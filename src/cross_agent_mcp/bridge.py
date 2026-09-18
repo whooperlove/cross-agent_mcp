@@ -1259,10 +1259,14 @@ def delivery_report(delivery_id: str) -> Dict[str, Any]:
         else:
             report['peer_transcript'] = {
                 **progress,
-                'note': ('Read from the peer transcript just now. `answer` is the text of the '
-                         'last turn the peer FINISHED after this request went out (matched by '
-                         'the echoed request id when there is one); null while it has not '
-                         'finished one. `is_working` is true while a turn is open. '
+                'note': ('Read from the peer transcript just now. `answer` is the turn that '
+                         'echoed this delivery id back, and nothing else: a request asks the '
+                         'peer to end its answer with that id, so a turn without it answers '
+                         'something else however recent it is. It is null until the peer '
+                         'finishes one that does. `unmatched_turn` is the peer\'s latest '
+                         'finished turn that did NOT echo it - shown so you can see what that '
+                         'session has been doing, never as an answer to this. `is_working` is '
+                         'true while a turn is open. '
                          + ('' if after else 'This record predates the request time being '
                                              'kept, so the answer is not filtered by time; check '
                                              'it against the request yourself.')),

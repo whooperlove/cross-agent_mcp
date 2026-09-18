@@ -796,35 +796,43 @@ def _codex_turns(lines: List[str]) -> Tuple[List[Dict[str, Any]], bool]:
 
 
 def _pick_answer(turns: List[Dict[str, Any]], after: Optional[float], token: Optional[str],
-                 label: str) -> Optional[Dict[str, Any]]:
-    """The turn that answers the request, out of the completed ones (newest first).
+                 label: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """The turn that answers the request, and the one that merely came after it.
 
-    An echoed token settles it either way, and better than any timing rule can: a match is
-    proof, wherever it sits, and a different token is proof that turn answers something else.
-    Only when the peer echoed nothing does timing decide, and then a turn written before the
-    request cannot be its answer.
+    A request carries a token and asks the peer to end its answer with it, so when there is a
+    token an echo of it is the only thing that makes a turn this request's answer. Nothing
+    else is evidence. A turn that finished after the message was delivered may be an answer to
+    a question the human asked in the same session a minute later, or the peer's reply to
+    somebody else entirely - both were written after the request, both look fresh, and neither
+    answers it. That turn comes back as context, for a human reading the delivery report, and
+    never as the answer.
+
+    Without a token - a reply, which asks nothing and expects no answer - timing is all there
+    is, and a turn written before the request still cannot be its answer.
     """
     spoken = [t for t in turns if t.get('text')]
+    fresh = [t for t in spoken
+             if after is None or (t['written_at'] is not None and t['written_at'] > after)]
+
     if token is not None:
         for turn in spoken:
             if request_token_in(turn['text']) == token:
-                return turn
+                return turn, None
+        if fresh:
+            echoed = [e for e in (request_token_in(t['text']) for t in fresh) if e]
+            logger.info(f'_pick_answer [unmatched]: {label} finished a turn after the request '
+                        f'but it does not echo {token}'
+                        + (f' (it answers {echoed})' if echoed else '')
+                        + '; keeping it as context, not as the answer')
+            return None, fresh[0]
+        return None, None
 
-    fresh = [t for t in spoken
-             if after is None or (t['written_at'] is not None and t['written_at'] > after)]
     if not fresh:
         if spoken:
             logger.info(f'_pick_answer [stale]: {label} last finished a turn before the request '
                         'was delivered, so there is no answer to recover yet')
-        return None
-
-    if token is not None:
-        echoed = [request_token_in(t['text']) for t in fresh]
-        if any(echoed):
-            logger.info(f'_pick_answer [other request]: {label} answered '
-                        f'{[e for e in echoed if e]}, not {token}')
-            return None
-    return fresh[0]
+        return None, None
+    return fresh[0], None
 
 
 def peer_progress(agent: str, session_id: str, after: Optional[float] = None,
@@ -845,6 +853,11 @@ def peer_progress(agent: str, session_id: str, after: Optional[float] = None,
     Only *finished* turns count. A peer mid-task also has a last message - a line about what it
     is doing next - and a delivery that timed out at 600s used to come back with that line as
     its answer. Here that peer is reported as working, and the answer is read once it ends.
+
+    `unmatched_turn` is the other half of that honesty. When the request carried a token and
+    the peer finished a turn without it, there *is* something to show a human reading the
+    delivery report - it just is not the answer, and is reported under its own name so nothing
+    downstream can mistake it for one.
     """
     session = find_session(agent, session_id)
     if not session:
@@ -853,10 +866,12 @@ def peer_progress(agent: str, session_id: str, after: Optional[float] = None,
     lines = _tail_lines(session['path'])
     turns, is_working = (_claude_turns(lines) if agent == config.AGENT_CLAUDE
                          else _codex_turns(lines))
-    answer = _pick_answer(turns, after, token, f'{agent} {session_id}')
+    answer, unmatched = _pick_answer(turns, after, token, f'{agent} {session_id}')
     return {
         'answer': answer['text'] if answer else None,
         'answered_at': answer['written_at'] if answer else None,
+        'unmatched_turn': unmatched['text'] if unmatched else None,
+        'unmatched_turn_at': unmatched['written_at'] if unmatched else None,
         'is_working': is_working,
         'last_turn_finished_at': turns[0]['written_at'] if turns else None,
         'transcript_mtime': _safe_mtime(session['path']),

@@ -1225,14 +1225,23 @@ def test_an_echoed_token_identifies_which_request_was_answered() -> None:
               discovery.last_agent_message(
                   'claude', 'sid', after=spoke_at.timestamp() - 999, token=mine) is None)
 
-        # If the peer omits the token, it falls back to the old timing rule — cooperation is a bonus, not a requirement.
+        # A request asks the peer to end its answer with the token, so when there is one the
+        # echo is the only evidence. A turn written afterwards may answer a question the human
+        # asked in the same session a minute later - fresh, and not ours.
         discovery.find_session = lambda a, s: {'path': transcript('토큰 없이 답합니다.')}
-        check('a peer that ignored the token still falls back to the clock',
+        check('a peer that ignored the token does not have the clock answer for it',
               discovery.last_agent_message(
-                  'claude', 'sid', after=spoke_at.timestamp() - 1, token=mine) is not None)
-        check('and the clock still refuses what predates the request',
+                  'claude', 'sid', after=spoke_at.timestamp() - 1, token=mine) is None)
+        check('but the turn is kept as context for whoever reads the report',
+              (discovery.peer_progress('claude', 'sid', after=spoke_at.timestamp() - 1,
+                                       token=mine) or {}).get('unmatched_turn')
+              == '토큰 없이 답합니다.')
+        check('a reply, which carries no token, still falls back to the clock',
               discovery.last_agent_message(
-                  'claude', 'sid', after=spoke_at.timestamp() + 1, token=mine) is None)
+                  'claude', 'sid', after=spoke_at.timestamp() - 1, token=None) is not None)
+        check('and the clock still refuses what predates it',
+              discovery.last_agent_message(
+                  'claude', 'sid', after=spoke_at.timestamp() + 1, token=None) is None)
     finally:
         discovery.find_session = original
 
@@ -2736,12 +2745,16 @@ def test_a_later_human_turn_does_not_hide_the_echoed_answer() -> None:
                   (discovery.last_agent_message('claude', 'sid', after=sent_at, token=mine) or '')
                   .startswith('등록 완료했습니다.'))
 
-            # a peer that echoes nothing: timing decides, as before
+            # a peer that echoes nothing has not answered *this* request, however fresh
             lines = [_claude_line('토큰 없이 답합니다.', 'end_turn', 'r1', sent_at + 100)]
             open(path, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
-            check('a peer that echoed nothing still falls back to the clock',
+            check('a turn that echoes nothing is not reported as the answer',
                   discovery.last_agent_message('claude', 'sid', after=sent_at, token=mine)
-                  == '토큰 없이 답합니다.')
+                  is None)
+            progress = discovery.peer_progress('claude', 'sid', after=sent_at, token=mine)
+            check('it is offered as context instead',
+                  progress.get('unmatched_turn') == '토큰 없이 답합니다.'
+                  and progress.get('answer') is None, str(progress)[:200])
         finally:
             discovery.find_session = original
 
@@ -5525,6 +5538,49 @@ class _AcceptedTurn:
         self.error = None
 
 
+def test_a_recovered_answer_must_echo_the_request_it_answers() -> None:
+    """Recovery reads a transcript the human is also using. Freshness is not evidence."""
+    sent_at = 1_788_500_000.0
+    mine = 'req_1788500000000_abcdef'
+
+    def job_for(target_session_id='sid-peer'):
+        return outbox.Job(
+            target_agent='claude', target_session_id=target_session_id, payload='q',
+            run_cwd='/w', pin_cwd='/w', env={}, timeout=600, ui_shim=None, title=None,
+            conversation_id='conv_recover', hop=1, sender_agent='codex',
+            sender_session_id='sid-me', wants_reply=True, summary='q', delivery_id=mine)
+
+    with tempfile.TemporaryDirectory(prefix='claude-recover-') as store:
+        path = store + '/session.jsonl'
+        original = discovery.find_session
+        discovery.find_session = lambda agent, sid: {'path': path}
+        try:
+            # the human asked the same session something else while we waited
+            open(path, 'w', encoding='utf-8').write(
+                _claude_line('네, 소라 세트로 하겠습니다.', 'end_turn', 'r1', sent_at + 300) + '\n')
+            job = job_for()
+            job.started_at = sent_at
+            check('an unrelated later turn is not recovered as our answer',
+                  bridge._recover_reply(job) is None)
+
+            progress = discovery.peer_progress('claude', 'sid-peer', after=sent_at, token=mine)
+            check('and it is reported as context, under its own name',
+                  progress.get('unmatched_turn') == '네, 소라 세트로 하겠습니다.'
+                  and progress.get('answer') is None, str(progress)[:200])
+
+            # the peer's real answer arrives, ending with the id it was asked to echo
+            open(path, 'a', encoding='utf-8').write(
+                _claude_line(f'검토 끝났습니다.\n{mine}', 'end_turn', 'r2', sent_at + 600) + '\n')
+            recovered = bridge._recover_reply(job)
+            check('the turn that echoes the request is recovered',
+                  (recovered or '').startswith('검토 끝났습니다.'), str(recovered)[:120])
+            check('and nothing is left dangling as context once it is found',
+                  discovery.peer_progress('claude', 'sid-peer', after=sent_at,
+                                          token=mine).get('unmatched_turn') is None)
+        finally:
+            discovery.find_session = original
+
+
 def run_all() -> None:
     test_the_suite_writes_nowhere_near_the_real_bridge()
     test_busy_lock_is_exclusive()
@@ -5661,6 +5717,7 @@ def run_all() -> None:
     test_a_forced_new_session_never_resolves_to_an_existing_one()
     test_a_reused_session_is_caught_even_if_a_shim_claims_otherwise()
     test_the_codex_shim_opens_a_thread_rather_than_reusing_one()
+    test_a_recovered_answer_must_echo_the_request_it_answers()
 
 if __name__ == '__main__':
     # The delivery directory used to be redirected here on its own, because finished jobs left
