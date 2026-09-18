@@ -8,6 +8,7 @@ without touching the code.
 import contextlib
 import os
 import stat
+import urllib.parse
 from typing import IO, Optional
 
 
@@ -334,14 +335,27 @@ PROXY_ENV_NAMES: frozenset = frozenset({
 def has_embedded_credentials(value: str) -> bool:
     """Whether a proxy setting carries userinfo in any of its entries.
 
-    The `@` that separates userinfo from the host is always literal - a username or password
-    containing one is percent-encoded as %40 - so finding one in the authority is enough, and
-    it does not matter whether the credential itself is encoded. A scheme is optional for the
-    same reason: `user:pass@host:8080` is accepted by the CLIs and says just as much.
+    Parsed rather than pattern-matched. Hand-splitting on `://` and `/` got both ends of this
+    wrong: it missed the scheme-relative `//alice:secret@proxy:3128`, and it read the `@` in
+    `http://proxy:3128?notify=a@b` as a credential. urlsplit knows where the authority ends,
+    and its `username`/`password` handle percent-encoded userinfo without any help.
+
+    A scheme is optional - `user:pass@host:8080` is accepted by the CLIs - so an entry without
+    one is prefixed with `//`, or `user:` would be read as the scheme. A value too malformed
+    to parse is treated as carrying credentials: it is a proxy setting we cannot vouch for,
+    and the failure hint says how to pass it deliberately.
     """
-    for entry in value.split(','):
-        authority = entry.strip().split('://', 1)[-1].split('/', 1)[0]
-        if '@' in authority:
+    for raw in value.split(','):
+        entry = raw.strip()
+        if not entry:
+            continue
+        if '://' not in entry and not entry.startswith('//'):
+            entry = '//' + entry
+        try:
+            parts = urllib.parse.urlsplit(entry)
+            if parts.username or parts.password:
+                return True
+        except ValueError:
             return True
     return False
 

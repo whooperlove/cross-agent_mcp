@@ -5195,8 +5195,10 @@ PROXY_WITH_CREDENTIALS = (
     'https://alice:super-secret@proxy.corp:3128',
     'http://token:abc123@proxy.corp:3128',
     'user:pass@proxy.corp:8080',                       # no scheme at all
+    '//alice:secret@proxy.corp:3128',                  # scheme-relative
     'http://user%40corp:p%40ssw0rd@proxy.corp:3128',   # percent-encoded userinfo
     'HTTP://ALICE:SECRET@PROXY.CORP:3128',
+    'http://token@proxy.corp:3128',                    # username, no password
     'http://proxy.corp:3128,https://bob:hunter2@other.corp:3128',
 )
 
@@ -5204,8 +5206,11 @@ PROXY_WITHOUT_CREDENTIALS = (
     'http://proxy.corp:3128',
     'https://proxy.corp:3128',
     'proxy.corp:3128',
+    '//proxy.corp:3128',
+    'http://[::1]:3128',
     'localhost,127.0.0.1,.corp.example',
-    'http://proxy.corp:3128/pac@file'.replace('@file', ''),
+    'http://proxy.corp:3128?notify=a@b',               # an @ in the query is not userinfo
+    'http://proxy.corp:3128/pac@file',                 # nor is one in the path
 )
 
 
@@ -5216,6 +5221,8 @@ def test_a_proxy_url_carrying_a_password_is_withheld() -> None:
     check('every shape of embedded credential is recognised', not caught, str(caught))
     missed = [v for v in PROXY_WITHOUT_CREDENTIALS if config.has_embedded_credentials(v)]
     check('and an ordinary proxy setting is not mistaken for one', not missed, str(missed))
+    check('a value too malformed to parse is treated as one rather than waved through',
+          config.has_embedded_credentials('http://[::1'))
 
     with _parent_environment(HTTPS_PROXY='https://alice:super-secret@proxy.corp:3128',
                              HTTP_PROXY='http://proxy.corp:3128',
