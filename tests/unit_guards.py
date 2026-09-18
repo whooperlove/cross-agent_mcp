@@ -5581,6 +5581,84 @@ def test_a_recovered_answer_must_echo_the_request_it_answers() -> None:
             discovery.find_session = original
 
 
+def test_require_refuses_a_fresh_conversation_the_panel_cannot_open() -> None:
+    """`require` exists so a delivery never silently becomes invisible; a new conversation is
+    no exception."""
+    from cross_agent_mcp import uihook
+    original = (uihook.find_panel_host, config.UI_HOOK_MODE)
+    uihook.find_panel_host = lambda agent: None
+    try:
+        config.UI_HOOK_MODE = uihook.UI_HOOK_REQUIRE
+        try:
+            bridge._resolve_target('claude', None, 'cwd', '/w', True, [])
+            check('require refuses when no panel can open a conversation', False,
+                  'no error raised')
+        except bridge.BridgeError as e:
+            check('require refuses when no panel can open a conversation',
+                  'Nothing was sent' in str(e), str(e))
+            check('and says the headless CLI is what it is ruling out',
+                  'headless' in str(e) and 'CROSS_AGENT_UI_HOOK=require' in str(e), str(e))
+
+        config.UI_HOOK_MODE = uihook.UI_HOOK_AUTO
+        check('auto falls through to the CLI instead of failing',
+              bridge._resolve_target('claude', None, 'cwd', '/w', True, []) is None)
+    finally:
+        (uihook.find_panel_host, config.UI_HOOK_MODE) = original
+
+
+def test_a_fresh_cli_session_is_created_under_the_id_the_caller_was_given() -> None:
+    """The receipt names the session, so the caller can address it from its next message."""
+    seen = {}
+
+    def fake_run(command, cwd, env, timeout):
+        seen['command'] = command
+        payload = json.dumps({'type': 'result', 'session_id': command[command.index(
+            '--session-id') + 1] if '--session-id' in command else None, 'result': 'hi'})
+        return __import__('subprocess').CompletedProcess(command, 0, payload + '\n', '')
+
+    original = bridge._run_cli
+    bridge._run_cli = fake_run
+    try:
+        result = bridge._call_claude('hello', 'a4f1c2d0-1111-4000-8000-000000000001', '/w', {},
+                                     600, None, None, is_new_session=True)
+        check('an allocated id creates a session rather than resuming one',
+              '--session-id' in seen['command'] and '--resume' not in seen['command'],
+              str(seen['command']))
+        check('the session it created is the one the caller was told about',
+              result['session_id'] == 'a4f1c2d0-1111-4000-8000-000000000001'
+              and result['is_new_session'] is True, str(result))
+
+        bridge._call_claude('hello', 'a4f1c2d0-1111-4000-8000-000000000001', '/w', {}, 600)
+        check('without that flag the same id still resumes, as before',
+              '--resume' in seen['command'], str(seen['command']))
+    finally:
+        bridge._run_cli = original
+
+
+def test_a_forced_new_codex_session_is_not_resumed() -> None:
+    seen = {}
+
+    def fake_run(command, cwd, env, timeout):
+        seen['command'] = command
+        event = json.dumps({'type': 'item.completed',
+                            'item': {'type': 'agent_message', 'text': 'hi'}})
+        started = json.dumps({'type': 'thread.started', 'thread_id': 'thread-brand-new'})
+        return __import__('subprocess').CompletedProcess(command, 0, started + '\n' + event, '')
+
+    original = bridge._run_cli
+    bridge._run_cli = fake_run
+    try:
+        result = bridge._call_codex('hello', None, '/w', {}, 600, None, None,
+                                    is_new_session=True)
+        check('a forced new codex session is started, never resumed',
+              'resume' not in seen['command'], str(seen['command']))
+        check('and the thread the CLI issued is reported back',
+              result['session_id'] == 'thread-brand-new'
+              and result['is_new_session'] is True, str(result))
+    finally:
+        bridge._run_cli = original
+
+
 def run_all() -> None:
     test_the_suite_writes_nowhere_near_the_real_bridge()
     test_busy_lock_is_exclusive()
@@ -5718,6 +5796,9 @@ def run_all() -> None:
     test_a_reused_session_is_caught_even_if_a_shim_claims_otherwise()
     test_the_codex_shim_opens_a_thread_rather_than_reusing_one()
     test_a_recovered_answer_must_echo_the_request_it_answers()
+    test_require_refuses_a_fresh_conversation_the_panel_cannot_open()
+    test_a_fresh_cli_session_is_created_under_the_id_the_caller_was_given()
+    test_a_forced_new_codex_session_is_not_resumed()
 
 if __name__ == '__main__':
     # The delivery directory used to be redirected here on its own, because finished jobs left

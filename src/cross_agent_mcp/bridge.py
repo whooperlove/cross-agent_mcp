@@ -678,7 +678,9 @@ def _call_claude(message: str, session_id: Optional[str], cwd: str, env: Dict[st
     if ui_shim:
         return _call_via_panel(message, session_id, ui_shim, timeout, cwd, title, **panel)
 
-    is_new = session_id is None
+    # `is_new_session` is the caller having asked for a fresh conversation, which the bridge
+    # may already have allocated an id for; without it, having no id at all means the same.
+    is_new = bool(panel.get('is_new_session')) or session_id is None
     target_id = session_id or str(uuid.uuid4())
 
     command = [config.CLAUDE_BIN, '-p', '--output-format', 'json']
@@ -733,7 +735,8 @@ def _call_codex(message: str, session_id: Optional[str], cwd: str, env: Dict[str
     if ui_shim:
         return _call_via_panel(message, session_id, ui_shim, timeout, cwd, title, **panel)
 
-    is_new = session_id is None
+    # Codex issues the thread id itself, so a forced new session arrives here without one.
+    is_new = bool(panel.get('is_new_session')) or session_id is None
 
     if is_new:
         command = [config.CODEX_BIN, 'exec', '--json', '--skip-git-repo-check',
@@ -934,7 +937,15 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
         return target
 
     if is_new_forced:
-        return chosen(_new_panel_conversation(target_agent), SELECTED_FORCED_NEW)
+        host = _new_panel_conversation(target_agent)
+        if host is None and config.UI_HOOK_MODE == uihook.UI_HOOK_REQUIRE:
+            raise BridgeError(
+                f'CROSS_AGENT_UI_HOOK=require and no {target_agent} panel in this editor window '
+                'can open a new conversation - every one of them is already driving a session. '
+                'Nothing was sent. The headless CLI would start a genuinely fresh session but '
+                'the panel would not show it, which is what require rules out; close or open a '
+                f'{target_agent} panel, or send without new_session to resume an existing one.')
+        return chosen(host, SELECTED_FORCED_NEW)
 
     wanted_id, requested = _requested_session_id(target_agent, session_id, cwd)
 
@@ -1474,6 +1485,15 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     target = _resolve_target(target_agent, session_id, scope, cwd, is_new_session, exclude_ids)
     target_id = target['session_id'] if target else None
 
+    # A fresh conversation with no panel to host it goes to the CLI, which starts one under an
+    # id of our choosing. Allocating it here rather than inside the call is what lets the
+    # receipt say which session the answer will come from - the caller can address it by id
+    # from the next message on, instead of waiting to see what appears.
+    is_new_over_cli = is_new_session and not (target or {}).get('ui_shim')
+    if is_new_over_cli and target_agent == config.AGENT_CLAUDE:
+        target_id = str(uuid.uuid4())
+        logger.info(f'send_message [new cli session]: claude {target_id}')
+
     record = registry.bump_conversation(conversation_id, sender_agent, target_agent)
     hop = int(record.get('hops', 1))
     remaining = max(config.MAX_HOPS - hop, 0)
@@ -1547,9 +1567,16 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
                 f'session={target_id or "NEW"} conv={conversation_id} hop={hop} '
                 f'delivery={delivery_id} state={job.state}')
 
-    is_new_target = target_id is None
+    is_new_target = is_new_session or target_id is None
     warnings: List[str] = []
-    if is_new_target:
+    if is_new_over_cli:
+        warnings.append(
+            'A NEW conversation was requested and no panel in this window could open one, so '
+            f'it is being started through the headless {target_agent} CLI. It is genuinely '
+            'fresh - no existing session was reused - but the editor panel will not show it '
+            'while it runs; it appears in the conversation list afterwards. Set '
+            'CROSS_AGENT_UI_HOOK=require to have this refused instead.')
+    elif is_new_target:
         warnings.append(
             f'No existing {target_agent} session was reachable for {run_cwd}, so a NEW '
             'conversation will be started. It has none of the earlier context. Tell the user '
@@ -1623,6 +1650,9 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         'target_agent': target_agent,
         'target_session_id': target_id,
         'target_last_activity_seconds_ago': idle_seconds,
+        # the id the fresh session will have, when it is ours to choose; otherwise the peer
+        # issues it and bridge_status reports it as soon as the delivery is accepted
+        'new_session_id': target_id if is_new_target else None,
         'session_origin': 'created' if is_new_target else (target or {}).get('source', 'unknown'),
         'target_selected_by': selected_by,
         'caller_supplied_session_id': selected_by == SELECTED_CALLER,
