@@ -538,6 +538,25 @@ def _raise_for_panel_failure(response: Dict[str, Any]) -> None:
     raise BridgeError(f'IDE panel relay failed: {error}')
 
 
+def _raise_unless_really_new(response: Dict[str, Any], existing: set) -> None:
+    """Check that a fresh conversation was actually opened, rather than one being reused.
+
+    The shim refuses what it cannot do, so this should never fire. It is here because the
+    failure it guards against is silent by nature: a message landing in a conversation that
+    was already running looks, from the receipt, exactly like one landing in a new one.
+    """
+    landed = response.get('sessionId')
+    if response.get('wasCreated') and landed and landed not in existing:
+        return
+
+    raise BridgeError(
+        'a new conversation was requested but the panel did not open one: the message went to '
+        f'{landed or "an unnamed session"}, which '
+        f'{"was already running" if landed in existing else "the shim did not report as new"}. '
+        'Nothing further was sent. Address an existing session by id, or send without '
+        'new_session to let the bridge resume one.')
+
+
 def _transcript_answer(target_agent: Optional[str], session_id: Optional[str],
                        after: float, token: Optional[str]) -> Optional[str]:
     """The peer's finished answer to *this* request, read from its transcript - or None.
@@ -560,11 +579,24 @@ def _transcript_answer(target_agent: Optional[str], session_id: Optional[str],
     return None
 
 
+def _live_session_ids(agent: Optional[str]) -> set:
+    """Every panel conversation of this agent that exists right now, this window or another."""
+    if not agent:
+        return set()
+    try:
+        return {s['session_id'] for s in uihook.find_live_sessions(agent)} | {
+            s['session_id'] for s in uihook.find_foreign_sessions(agent)}
+    except Exception as e:
+        logger.debug(f'_live_session_ids [exception]: {agent} {e}')
+        return set()
+
+
 def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, Any],
                     timeout: int, cwd: str, title: Optional[str] = None,
                     on_accepted: Optional[Any] = None, wants_result: bool = True,
                     patience: Optional[float] = None, target_agent: Optional[str] = None,
-                    request_token: Optional[str] = None) -> Dict[str, Any]:
+                    request_token: Optional[str] = None,
+                    is_new_session: bool = False) -> Dict[str, Any]:
     """Deliver through the editor panel shim, so the exchange shows up in the panel.
 
     The hand-over and the answer are two waits, not one. The shim answers the first as soon as
@@ -583,9 +615,15 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
     """
     started = time.time()
     budget = patience if patience is not None else timeout
+    # Recorded before the message goes anywhere: "a new conversation" means one that did not
+    # exist a moment ago, and that is only checkable against the sessions that did.
+    existing = _live_session_ids(target_agent) if is_new_session else set()
+
     response = uihook.send(message, ui_shim, session_id, timeout, cwd, title,
-                           accept_timeout=PANEL_ACCEPT_SECONDS)
+                           accept_timeout=PANEL_ACCEPT_SECONDS, create_new=is_new_session)
     _raise_for_panel_failure(response)
+    if is_new_session:
+        _raise_unless_really_new(response, existing)
 
     is_accepted_reported = False
     while response.get('pending'):
@@ -955,6 +993,8 @@ def _deliver(job: outbox.Job) -> Dict[str, Any]:
         # turn the shim lost track of. A reply carries none, and wants no answer anyway.
         target_agent=job.target_agent,
         request_token=job.delivery_id if job.wants_reply else None,
+        # a fresh conversation was asked for, so the transport has to say it opened one
+        is_new_session=job.is_new_session,
     )
 
     if result['is_new_session'] and result['session_id']:
@@ -1469,6 +1509,7 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         summary=_summary(message),
         delivery_id=request_id,
         kind=outbox.KIND_REQUEST,
+        is_new_session=is_new_session,
     )
     # Stay on the line for a moment. A message the worker cannot hand over at all fails within
     # a second, and the caller who is still here is the right one to hear it - three requests

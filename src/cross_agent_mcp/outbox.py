@@ -399,7 +399,7 @@ class Job:
                  conversation_id: str, hop: int, sender_agent: str,
                  sender_session_id: Optional[str], wants_reply: bool,
                  summary: str, delivery_id: Optional[str] = None,
-                 kind: Optional[str] = None) -> None:
+                 kind: Optional[str] = None, is_new_session: bool = False) -> None:
         self.delivery_id = delivery_id or new_request_id()
         self.target_agent = target_agent
         self.target_session_id = target_session_id
@@ -419,6 +419,9 @@ class Job:
         self.wants_reply = wants_reply
         self.summary = summary
         self.kind = kind or (KIND_REQUEST if wants_reply else KIND_REPLY)
+        # the caller asked for a conversation with no context in it, so no existing session
+        # may be used for this delivery - not as a fallback, not as a retry target
+        self.is_new_session = is_new_session
 
         self.state = STATE_QUEUED
         self.created_at = time.time()

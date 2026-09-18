@@ -273,18 +273,30 @@ def find_panel_host(agent: str) -> Optional[Dict[str, Any]]:
     process behind it, so a new conversation started there is at least visible - but starting
     one when an existing session could have been resumed would throw away the context the
     caller meant to reach, so callers must exhaust every lookup before asking for this.
-    """
-    shims = find_local_shims(agent)
-    if not shims:
-        return None
 
-    newest = max(shims, key=lambda s: float(s.get('started_at') or 0))
-    return {'session_id': None, 'cwd': None, 'shim': newest, 'opens_new_session': True}
+    Only a shim that says it can open one is offered. "Has a process" is not the same as "can
+    open a conversation": the Claude shim can only write into the stdin it was started with,
+    so a panel already driving a session cannot host a second - and choosing it anyway is how
+    a request for a fresh conversation ended up in the middle of an unrelated one. A shim too
+    old to answer the question is not chosen either; there is a CLI path for that.
+    """
+    for shim in sorted(find_local_shims(agent),
+                       key=lambda s: float(s.get('started_at') or 0), reverse=True):
+        status = read_status(shim)
+        if not status.get('ok'):
+            continue
+        if not status.get('can_create_session'):
+            logger.info(f'find_panel_host [cannot create]: {agent} shim pid={shim.get("pid")} '
+                        f'is driving {len(status.get("sessions") or [])} session(s)')
+            continue
+        return {'session_id': None, 'cwd': None, 'shim': shim, 'opens_new_session': True}
+    return None
 
 
 def send(text: str, shim: Dict[str, Any], session_id: Optional[str], timeout: int,
          cwd: Optional[str] = None, title: Optional[str] = None,
-         accept_timeout: Optional[int] = None) -> Dict[str, Any]:
+         accept_timeout: Optional[int] = None,
+         create_new: bool = False) -> Dict[str, Any]:
     """Hand a message to the panel.
 
     With `accept_timeout` the shim answers as soon as the peer has taken the message, with
@@ -301,6 +313,10 @@ def send(text: str, shim: Dict[str, Any], session_id: Optional[str], timeout: in
         payload['title'] = title
     if accept_timeout is not None:
         payload['acceptTimeout'] = accept_timeout
+    if create_new:
+        # said out loud to the shim as well, not only decided here: the shim is the only
+        # party that knows whether it can honour it
+        payload['createNew'] = True
 
     logger.info(f'send [BEGIN]: via {shim.get("agent")} panel shim '
                 f'pid={shim.get("pid")} session={session_id}')

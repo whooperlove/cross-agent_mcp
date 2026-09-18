@@ -233,12 +233,18 @@ class PanelShim:
 
     def inject(self, text: str, session_id: Optional[str], timeout: int,
                cwd: Optional[str] = None, title: Optional[str] = None,
-               accept_timeout: Optional[int] = None) -> Dict[str, Any]:
+               accept_timeout: Optional[int] = None,
+               create_new: bool = False) -> Dict[str, Any]:
         """Deliver a message into the panel, opening a conversation if none is running.
 
         With `accept_timeout` the call returns as soon as the peer has taken the message, and
         the turn is left for `await_turn` to collect. Without it the call waits `timeout` for
         the turn to end, as it always did.
+
+        `create_new` is the caller saying the message must start a *new* conversation. A shim
+        that cannot open one refuses the request outright rather than writing the message into
+        whatever conversation it happens to be driving: the caller asked for a conversation
+        with no context in it, and delivering into an existing one gives it the opposite.
         """
         raise NotImplementedError
 
@@ -327,6 +333,7 @@ class PanelShim:
                 request.get('cwd'),
                 request.get('title'),
                 int(accept_timeout) if accept_timeout is not None else None,
+                bool(request.get('createNew')),
             )
         if operation == 'await':
             return self.await_turn(

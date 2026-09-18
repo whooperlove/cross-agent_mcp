@@ -199,6 +199,7 @@ class ClaudeStreamShim(PanelShim):
             approval = dict(self.awaiting_approval) if self.awaiting_approval else None
             if approval:
                 approval['waiting_seconds'] = round(time.time() - approval.get('since', 0))
+            can_create = self.session_id is None
             sessions = ([{'session_id': self.session_id, 'thread_id': self.session_id,
                           'cwd': self.cwd, 'last_seen': self.last_seen,
                           'last_user_activity': self.last_user_activity,
@@ -206,8 +207,12 @@ class ClaudeStreamShim(PanelShim):
                           'awaiting_approval': approval}]
                         if self.session_id else [])
             activity = self.last_user_activity
+        # The extension owns the conversation list; this shim can only write into the one
+        # stdin it was started with. So a panel already driving a session cannot open another,
+        # and saying so here is what stops the bridge from choosing it for a fresh one.
         return {'ok': True, 'agent': self.agent, 'pid': os.getpid(), 'sessions': sessions,
                 'threads': sessions, 'last_user_activity': activity,
+                'can_create_session': can_create,
                 'argv': self.argv, 'real_binary': self.real_binary}
 
     def _wait_for_idle(self, deadline: float) -> bool:
@@ -223,7 +228,8 @@ class ClaudeStreamShim(PanelShim):
 
     def inject(self, text: str, session_id: Optional[str], timeout: int,
                cwd: Optional[str] = None, title: Optional[str] = None,
-               accept_timeout: Optional[int] = None) -> Dict[str, Any]:
+               accept_timeout: Optional[int] = None,
+               create_new: bool = False) -> Dict[str, Any]:
         with self.state_lock:
             current = self.session_id
         if session_id and session_id != current:
@@ -233,6 +239,14 @@ class ClaudeStreamShim(PanelShim):
         # A panel sitting on its conversation list has a process but no conversation yet.
         # Writing the message anyway makes the CLI open one, and the panel renders it.
         is_created = current is None
+
+        # Asked for a fresh conversation while already driving one, the only thing this shim
+        # could do is write into that one - which is the opposite of what was asked for, and
+        # it used to do exactly that, because a null session id skipped the check above.
+        if create_new and not is_created:
+            return {'ok': False, 'accepted': False,
+                    'error': f'this panel already drives session {current} and cannot open a '
+                             'new conversation; nothing was written to it'}
 
         # the CLI serialises turns; injecting mid-turn would make us collect the wrong reply
         idle_wait = min(IDLE_WAIT_SECONDS, accept_timeout if accept_timeout is not None else timeout)

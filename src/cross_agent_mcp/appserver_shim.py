@@ -437,6 +437,9 @@ class CodexAppServerShim(PanelShim):
             thread['awaiting_approval'] = self._approval_for(thread['thread_id'])
         return {'ok': True, 'agent': self.agent, 'pid': os.getpid(), 'threads': threads,
                 'sessions': threads, 'last_user_activity': activity,
+                # the app server opens a thread on request, so this shim can always host a
+                # brand new conversation
+                'can_create_session': True,
                 'argv': self.argv, 'real_binary': self.real_codex}
 
     def _pick_thread(self, thread_id: Optional[str]) -> Optional[str]:
@@ -505,8 +508,14 @@ class CodexAppServerShim(PanelShim):
 
     def inject(self, text: str, session_id: Optional[str], timeout: int,
                cwd: Optional[str] = None, title: Optional[str] = None,
-               accept_timeout: Optional[int] = None) -> Dict[str, Any]:
-        result = self._inject_once(text, session_id, timeout, cwd, title, accept_timeout)
+               accept_timeout: Optional[int] = None,
+               create_new: bool = False) -> Dict[str, Any]:
+        if create_new and session_id:
+            return {'ok': False, 'accepted': False,
+                    'error': f'cannot open a new thread and target {session_id} at once'}
+
+        result = self._inject_once(text, session_id, timeout, cwd, title, accept_timeout,
+                                   create_new)
 
         # A thread can stop accepting direct input after we learned about it - the panel may
         # have handed it to a multi-agent run. Drop it and try once on a fresh conversation.
@@ -515,14 +524,16 @@ class CodexAppServerShim(PanelShim):
             stale = result.get('sessionId')
             if stale:
                 self._forget_thread(stale)
-            return self._inject_once(text, None, timeout, cwd, title, accept_timeout)
+            return self._inject_once(text, None, timeout, cwd, title, accept_timeout, create_new)
 
         return result
 
     def _inject_once(self, text: str, session_id: Optional[str], timeout: int,
                      cwd: Optional[str], title: Optional[str],
-                     accept_timeout: Optional[int]) -> Dict[str, Any]:
-        target = self._pick_thread(session_id)
+                     accept_timeout: Optional[int],
+                     create_new: bool = False) -> Dict[str, Any]:
+        # a fresh conversation was asked for, so no existing thread is a candidate for it
+        target = None if create_new else self._pick_thread(session_id)
         is_created = False
 
         if not target:
