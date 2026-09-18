@@ -3063,6 +3063,38 @@ def test_the_no_hard_link_fallback_is_still_exclusive_under_contention() -> None
     check('and hard links are back for everything else', os.link is original_link)
 
 
+def test_the_transition_guard_cannot_be_held_hostage_by_another_account() -> None:
+    """flock is granted on any open descriptor, whatever its access mode. A world-readable
+    guard is one any account on the machine can hold exclusively and never release, which
+    stops every delivery without touching anything else."""
+    import stat as stat_module
+    previous_umask = os.umask(0o022)
+    try:
+        config.ensure_dirs()
+        guard = registry._guard_path()
+        with contextlib.suppress(OSError):
+            os.remove(guard)
+
+        with registry.busy_lock(config.AGENT_CODEX, 'unit-guardmode-' + os.urandom(3).hex(),
+                                'conv_guard'):
+            pass
+
+        mode = stat_module.S_IMODE(os.lstat(guard).st_mode)
+        check('the guard is created owner-only under a permissive umask', mode == 0o600,
+              oct(mode))
+
+        # a guard left behind by a build that created it with the umask
+        os.chmod(guard, 0o644)
+        with registry.busy_lock(config.AGENT_CODEX, 'unit-guardrepair-' + os.urandom(3).hex(),
+                                'conv_guard'):
+            pass
+        mode = stat_module.S_IMODE(os.lstat(guard).st_mode)
+        check('and one left open by an earlier build is repaired on the next use',
+              mode == 0o600, oct(mode))
+    finally:
+        os.umask(previous_umask)
+
+
 def run_all() -> None:
     test_busy_lock_is_exclusive()
     test_busy_lock_release_respects_owner()
@@ -3139,6 +3171,7 @@ def run_all() -> None:
     test_a_claimed_lock_is_readable_the_instant_it_exists()
     test_a_stale_clear_cannot_delete_the_lock_that_replaced_it()
     test_the_no_hard_link_fallback_is_still_exclusive_under_contention()
+    test_the_transition_guard_cannot_be_held_hostage_by_another_account()
 
 if __name__ == '__main__':
     # Delivery records are written by any finished job, so a test run left rows like

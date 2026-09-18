@@ -203,15 +203,24 @@ def _lock_transition() -> Iterator[None]:
     between. The guard puts them back together.
 
     The kernel drops an flock when the holder exits, so a process dying in here cannot wedge
-    the directory.
+    the directory. Another *user* could, though, which is why the mode is explicit: flock is
+    granted on any open descriptor regardless of access mode, so a world-readable guard is one
+    any account on the machine can hold exclusively and never release, stopping every delivery
+    without touching anything else. It is created 0600, and fchmod'd on every open so a guard
+    left behind by a build that created it with the umask is repaired rather than trusted.
     """
     config.ensure_dirs()
-    with open(_guard_path(), 'a+', encoding='utf-8') as guard:
-        fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
+    fd = os.open(_guard_path(), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with contextlib.suppress(OSError):
+            os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _mtime(path: str) -> float:
