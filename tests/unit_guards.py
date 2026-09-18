@@ -2936,25 +2936,35 @@ def test_a_stale_clear_cannot_delete_the_lock_that_replaced_it() -> None:
     session_id = 'unit-replace-' + os.urandom(4).hex()
     path = registry._lock_path(config.AGENT_CODEX, session_id)
     config.ensure_dirs()
+    dead_pid = 2 ** 22 - 1
 
     # a lock whose holder is long gone: the reader will decide to clear it
     with open(path, 'w', encoding='utf-8') as f:
-        json.dump({'pid': 2 ** 22 - 1, 'token': 'ghost', 'agent': config.AGENT_CODEX,
+        json.dump({'pid': dead_pid, 'token': 'ghost', 'agent': config.AGENT_CODEX,
                    'session_id': session_id, 'conversation_id': 'conv_ghost',
                    'started_at': time.time(), 'ttl_seconds': 1}, f)
 
     reader_is_inside = threading.Event()
     let_reader_finish = threading.Event()
     claimed = threading.Event()
-    held_token = {}
+    may_release = threading.Event()
+    held = {}
 
     original_is_alive = registry._is_pid_alive
+    pause_once = threading.Lock()
+    has_paused = []
 
     def pausing_is_alive(pid: int) -> bool:
-        # the reader has read the record and is about to act on it
-        if pid == 2 ** 22 - 1:
-            reader_is_inside.set()
-            let_reader_finish.wait(timeout=10)
+        # Pause the FIRST reader mid-decision and nobody else. Pausing every caller would stop
+        # the claimer inside this patch rather than on the guard, and the test would then pass
+        # with no guard at all - which is what it did before this line existed.
+        if pid == dead_pid:
+            with pause_once:
+                is_first = not has_paused
+                has_paused.append(pid)
+            if is_first:
+                reader_is_inside.set()
+                let_reader_finish.wait(timeout=10)
             return False
         return original_is_alive(pid)
 
@@ -2965,45 +2975,49 @@ def test_a_stale_clear_cannot_delete_the_lock_that_replaced_it() -> None:
         try:
             with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_real'):
                 with open(path, 'r', encoding='utf-8') as f:
-                    held_token['token'] = json.load(f).get('token')
+                    held['token'] = json.load(f).get('token')
                 claimed.set()
-                time.sleep(0.2)
+                # keep holding it until the assertions below have looked
+                may_release.wait(timeout=10)
         except Exception as e:
-            held_token['error'] = f'{type(e).__name__}: {e}'
+            held['error'] = f'{type(e).__name__}: {e}'
+            claimed.set()
 
     registry._is_pid_alive = pausing_is_alive
+    reading = threading.Thread(target=reader)
+    claiming = threading.Thread(target=claimer)
     try:
-        reading = threading.Thread(target=reader)
         reading.start()
         check('the reader reached its decision about the stale lock',
               reader_is_inside.wait(timeout=10))
 
-        claiming = threading.Thread(target=claimer)
         claiming.start()
-        # with the transition guard held by the reader, the claimer cannot get in front of it
+        # the reader is holding the transition, so the claimer cannot act on the same lock yet
         check('a claimer cannot slip in while a stale clear is half-done',
-              not claimed.wait(timeout=1.0), str(held_token))
+              not claimed.wait(timeout=1.0), str(held))
 
         let_reader_finish.set()
+        reading.join(timeout=10)
         check('and once the clear is finished the claim goes through',
-              claimed.wait(timeout=10), str(held_token))
+              claimed.wait(timeout=10) and 'error' not in held, str(held))
 
-        survivor_exists = os.path.exists(path)
+        # read while the claimer is still inside its `with`, and after the reader has done
+        # whatever unlinking it was going to do
         survivor = None
-        if survivor_exists:
+        if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
                 survivor = json.load(f).get('token')
+        check("the new holder's lock is still on disk, not deleted by the older reader",
+              survivor is not None and survivor == held.get('token'),
+              f'on_disk={survivor} held={held.get("token")}')
+    finally:
+        may_release.set()
+        let_reader_finish.set()
         claiming.join(timeout=10)
         reading.join(timeout=10)
-    finally:
         registry._is_pid_alive = original_is_alive
-        let_reader_finish.set()
         with contextlib.suppress(OSError):
             os.remove(path)
-
-    check('the new holder\'s lock is still on disk, not deleted by the older reader',
-          survivor_exists and survivor == held_token.get('token'),
-          f'exists={survivor_exists} on_disk={survivor} held={held_token}')
 
 
 def test_the_no_hard_link_fallback_is_still_exclusive_under_contention() -> None:
