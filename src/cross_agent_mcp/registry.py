@@ -28,6 +28,10 @@ CONVERSATION_TTL_SECONDS = 24 * 3600
 # momentary stat failure on a network share or a briefly relinked symlink cannot erase it
 PIN_GRACE_SECONDS = 3600
 
+# how old an unreadable lock file must be before it is treated as debris rather than as
+# somebody else's claim being written right now
+UNREADABLE_LOCK_GRACE_SECONDS = 30
+
 
 class SessionBusyError(Exception):
     """Raised when a session is already holding a live busy lock."""
@@ -171,6 +175,13 @@ def _lock_path(agent: str, session_id: str) -> str:
     return config.LOCK_DIR + f'{agent}__{session_id}.lock'
 
 
+def _mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
 def _is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -188,8 +199,14 @@ def read_busy_lock(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
     except FileNotFoundError:
         return None
     except Exception:
-        with contextlib.suppress(OSError):
-            os.remove(path)
+        # A lock that cannot be read is a leftover from a crash mid-write, and clearing it is
+        # what stops one poisoning a session forever. It is only ever cleared once it is too
+        # old to be anybody's live claim: the atomic claim above means a current build cannot
+        # produce one of these, and the age is the second lock on that door - not the first.
+        if time.time() - _mtime(path) > UNREADABLE_LOCK_GRACE_SECONDS:
+            logger.info(f'read_busy_lock [unreadable]: clearing {path}')
+            with contextlib.suppress(OSError):
+                os.remove(path)
         return None
 
     # The holder says how long it may legitimately hold on; a lock without that field was
@@ -206,15 +223,46 @@ def read_busy_lock(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _claim_lock_file(path: str, payload: str) -> bool:
-    """Create the lock file, or report that somebody else already owns it."""
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        return False
+    """Create the lock file whole, or report that somebody else already owns it.
 
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        f.write(payload)
-    return True
+    The claim used to be an O_EXCL create followed by a separate write, which left the lock
+    file existing and empty for as long as that took. Another claimer arriving in that window
+    read it, failed to parse it, and - taking it for a corrupt leftover - deleted it. Its
+    retry then won a lock somebody else was already holding: with six threads racing for one
+    session, three of them have been seen to win.
+
+    Writing the record to a temporary and linking it into place closes that window rather than
+    narrowing it. `link` fails outright if the name is taken, so it is the same all-or-nothing
+    claim O_EXCL gave; the difference is that the file is complete at the instant it appears,
+    so there is no state another process can misread.
+    """
+    tmp = f'{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp'
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(payload)
+
+        try:
+            os.link(tmp, path)
+            return True
+        except FileExistsError:
+            return False
+        except OSError as e:
+            # A filesystem without hard links. Fall back to the create-then-write claim, which
+            # is exclusive but leaves the window above; the age check in read_busy_lock is what
+            # covers it there. Every store either agent keeps its sessions in supports links,
+            # so this is for an unusual CROSS_AGENT_HOME rather than for the normal case.
+            logger.warning(f'_claim_lock_file [no hard links]: {e}; falling back')
+            try:
+                with os.fdopen(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600),
+                               'w', encoding='utf-8') as f:
+                    f.write(payload)
+                return True
+            except FileExistsError:
+                return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
 
 
 def _release_lock_file(path: str, token: str) -> None:

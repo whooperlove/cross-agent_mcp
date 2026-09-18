@@ -3,6 +3,7 @@
     PYTHONPATH=src .venv/bin/python tests/unit_guards.py
 """
 
+import contextlib
 import json
 import os
 import sys
@@ -2833,6 +2834,101 @@ def uuid_hex() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def test_the_busy_lock_survives_a_sustained_race() -> None:
+    """One round of six threads let the old claim through about one run in five. This runs the
+    race often enough that a claim which is only nearly exclusive cannot pass it."""
+    rounds, racers = 40, 8
+    bad_rounds = []
+
+    for round_number in range(rounds):
+        session_id = f'unit-race-{round_number}-' + os.urandom(3).hex()
+        outcomes = []
+        guard = threading.Lock()
+        barrier = threading.Barrier(racers)
+
+        def worker() -> None:
+            barrier.wait()
+            try:
+                with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_race'):
+                    with guard:
+                        outcomes.append('won')
+                    time.sleep(0.01)
+            except registry.SessionBusyError:
+                with guard:
+                    outcomes.append('refused')
+
+        threads = [threading.Thread(target=worker) for _ in range(racers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        if outcomes.count('won') != 1 or len(outcomes) != racers:
+            bad_rounds.append((round_number, list(outcomes)))
+        check_lock = registry.read_busy_lock(config.AGENT_CODEX, session_id)
+        if check_lock is not None:
+            bad_rounds.append((round_number, 'lock left behind'))
+
+    check(f'exactly one of {racers} claimers wins, in every one of {rounds} rounds',
+          not bad_rounds, str(bad_rounds[:3]))
+
+
+def test_a_lock_being_written_is_never_mistaken_for_debris() -> None:
+    """The mechanism of the race: the loser read a file the winner had not finished writing."""
+    session_id = 'unit-halfwritten-' + os.urandom(4).hex()
+    path = registry._lock_path(config.AGENT_CODEX, session_id)
+    config.ensure_dirs()
+
+    # exactly what the old claim left on disk between its create and its write
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('')
+    try:
+        check('an unreadable lock that has just appeared is left alone',
+              registry.read_busy_lock(config.AGENT_CODEX, session_id) is None
+              and os.path.exists(path))
+
+        os.utime(path, (time.time() - registry.UNREADABLE_LOCK_GRACE_SECONDS - 5,) * 2)
+        check('while one old enough to be real debris is cleared',
+              registry.read_busy_lock(config.AGENT_CODEX, session_id) is None
+              and not os.path.exists(path))
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+
+def test_a_claimed_lock_is_readable_the_instant_it_exists() -> None:
+    """Whatever a concurrent claimer sees, it sees a whole record."""
+    session_id = 'unit-whole-' + os.urandom(4).hex()
+    path = registry._lock_path(config.AGENT_CODEX, session_id)
+    seen = []
+    stop = threading.Event()
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    seen.append(json.load(f).get('conversation_id'))
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                seen.append(f'torn: {type(e).__name__}')
+
+    watcher = threading.Thread(target=reader, daemon=True)
+    watcher.start()
+    try:
+        for _ in range(200):
+            with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_whole'):
+                pass
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
+
+    torn = [s for s in seen if s != 'conv_whole']
+    check('a reader racing 200 claims never sees a partial lock file', not torn,
+          str(torn[:3]) + f' of {len(seen)} reads')
+    check('and it did actually observe the lock', len(seen) > 0, str(len(seen)))
+
+
 def run_all() -> None:
     test_busy_lock_is_exclusive()
     test_busy_lock_release_respects_owner()
@@ -2904,6 +3000,9 @@ def run_all() -> None:
     test_in_flight_records_expire_and_are_pruned()
     test_servers_sharing_the_delivery_directory_do_not_trip_over_each_other()
     test_servers_from_before_in_flight_records_share_the_directory_safely()
+    test_the_busy_lock_survives_a_sustained_race()
+    test_a_lock_being_written_is_never_mistaken_for_debris()
+    test_a_claimed_lock_is_readable_the_instant_it_exists()
 
 if __name__ == '__main__':
     # Delivery records are written by any finished job, so a test run left rows like
