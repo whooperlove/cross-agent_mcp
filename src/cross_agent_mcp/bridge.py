@@ -1621,8 +1621,12 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
             'turn, not your wait - this call already returned - so a shorter value only '
             'aborts work that would have finished. Pass a larger one to allow more time.')
 
+    # `is_new_target`, not `is_new_over_cli`: a fresh CLI session is started whenever nothing
+    # was resolved to resume, and that is not only the forced case. Ordinary resolution that
+    # finds no session and no panel starts one too, and calling that a resume misreports it -
+    # and would let the stale-target warning fire about a conversation that does not exist yet.
     delivery = ('ide-panel' if (target or {}).get('ui_shim')
-                else 'cli-new-session' if is_new_over_cli else 'cli-resume')
+                else 'cli-new-session' if is_new_target else 'cli-resume')
     is_carried_by_a_turn = _is_bridge_started_turn()
     if is_carried_by_a_turn:
         warnings.append(_short_lived_carrier_warning(target_agent, delivery))

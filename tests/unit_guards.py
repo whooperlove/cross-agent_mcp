@@ -443,6 +443,23 @@ def test_the_receipt_says_who_chose_the_conversation() -> None:
         check('while a conversation nobody asked for is created',
               ordinary.get('target_selected_by') == bridge.SELECTED_CREATED,
               str(ordinary.get('target_selected_by')))
+
+        # `delivery` says how the message travels, and a fresh CLI session is not a resume.
+        # Forcing one is not the only way to get one: ordinary resolution that finds no
+        # session and no panel starts one too, and reporting that as `cli-resume` describes a
+        # conversation being continued when none existed - which is also what the stale-target
+        # warning keys on, so it could then warn that a session yet to exist looks retired.
+        check('a forced-new conversation with no panel travels as a new CLI session',
+              receipt(bridge.SELECTED_FORCED_NEW, is_new_session=True,
+                      no_target=True).get('delivery') == 'cli-new-session',
+              str(receipt(bridge.SELECTED_FORCED_NEW, is_new_session=True,
+                          no_target=True).get('delivery')))
+        unforced = receipt(bridge.SELECTED_CREATED, no_target=True)
+        check('and so does one nobody forced, where nothing existed to resume',
+              unforced.get('delivery') == 'cli-new-session', str(unforced.get('delivery')))
+        check('while a session that does exist is still a resume',
+              receipt(bridge.SELECTED_CALLER).get('delivery') == 'cli-resume',
+              str(receipt(bridge.SELECTED_CALLER).get('delivery')))
     finally:
         (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
          outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome) = originals
@@ -5694,6 +5711,47 @@ def test_an_answer_that_mentions_two_requests_is_matched_by_the_right_one() -> N
             discovery.find_session = original
 
 
+def test_a_busy_panel_and_an_old_shim_are_handled_the_same_under_both_modes() -> None:
+    """The two ways a panel can fail to host a fresh conversation, against both hook modes."""
+    from cross_agent_mcp import uihook
+    busy = {'agent': 'claude', 'pid': 201, 'socket': '/tmp/busy2.sock', 'started_at': 200.0}
+    old = {'agent': 'claude', 'pid': 202, 'socket': '/tmp/old2.sock', 'started_at': 100.0}
+    statuses = {
+        # a panel already driving a conversation says so
+        '/tmp/busy2.sock': {'ok': True, 'can_create_session': False,
+                            'sessions': [{'session_id': 'sid-busy'}]},
+        # a shim from before the field existed cannot answer at all
+        '/tmp/old2.sock': {'ok': True, 'sessions': [{'session_id': 'sid-old'}]},
+    }
+    originals = (uihook.find_local_shims, uihook.read_status, config.UI_HOOK_MODE,
+                 uihook.is_enabled, discovery.find_active_session)
+    uihook.read_status = lambda shim: statuses[shim['socket']]
+    uihook.is_enabled = lambda: True
+    # an active session exists on disk, so falling back would land in a real conversation
+    discovery.find_active_session = lambda *a, **kw: {
+        'agent': 'claude', 'session_id': 'sid-active', 'cwd': '/w', 'is_active': True,
+        'mtime': 1.0}
+    try:
+        for label, shims in (('a busy panel', [busy]), ('an old shim', [old]),
+                             ('both together', [busy, old])):
+            uihook.find_local_shims = lambda agent, _s=shims: list(_s)
+
+            config.UI_HOOK_MODE = uihook.UI_HOOK_AUTO
+            target = bridge._resolve_target('claude', None, 'cwd', '/w', True, [])
+            check(f'auto: {label} yields no panel target, so the CLI creates a fresh one',
+                  target is None, str(target))
+
+            config.UI_HOOK_MODE = uihook.UI_HOOK_REQUIRE
+            try:
+                bridge._resolve_target('claude', None, 'cwd', '/w', True, [])
+                check(f'require: {label} is refused', False, 'no error raised')
+            except bridge.BridgeError as e:
+                check(f'require: {label} is refused', 'Nothing was sent' in str(e), str(e))
+    finally:
+        (uihook.find_local_shims, uihook.read_status, config.UI_HOOK_MODE,
+         uihook.is_enabled, discovery.find_active_session) = originals
+
+
 def run_all() -> None:
     test_the_suite_writes_nowhere_near_the_real_bridge()
     test_busy_lock_is_exclusive()
@@ -5832,6 +5890,7 @@ def run_all() -> None:
     test_the_codex_shim_opens_a_thread_rather_than_reusing_one()
     test_a_recovered_answer_must_echo_the_request_it_answers()
     test_require_refuses_a_fresh_conversation_the_panel_cannot_open()
+    test_a_busy_panel_and_an_old_shim_are_handled_the_same_under_both_modes()
     test_a_fresh_cli_session_is_created_under_the_id_the_caller_was_given()
     test_a_forced_new_codex_session_is_not_resumed()
     test_an_answer_that_mentions_two_requests_is_matched_by_the_right_one()
