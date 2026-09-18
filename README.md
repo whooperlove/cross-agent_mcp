@@ -544,6 +544,7 @@ Every delivered message carries a header with the sender, conversation ID, and h
 | `CROSS_AGENT_CLAUDE_BIN` / `CROSS_AGENT_CODEX_BIN` | `claude` / `codex` | CLI path |
 | `CROSS_AGENT_CODEX_SCAN_LIMIT` | `2000` | Safety cap on Codex rollout scanning (applies only to scope=`any`) |
 | `CROSS_AGENT_SELF` | (auto-detected) | Force which agent is treated as the caller |
+| `CROSS_AGENT_CHILD_ENV` | (unset) | Extra variable names, comma-separated, to pass to a spawned agent CLI (see below) |
 | `CROSS_AGENT_DEBUG` | (unset) | DEBUG logging when set to any value |
 
 To set a value in Claude Code: `claude mcp add cross-agent -s user -e KEY=VALUE -- <script>`;
@@ -567,6 +568,46 @@ installation made before that was enforced the first time it runs. Two things fo
 - **Its filesystem has to support `chmod`.** If the state directory can't be made owner-only,
   the bridge stops with an error instead of carrying on, rather than write session ids, working
   directories and message summaries somewhere it has just failed to make private.
+### What a spawned agent CLI inherits
+
+When the bridge relays over the CLI rather than the panel, it starts a `claude` or `codex`
+process. That process does **not** get this server's environment. An editor passes its own
+environment to every MCP server it launches, and by then a desktop session has usually
+collected API keys, cloud credentials and whatever a shell profile exports — forwarding all
+of it would hand it to the peer agent and to every command the peer then runs.
+
+The child is built up from a named baseline instead (`config.CHILD_ENV_BASELINE`):
+
+- `PATH`, `HOME`, `SHELL`, `USER`, `LOGNAME` — finding and running the binary
+- `LANG`, `LC_*`, `TERM`, `COLORTERM`, `TZ` — locale and terminal
+- `TMPDIR`/`TEMP`/`TMP` and the `XDG_*` roots — where the CLIs keep state
+- `HTTP(S)_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`,
+  `NODE_EXTRA_CA_CERTS` — reaching the network through a proxy and trusting its CA
+- `__CF_USER_TEXT_ENCODING` — macOS Core Foundation
+- `CLAUDE_CONFIG_DIR`, `CODEX_HOME` — the session stores the bridge itself resolves against
+- the bridge's own settings from the table above, so a spawned agent runs a bridge
+  configured like this one (`CROSS_AGENT_SELF` is deliberately **not** inherited: a child
+  must work out its own identity, not adopt its parent's)
+
+Both CLIs authenticate through files under `HOME` in the normal editor setup, so this is
+enough. If yours authenticates through an environment variable — an API key, a gateway token,
+a credential helper's variable — name it:
+
+```bash
+claude mcp add cross-agent -s user -e CROSS_AGENT_CHILD_ENV=ANTHROPIC_API_KEY -- <script>
+```
+
+**Each name listed there becomes visible to the peer agent and to every command the peer
+runs**, so list the one variable you need rather than a prefix or a family of them. If a CLI
+relay fails and an obvious auth variable was withheld, the error says so and names it, so you
+should not have to guess.
+
+Two withheld variables are worth calling out, because a CLI-relayed peer used to get them:
+
+- `SSH_AUTH_SOCK` — with it, the peer agent can authenticate as you with every key in your
+  ssh-agent. If you want a peer to be able to `git push` over SSH, opt it back in knowingly.
+- `GITHUB_TOKEN`, `AWS_*`, and anything else your shell profile exports — the peer had all of
+  it before, and needs none of it to answer a message.
 
 ## 8. Verification
 
