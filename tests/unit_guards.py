@@ -8,8 +8,6 @@ import errno
 import json
 import os
 import shutil
-import json
-import os
 import stat
 import sys
 import tempfile
@@ -3416,6 +3414,95 @@ def test_a_state_root_that_points_into_a_store_is_refused_before_it_is_followed(
               f'{oct(_mode(real_store))} {oct(_mode(real_store + "/projects"))}')
 
 
+def test_the_repair_only_touches_what_the_bridge_owns() -> None:
+    """CROSS_AGENT_HOME can be pointed at a directory that already has things in it. Tightening
+    everything found there would re-mode the user's own files for being in the wrong place."""
+    with _throwaway_state_home() as home:
+        config.ensure_dirs()
+
+        theirs_dir = home + 'my-important-stuff'
+        os.makedirs(theirs_dir, exist_ok=True)
+        theirs_file = theirs_dir + '/notes.txt'
+        with open(theirs_file, 'w', encoding='utf-8') as f:
+            f.write('mine')
+        loose_file = home + 'README.md'
+        with open(loose_file, 'w', encoding='utf-8') as f:
+            f.write('mine too')
+        os.chmod(theirs_dir, 0o755)
+        os.chmod(theirs_file, 0o644)
+        os.chmod(loose_file, 0o644)
+
+        ours = home + 'deliveries/req_ours_000000.json'
+        with open(ours, 'w', encoding='utf-8') as f:
+            f.write('{}')
+        os.chmod(ours, 0o644)
+        os.chmod(home + 'locks', 0o755)
+
+        config.repair_state_permissions(home)
+
+        check('an unrelated directory in the state root keeps its permissions',
+              _mode(theirs_dir) == 0o755 and _mode(theirs_file) == 0o644,
+              f'{oct(_mode(theirs_dir))} {oct(_mode(theirs_file))}')
+        check('and so does an unrelated file beside the registry',
+              _mode(loose_file) == 0o644, oct(_mode(loose_file)))
+        check('while the directories and files the bridge owns are repaired',
+              _mode(ours) == 0o600 and _mode(home + 'locks') == 0o700,
+              f'{oct(_mode(ours))} {oct(_mode(home + "locks"))}')
+
+
+def test_a_shim_log_written_before_this_is_tightened_when_it_is_next_opened() -> None:
+    """open(2)'s mode applies only when it creates the file, so an existing log kept whatever
+    it had while being appended to through a handler that looks secure."""
+    with _throwaway_state_home():
+        config.ensure_dirs()
+        path = config.LOG_DIR + 'shim-claude.log'
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('written by an older build\n')
+        os.chmod(path, 0o644)
+        check('the log starts out readable by everyone', _mode(path) == 0o644)
+
+        handler = panel.SecureRotatingFileHandler(path, encoding='utf-8')
+        logging = __import__('logging')
+        handler.emit(logging.LogRecord('t', 20, __file__, 1, 'new line', None, None))
+        handler.close()
+
+        check('opening it through the handler tightens it', _mode(path) == 0o600,
+              oct(_mode(path)))
+        with open(path, encoding='utf-8') as f:
+            kept = f.read()
+        check('and nothing that was already in it is lost',
+              'written by an older build' in kept and 'new line' in kept, kept[:80])
+
+
+def test_state_that_cannot_be_made_private_is_refused_rather_than_used() -> None:
+    """Carrying on would mean writing sessions and messages into a directory the bridge has
+    just failed to make private, while everything else assumes it succeeded."""
+    with _throwaway_state_home() as home:
+        target = home + 'unchmodable'
+        original_chmod = os.chmod
+
+        def refuse_chmod(path, mode, *args, **kwargs):
+            if os.path.realpath(str(path)) == os.path.realpath(target):
+                raise OSError(errno.EPERM, 'operation not permitted')
+            return original_chmod(path, mode, *args, **kwargs)
+
+        os.chmod = refuse_chmod
+        try:
+            config.secure_makedirs(target)
+            check('a directory that cannot be made owner-only is refused', False,
+                  'no error raised')
+        except OSError as e:
+            check('a directory that cannot be made owner-only is refused',
+                  'owner-only' in str(e), str(e))
+            check('and the error says what to do about it',
+                  'CROSS_AGENT_HOME' in str(e), str(e))
+        finally:
+            os.chmod = original_chmod
+
+        check('while the migration walk stays best-effort and never raises',
+              config.repair_state_permissions(home) >= 0)
+
+
 def run_all() -> None:
     test_the_suite_writes_nowhere_near_the_real_bridge()
     test_busy_lock_is_exclusive()
@@ -3502,6 +3589,9 @@ def run_all() -> None:
     test_the_repair_never_touches_the_agents_own_transcript_stores()
     test_a_store_nested_under_the_state_root_is_walked_past_not_into()
     test_a_state_root_that_points_into_a_store_is_refused_before_it_is_followed()
+    test_the_repair_only_touches_what_the_bridge_owns()
+    test_a_shim_log_written_before_this_is_tightened_when_it_is_next_opened()
+    test_state_that_cannot_be_made_private_is_refused_rather_than_used()
 
 if __name__ == '__main__':
     # The delivery directory used to be redirected here on its own, because finished jobs left

@@ -149,6 +149,15 @@ def is_protected_path(path: str) -> bool:
     return any(_within(real, root) for root in _PROTECTED_TREES)
 
 
+# What the bridge owns inside its state root, by name. The repair walk visits only these,
+# because CROSS_AGENT_HOME can be pointed at a directory that already has things in it -
+# `~/git` would do - and "tighten everything I find" would then re-mode the user's own files
+# for the crime of being in the wrong directory. Anything the bridge writes is either one of
+# these files or inside one of these directories.
+MANAGED_FILES: tuple = ('registry.json', 'registry.json.lock', 'registry.json.tmp')
+MANAGED_SUBDIRS: tuple = ('locks', 'logs', 'deliveries', 'panels')
+
+
 def secure_makedirs(path: str) -> None:
     """Create a state directory nobody else can read, whatever the umask says.
 
@@ -165,9 +174,19 @@ def secure_makedirs(path: str) -> None:
 
     os.makedirs(path, mode=DIR_MODE, exist_ok=True)
     # makedirs applies the umask to `mode`, and says nothing at all about a directory that
-    # already existed; chmod is what actually settles both cases.
-    with contextlib.suppress(OSError):
+    # already existed; chmod is what actually settles both cases. A failure here is raised
+    # rather than swallowed: this is state being created to be used, and carrying on would
+    # mean the bridge writing sessions and messages into a directory it has just failed to
+    # make private, while every other part of it assumes otherwise. Best-effort belongs in
+    # the migration walk, where the alternative to skipping a path is not starting at all.
+    try:
         os.chmod(path, DIR_MODE)
+    except OSError as e:
+        raise OSError(
+            f'cannot make {path} owner-only ({e}). The bridge keeps session ids, working '
+            'directories and message summaries there, so it will not use a directory whose '
+            'permissions it could not set. Point CROSS_AGENT_HOME at a filesystem that '
+            'supports it.') from e
 
 
 def secure_open(path: str, mode: str = 'w') -> IO[str]:
@@ -205,26 +224,37 @@ def repair_state_permissions(root: Optional[str] = None) -> int:
     if is_protected_path(base):
         return 0
 
-    repaired = 0
-    for current, dirs, files in os.walk(base, followlinks=False):
-        # Prune rather than only refuse at the top: a store can sit *beneath* a legitimate
-        # state root - CLAUDE_CONFIG_DIR inside CROSS_AGENT_HOME is all it takes - and a walk
-        # that only checked its starting point would march straight into it.
-        pruned = [name for name in dirs if is_protected_path(os.path.join(current, name))]
-        for name in pruned:
-            dirs.remove(name)
+    repaired = _repair_path(base, DIR_MODE)
+    for name in MANAGED_FILES:
+        repaired += _repair_path(os.path.join(base, name), FILE_MODE)
 
-        for path, wanted in ([(current, DIR_MODE)]
-                             + [(os.path.join(current, name), FILE_MODE) for name in files]):
-            try:
-                info = os.lstat(path)
-                if stat.S_ISLNK(info.st_mode) or not stat.S_IMODE(info.st_mode) & 0o077:
-                    continue
-                os.chmod(path, wanted)
-                repaired += 1
-            except OSError:
-                continue
+    for name in MANAGED_SUBDIRS:
+        directory = os.path.join(base, name)
+        if not os.path.isdir(directory) or is_protected_path(directory):
+            continue
+        for current, dirs, files in os.walk(directory, followlinks=False):
+            # Prune rather than only refuse at the top: a store can sit *beneath* a state
+            # directory - nothing stops CLAUDE_CONFIG_DIR being set there - and a walk that
+            # only checked where it started would march straight into it.
+            for protected in [d for d in dirs if is_protected_path(os.path.join(current, d))]:
+                dirs.remove(protected)
+
+            repaired += _repair_path(current, DIR_MODE)
+            for filename in files:
+                repaired += _repair_path(os.path.join(current, filename), FILE_MODE)
     return repaired
+
+
+def _repair_path(path: str, wanted: int) -> int:
+    """Tighten one path if it is open to anyone else. Never follows a symlink, never raises."""
+    try:
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_IMODE(info.st_mode) & 0o077:
+            return 0
+        os.chmod(path, wanted)
+        return 1
+    except OSError:
+        return 0
 
 
 def ensure_dirs() -> None:

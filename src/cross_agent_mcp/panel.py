@@ -99,8 +99,16 @@ class SecureRotatingFileHandler(logging.handlers.RotatingFileHandler):
 
     def _open(self):
         flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if 'w' in self.mode else os.O_APPEND)
-        return os.fdopen(os.open(self.baseFilename, flags, config.FILE_MODE),
-                         self.mode, encoding=self.encoding)
+        fd = os.open(self.baseFilename, flags, config.FILE_MODE)
+        try:
+            # open(2)'s mode argument applies only when it creates the file, so a log that
+            # already exists keeps whatever it had - which is how a log written before any of
+            # this stayed 0644 while being appended to through a handler that looks secure.
+            os.fchmod(fd, config.FILE_MODE)
+        except OSError:
+            os.close(fd)
+            raise
+        return os.fdopen(fd, self.mode, encoding=self.encoding)
 
 
 def shim_logger(agent: str) -> logging.Logger:
@@ -116,7 +124,10 @@ def shim_logger(agent: str) -> logging.Logger:
     log.setLevel(logging.INFO)
     log.propagate = False
     try:
-        config.secure_makedirs(config.LOG_DIR)
+        # ensure_dirs rather than secure_makedirs: it also runs the once-per-process repair,
+        # and a shim is a separate process that otherwise never calls it - which left the
+        # shim logs as the one part of the state tree an upgrade never reached.
+        config.ensure_dirs()
         handler = SecureRotatingFileHandler(
             config.LOG_DIR + f'shim-{agent}.log', maxBytes=1_000_000, backupCount=2,
             encoding='utf-8')
