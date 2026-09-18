@@ -90,6 +90,19 @@ def request_token_in(text: Optional[str]) -> Optional[str]:
     return match.group(0) if match else None
 
 
+class SecureRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """A rotating log whose every generation is owner-only, including after a rollover.
+
+    Rotation opens the next file itself, so setting the mode once on the first one would
+    leave every later generation at whatever the umask gives it.
+    """
+
+    def _open(self):
+        flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if 'w' in self.mode else os.O_APPEND)
+        return os.fdopen(os.open(self.baseFilename, flags, config.FILE_MODE),
+                         self.mode, encoding=self.encoding)
+
+
 def shim_logger(agent: str) -> logging.Logger:
     """A per-process log for the shim, so a turn it lost track of can be reconstructed later.
 
@@ -103,8 +116,8 @@ def shim_logger(agent: str) -> logging.Logger:
     log.setLevel(logging.INFO)
     log.propagate = False
     try:
-        os.makedirs(config.LOG_DIR, exist_ok=True)
-        handler = logging.handlers.RotatingFileHandler(
+        config.secure_makedirs(config.LOG_DIR)
+        handler = SecureRotatingFileHandler(
             config.LOG_DIR + f'shim-{agent}.log', maxBytes=1_000_000, backupCount=2,
             encoding='utf-8')
         handler.setFormatter(logging.Formatter(
@@ -264,7 +277,7 @@ class PanelShim:
     # --------------------------------------------------------------- registry
 
     def register(self) -> None:
-        os.makedirs(REGISTRY_DIR, exist_ok=True)
+        config.secure_makedirs(REGISTRY_DIR)
         record = {
             'agent': self.agent,
             'pid': os.getpid(),
@@ -273,7 +286,7 @@ class PanelShim:
             'started_at': time.time(),
             'argv': self.argv,
         }
-        with open(self.registry_path, 'w', encoding='utf-8') as f:
+        with config.secure_open(self.registry_path) as f:
             json.dump(record, f)
 
     def unregister(self) -> None:

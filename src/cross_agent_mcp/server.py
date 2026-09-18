@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 
-from . import bridge, caller, config, discovery, outbox, registry, uihook
+from . import bridge, caller, config, discovery, outbox, panel, registry, uihook
 
 
 logger = logging.getLogger('cross_agent_mcp')
@@ -48,7 +48,7 @@ def init_logging() -> None:
 
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-    file_handler = logging.handlers.RotatingFileHandler(
+    file_handler = panel.SecureRotatingFileHandler(
         config.LOG_PATH, maxBytes=2_000_000, backupCount=3, encoding='utf-8')
     file_handler.setFormatter(formatter)
     package_logger.addHandler(file_handler)

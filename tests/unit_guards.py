@@ -8,6 +8,9 @@ import errno
 import json
 import os
 import shutil
+import json
+import os
+import stat
 import sys
 import tempfile
 import threading
@@ -25,7 +28,7 @@ os.environ['CODEX_HOME'] = STATE_ROOT + '/codex'
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/src')
 
-from cross_agent_mcp import bridge, config, discovery, outbox, registry  # noqa: E402
+from cross_agent_mcp import bridge, config, discovery, outbox, panel, registry  # noqa: E402
 
 
 FAILURES = []
@@ -3171,6 +3174,180 @@ def test_the_transition_guard_cannot_be_held_hostage_by_another_account() -> Non
                 os.chmod(guard, 0o600)
     finally:
         os.umask(previous_umask)
+# ------------------------------------------- state on disk is readable only by its owner
+
+STATE_PATHS = ('HOME_DIR', 'REGISTRY_PATH', 'LOCK_DIR', 'LOG_DIR', 'LOG_PATH', 'DELIVERY_DIR')
+
+
+@contextlib.contextmanager
+def _throwaway_state_home(umask: int = 0o022):
+    """Point every state path at a temporary tree, under a deliberately permissive umask.
+
+    0022 is the default on every distribution this runs on, so it is the umask these modes
+    have to hold under: a test that inherits a strict one would pass without proving anything.
+    """
+    saved = {name: getattr(config, name) for name in STATE_PATHS}
+    saved_repaired = config._is_repaired
+    previous_umask = os.umask(umask)
+    try:
+        with tempfile.TemporaryDirectory(prefix='cross-agent-test-modes-') as home:
+            config.HOME_DIR = home + '/'
+            config.REGISTRY_PATH = config.HOME_DIR + 'registry.json'
+            config.LOCK_DIR = config.HOME_DIR + 'locks/'
+            config.LOG_DIR = config.HOME_DIR + 'logs/'
+            config.LOG_PATH = config.LOG_DIR + 'bridge.log'
+            config.DELIVERY_DIR = config.HOME_DIR + 'deliveries/'
+            config._is_repaired = False
+            yield config.HOME_DIR
+    finally:
+        os.umask(previous_umask)
+        for name, value in saved.items():
+            setattr(config, name, value)
+        config._is_repaired = saved_repaired
+
+
+def _mode(path: str) -> int:
+    return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+def _too_open(root: str):
+    """Every path under `root` that grants anything to group or other."""
+    loose = []
+    for current, _, files in os.walk(root):
+        for path in [current] + [os.path.join(current, name) for name in files]:
+            if _mode(path) & 0o077:
+                loose.append(f'{path} {oct(_mode(path))}')
+    return loose
+
+
+def test_the_state_tree_is_owner_only() -> None:
+    with _throwaway_state_home() as home:
+        config.ensure_dirs()
+        registry.set_pin(config.AGENT_CODEX, home, 'sid-modes', home)
+        with registry.busy_lock(config.AGENT_CODEX, 'sid-modes', 'conv_modes'):
+            lock_mode = _mode(registry._lock_path(config.AGENT_CODEX, 'sid-modes'))
+        outbox._write_record({'delivery_id': 'req_modes_000000', 'state': 'queued'},
+                             is_finished=False)
+        log = panel.SecureRotatingFileHandler(config.LOG_PATH, encoding='utf-8')
+        log.emit(__import__('logging').LogRecord('t', 20, __file__, 1, 'hello', None, None))
+        log.close()
+
+        check('every state directory is 0700',
+              _mode(home) == 0o700 and _mode(config.LOCK_DIR) == 0o700
+              and _mode(config.LOG_DIR) == 0o700 and _mode(config.DELIVERY_DIR) == 0o700,
+              f'{oct(_mode(home))} {oct(_mode(config.LOCK_DIR))} '
+              f'{oct(_mode(config.LOG_DIR))} {oct(_mode(config.DELIVERY_DIR))}')
+        check('the registry, its lock, a delivery record and the log are 0600',
+              _mode(config.REGISTRY_PATH) == 0o600 and lock_mode == 0o600
+              and _mode(config.LOG_PATH) == 0o600, str(_too_open(home)))
+        check('nothing under the state tree is readable by anyone else',
+              not _too_open(home), str(_too_open(home)))
+
+
+def test_a_panel_registration_is_owner_only() -> None:
+    with _throwaway_state_home() as home:
+        config.ensure_dirs()
+        shim = panel.PanelShim.__new__(panel.PanelShim)
+        shim.agent = config.AGENT_CLAUDE
+        shim.argv = ['--resume=sid-modes']
+        shim.registry_path = home + 'panels/claude-test.json'
+        shim.socket_path = home + 'panels/claude-test.sock'
+        panel.REGISTRY_DIR = home + 'panels/'
+        try:
+            shim.register()
+        finally:
+            panel.REGISTRY_DIR = config.HOME_DIR + 'panels/'
+
+        check('the panel registry directory is 0700', _mode(home + 'panels') == 0o700,
+              oct(_mode(home + 'panels')))
+        check('a panel registration file is 0600', _mode(shim.registry_path) == 0o600,
+              oct(_mode(shim.registry_path)))
+
+
+def test_a_delivery_record_is_owner_only_before_it_is_renamed_into_place() -> None:
+    """The temporary must never be the world-readable copy the rename then publishes."""
+    seen = {}
+    original_replace = outbox.os.replace
+
+    def watched_replace(src, dst):
+        seen['mode'] = _mode(src)
+        return original_replace(src, dst)
+
+    with _throwaway_state_home():
+        config.ensure_dirs()
+        outbox.os.replace = watched_replace
+        try:
+            outbox._write_record({'delivery_id': 'req_modes_111111', 'state': 'delivered'},
+                                 is_finished=True)
+        finally:
+            outbox.os.replace = original_replace
+        final = _mode(config.DELIVERY_DIR + 'req_modes_111111.json')
+
+    check('the temporary a delivery record is written to is already 0600',
+          seen.get('mode') == 0o600, oct(seen.get('mode', 0)))
+    check('and the record it is renamed into place as stays 0600', final == 0o600, oct(final))
+
+
+def test_a_rotated_log_generation_is_owner_only() -> None:
+    """Rotation opens the next file itself, so the mode has to survive a rollover."""
+    with _throwaway_state_home():
+        config.ensure_dirs()
+        handler = panel.SecureRotatingFileHandler(config.LOG_PATH, maxBytes=200, backupCount=1,
+                                                  encoding='utf-8')
+        logging = __import__('logging')
+        for index in range(20):
+            handler.emit(logging.LogRecord('t', 20, __file__, index, 'x' * 60, None, None))
+        handler.close()
+
+        rotated = config.LOG_PATH + '.1'
+        check('the log rotated during the test', os.path.exists(rotated))
+        check('both the current and the rotated log are 0600',
+              _mode(config.LOG_PATH) == 0o600 and os.path.exists(rotated)
+              and _mode(rotated) == 0o600,
+              f'{oct(_mode(config.LOG_PATH))} '
+              f'{oct(_mode(rotated)) if os.path.exists(rotated) else "missing"}')
+
+
+def test_an_installation_from_before_this_is_repaired_on_startup() -> None:
+    """New files are created owner-only; an existing tree has to be tightened, not left."""
+    with _throwaway_state_home() as home:
+        for directory in (home, home + 'locks/', home + 'logs/', home + 'deliveries/'):
+            os.makedirs(directory, exist_ok=True)
+            os.chmod(directory, 0o755)
+        legacy = home + 'deliveries/req_legacy_000000.json'
+        with open(legacy, 'w', encoding='utf-8') as f:
+            f.write('{}')
+        os.chmod(legacy, 0o644)
+
+        check('the tree starts out readable by everyone', bool(_too_open(home)))
+        config.ensure_dirs()
+        check('startup tightened every path that was left open', not _too_open(home),
+              str(_too_open(home)))
+        check('and the repaired file is still readable by its owner',
+              _mode(legacy) == 0o600 and open(legacy, encoding='utf-8').read() == '{}')
+
+
+def test_the_repair_never_touches_the_agents_own_transcript_stores() -> None:
+    """CROSS_AGENT_HOME is user-supplied; pointed at ~ it must not re-mode the user's files."""
+    with tempfile.TemporaryDirectory(prefix='cross-agent-test-protected-') as store:
+        victim = store + '/notes.txt'
+        with open(victim, 'w', encoding='utf-8') as f:
+            f.write('mine')
+        os.chmod(victim, 0o644)
+
+        saved = config._PROTECTED_ROOTS
+        config._PROTECTED_ROOTS = saved | {os.path.realpath(store)}
+        try:
+            repaired = config.repair_state_permissions(store)
+        finally:
+            config._PROTECTED_ROOTS = saved
+
+        check('a protected root is refused outright', repaired == 0, str(repaired))
+        check('and nothing under it was re-moded', _mode(victim) == 0o644, oct(_mode(victim)))
+        check('the real protected set covers home and both transcript stores',
+              os.path.realpath(os.path.expanduser('~')) in config._PROTECTED_ROOTS
+              and os.path.realpath(config.CLAUDE_PROJECTS_DIR) in config._PROTECTED_ROOTS
+              and os.path.realpath(config.CODEX_SESSIONS_DIR) in config._PROTECTED_ROOTS)
 
 
 def run_all() -> None:
@@ -3251,6 +3428,12 @@ def run_all() -> None:
     test_a_stale_clear_cannot_delete_the_lock_that_replaced_it()
     test_the_no_hard_link_fallback_is_still_exclusive_under_contention()
     test_the_transition_guard_cannot_be_held_hostage_by_another_account()
+    test_the_state_tree_is_owner_only()
+    test_a_panel_registration_is_owner_only()
+    test_a_delivery_record_is_owner_only_before_it_is_renamed_into_place()
+    test_a_rotated_log_generation_is_owner_only()
+    test_an_installation_from_before_this_is_repaired_on_startup()
+    test_the_repair_never_touches_the_agents_own_transcript_stores()
 
 if __name__ == '__main__':
     # The delivery directory used to be redirected here on its own, because finished jobs left

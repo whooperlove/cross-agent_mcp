@@ -119,10 +119,13 @@ def _write_json_atomically(path: str, record: Dict[str, Any]) -> None:
 
     A reader in any process sees the previous record or the new one, never half of either, and
     two writers never truncate each other's temporary.
+
+    The temporary is owner-only from the moment it exists, so the rename never publishes a
+    record that was briefly world-readable under it.
     """
     tmp = f'{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp'
     try:
-        with open(tmp, 'w', encoding='utf-8') as f:
+        with config.secure_open(tmp) as f:
             json.dump(record, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
     except BaseException:
@@ -146,7 +149,7 @@ def _write_record(record: Dict[str, Any], is_finished: bool = True) -> None:
     """
     try:
         config.ensure_dirs()
-        os.makedirs(_in_flight_dir(), exist_ok=True)
+        config.secure_makedirs(_in_flight_dir())
         now = time.time()
         stamped = {**record, 'origin_pid': record.get('origin_pid') or os.getpid(),
                    'updated_at': now}

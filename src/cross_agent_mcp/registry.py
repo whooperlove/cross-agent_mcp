@@ -88,7 +88,7 @@ def update_registry(mutator: Callable[[Dict[str, Any]], Any]) -> Any:
     config.ensure_dirs()
     lock_path = config.REGISTRY_PATH + '.lock'
 
-    with open(lock_path, 'a+', encoding='utf-8') as lock_file:
+    with config.secure_open(lock_path, 'a+') as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             data = _read_unlocked(config.REGISTRY_PATH)
@@ -96,7 +96,7 @@ def update_registry(mutator: Callable[[Dict[str, Any]], Any]) -> Any:
             _prune(data)
 
             tmp_path = config.REGISTRY_PATH + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
+            with config.secure_open(tmp_path) as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, config.REGISTRY_PATH)
             return result

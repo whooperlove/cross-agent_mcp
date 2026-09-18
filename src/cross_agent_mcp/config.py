@@ -5,8 +5,10 @@ tuned from the MCP client configuration (Claude Code `.mcp.json`, Codex `config.
 without touching the code.
 """
 
+import contextlib
 import os
-from typing import Optional
+import stat
+from typing import IO, Optional
 
 
 def get_env_str(name: str, default: str) -> str:
@@ -102,6 +104,89 @@ AGENT_CLAUDE: str = 'claude'
 AGENT_CODEX: str = 'codex'
 
 
+# Everything the bridge writes is owner-only. The state tree names the sessions being
+# bridged, the directories they run in, and a one-line summary of every message relayed; the
+# logs add the routing around them. None of that is another account's business, and the
+# user's umask is not a safe place to decide it - a default 0022 leaves it all world-readable.
+DIR_MODE: int = 0o700
+FILE_MODE: int = 0o600
+
+# whether this process has already repaired a state tree created before those modes
+_is_repaired: bool = False
+
+# Directories the repair walk must never descend into, however CROSS_AGENT_HOME is set: the
+# user's own files, and the two agents' transcript stores, are not the bridge's to re-mode.
+_PROTECTED_ROOTS = {os.path.realpath(p) for p in (
+    '/', os.path.expanduser('~'), CLAUDE_HOME_DIR, CLAUDE_PROJECTS_DIR,
+    CODEX_HOME_DIR, CODEX_SESSIONS_DIR)}
+
+
+def secure_makedirs(path: str) -> None:
+    """Create a state directory nobody else can read, whatever the umask says."""
+    os.makedirs(path, mode=DIR_MODE, exist_ok=True)
+    # makedirs applies the umask to `mode`, and says nothing at all about a directory that
+    # already existed; chmod is what actually settles both cases.
+    with contextlib.suppress(OSError):
+        os.chmod(path, DIR_MODE)
+
+
+def secure_open(path: str, mode: str = 'w') -> IO[str]:
+    """Open a state file for writing, created owner-only from the first byte.
+
+    The mode is given to `open(2)` rather than applied afterwards, so the file is never
+    briefly readable by anyone else - which matters most for the temporary a delivery record
+    is written to before it is renamed into place.
+    """
+    flags = os.O_WRONLY | os.O_CREAT
+    if 'x' in mode:
+        flags |= os.O_EXCL
+    elif 'a' in mode:
+        flags |= os.O_APPEND
+    else:
+        flags |= os.O_TRUNC
+    if '+' in mode:
+        flags = (flags & ~os.O_WRONLY) | os.O_RDWR
+    return os.fdopen(os.open(path, flags, FILE_MODE), mode, encoding='utf-8')
+
+
+def repair_state_permissions(root: Optional[str] = None) -> int:
+    """Tighten a state tree written before these modes were enforced. Returns what it changed.
+
+    New files are created owner-only, but an installation that predates that keeps whatever
+    the umask gave it - so the modes have to be repaired, not merely applied from here on.
+    Only paths that grant something to group or other are touched, symlinks are never
+    followed, and a failure on one path never stops the walk: this runs at startup and must
+    not be able to stop the bridge from working.
+    """
+    base = root if root is not None else HOME_DIR
+    # CROSS_AGENT_HOME is user-supplied. Pointed at a home directory or a transcript store it
+    # would walk the user's own files and tighten them, so a root that is not a directory of
+    # the bridge's own is left alone.
+    if os.path.realpath(base) in _PROTECTED_ROOTS:
+        return 0
+
+    repaired = 0
+    for current, _, files in os.walk(base, followlinks=False):
+        for path, wanted in ([(current, DIR_MODE)]
+                             + [(os.path.join(current, name), FILE_MODE) for name in files]):
+            try:
+                info = os.lstat(path)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_IMODE(info.st_mode) & 0o077:
+                    continue
+                os.chmod(path, wanted)
+                repaired += 1
+            except OSError:
+                continue
+    return repaired
+
+
 def ensure_dirs() -> None:
+    global _is_repaired
     for path in (HOME_DIR, LOCK_DIR, LOG_DIR, DELIVERY_DIR):
-        os.makedirs(path, exist_ok=True)
+        secure_makedirs(path)
+
+    if not _is_repaired:
+        # once per process, on the first thing that needs the state tree - so every entry
+        # point repairs an old installation without each one having to remember to
+        _is_repaired = True
+        repair_state_permissions()
