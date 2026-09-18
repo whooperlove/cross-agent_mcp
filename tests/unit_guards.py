@@ -3091,6 +3091,45 @@ def test_the_transition_guard_cannot_be_held_hostage_by_another_account() -> Non
         mode = stat_module.S_IMODE(os.lstat(guard).st_mode)
         check('and one left open by an earlier build is repaired on the next use',
               mode == 0o600, oct(mode))
+
+        # a filesystem that will not tighten it must stop the bridge, not be worked around
+        original_fchmod = os.fchmod
+
+        def refuse_fchmod(fd, mode_):
+            raise OSError(1, 'operation not permitted')
+
+        os.fchmod = refuse_fchmod
+        try:
+            with registry.busy_lock(config.AGENT_CODEX, 'unit-guardfail-' + os.urandom(3).hex(),
+                                    'conv_guard'):
+                pass
+            check('a guard that cannot be made owner-only refuses to be used', False,
+                  'the lock was taken anyway')
+        except OSError as e:
+            check('a guard that cannot be made owner-only refuses to be used',
+                  'not permitted' in str(e) or 'owner-only' in str(e), str(e))
+        finally:
+            os.fchmod = original_fchmod
+
+        # and one that silently ignores the chmod is caught by reading the mode back
+        def lying_fchmod(fd, mode_):
+            return None
+
+        os.chmod(guard, 0o644)
+        os.fchmod = lying_fchmod
+        try:
+            with registry.busy_lock(config.AGENT_CODEX, 'unit-guardlie-' + os.urandom(3).hex(),
+                                    'conv_guard'):
+                pass
+            check('a filesystem that ignores the chmod is caught by reading it back', False,
+                  'the lock was taken anyway')
+        except OSError as e:
+            check('a filesystem that ignores the chmod is caught by reading it back',
+                  'after being set to 0600' in str(e), str(e))
+        finally:
+            os.fchmod = original_fchmod
+            with contextlib.suppress(OSError):
+                os.chmod(guard, 0o600)
     finally:
         os.umask(previous_umask)
 

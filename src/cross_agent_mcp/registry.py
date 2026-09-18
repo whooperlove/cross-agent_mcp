@@ -10,6 +10,7 @@ import fcntl
 import json
 import logging
 import os
+import stat
 import time
 import uuid
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -212,8 +213,18 @@ def _lock_transition() -> Iterator[None]:
     config.ensure_dirs()
     fd = os.open(_guard_path(), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        with contextlib.suppress(OSError):
-            os.fchmod(fd, 0o600)
+        # Not best-effort. A guard that stays group- or world-writable is one anyone on the
+        # machine can hold exclusively and never release, so failing to set the mode means
+        # the protection is not there - and carrying on would take the lock anyway and call
+        # it safe. Verified after the fact rather than assumed, because a filesystem that
+        # ignores fchmod reports success.
+        os.fchmod(fd, 0o600)
+        mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        if mode & 0o077:
+            raise OSError(
+                f'{_guard_path()} is {oct(mode)} after being set to 0600. The bridge '
+                'serialises its lock decisions through that file, so a filesystem that will '
+                'not make it owner-only leaves every delivery stoppable by any account here.')
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             yield
