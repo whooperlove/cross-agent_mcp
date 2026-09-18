@@ -175,6 +175,45 @@ def _lock_path(agent: str, session_id: str) -> str:
     return config.LOCK_DIR + f'{agent}__{session_id}.lock'
 
 
+def _guard_path() -> str:
+    """The file whose flock serialises every decision about a busy lock.
+
+    One guard for the whole lock directory rather than one per session. Everything held under
+    it is a single small filesystem operation - read a record, link a file, unlink a file -
+    with no waiting of any kind inside, so the contention it adds is not measurable, and a
+    guard per session would leave a file behind for every session ever locked.
+    """
+    return config.LOCK_DIR + '.transitions.guard'
+
+
+@contextlib.contextmanager
+def _lock_transition() -> Iterator[None]:
+    """Hold the lock directory still for one read-decide-write.
+
+    Making the claim atomic stopped a loser corrupting a winner's lock, but left a second race
+    in the other direction, between a reader and a claimer:
+
+      1. A reads a lock whose holder is dead and decides to clear it;
+      2. B clears it first and claims the session for itself;
+      3. A, still acting on what it read, unlinks B's perfectly good lock.
+
+    The session is then unlocked while B believes it holds it, which is the same ending by a
+    different road. Neither step is atomic on its own and no amount of care inside one of them
+    helps, because the decision and the act are separated by whatever the scheduler does in
+    between. The guard puts them back together.
+
+    The kernel drops an flock when the holder exits, so a process dying in here cannot wedge
+    the directory.
+    """
+    config.ensure_dirs()
+    with open(_guard_path(), 'a+', encoding='utf-8') as guard:
+        fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+
+
 def _mtime(path: str) -> float:
     try:
         return os.path.getmtime(path)
@@ -192,6 +231,12 @@ def _is_pid_alive(pid: int) -> bool:
 
 def read_busy_lock(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
     """Return the live lock record for a session, clearing it when it is stale."""
+    with _lock_transition():
+        return _read_busy_lock_held(agent, session_id)
+
+
+def _read_busy_lock_held(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
+    """As read_busy_lock, for a caller that is already holding the transition guard."""
     path = _lock_path(agent, session_id)
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -266,7 +311,16 @@ def _claim_lock_file(path: str, payload: str) -> bool:
 
 
 def _release_lock_file(path: str, token: str) -> None:
-    """Remove the lock only while we still own it, never somebody else's fresh claim."""
+    """Remove the lock only while we still own it, never somebody else's fresh claim.
+
+    Under the transition guard for the same reason the stale clear is: checking the token and
+    acting on it are two steps, and between them the lock can become somebody else's.
+    """
+    with _lock_transition():
+        _release_lock_file_held(path, token)
+
+
+def _release_lock_file_held(path: str, token: str) -> None:
     try:
         with open(path, 'r', encoding='utf-8') as f:
             record = json.load(f)
@@ -307,14 +361,17 @@ def busy_lock(agent: str, session_id: str, conversation_id: str,
     })
 
     is_claimed = False
-    # one retry: read_busy_lock clears an abandoned record, and the retry re-races for it
-    for _ in range(2):
-        if _claim_lock_file(path, payload):
-            is_claimed = True
-            break
-        holder = read_busy_lock(agent, session_id)
-        if holder:
-            raise SessionBusyError(holder)
+    # One transition: claim, or read what is there and clear it if it is abandoned, then claim
+    # what we just cleared. Split across two guarded steps, the window between them is exactly
+    # where somebody else's fresh claim would get deleted by our retry.
+    with _lock_transition():
+        for _ in range(2):
+            if _claim_lock_file(path, payload):
+                is_claimed = True
+                break
+            holder = _read_busy_lock_held(agent, session_id)
+            if holder:
+                raise SessionBusyError(holder)
 
     if not is_claimed:
         raise SessionBusyError({'agent': agent, 'session_id': session_id})

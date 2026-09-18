@@ -4,6 +4,7 @@
 """
 
 import contextlib
+import errno
 import json
 import os
 import sys
@@ -2929,6 +2930,125 @@ def test_a_claimed_lock_is_readable_the_instant_it_exists() -> None:
     check('and it did actually observe the lock', len(seen) > 0, str(len(seen)))
 
 
+def test_a_stale_clear_cannot_delete_the_lock_that_replaced_it() -> None:
+    """The second race, in the other direction: a reader decides a lock is abandoned, somebody
+    else clears and reclaims it first, and the reader's unlink then deletes their good lock."""
+    session_id = 'unit-replace-' + os.urandom(4).hex()
+    path = registry._lock_path(config.AGENT_CODEX, session_id)
+    config.ensure_dirs()
+
+    # a lock whose holder is long gone: the reader will decide to clear it
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({'pid': 2 ** 22 - 1, 'token': 'ghost', 'agent': config.AGENT_CODEX,
+                   'session_id': session_id, 'conversation_id': 'conv_ghost',
+                   'started_at': time.time(), 'ttl_seconds': 1}, f)
+
+    reader_is_inside = threading.Event()
+    let_reader_finish = threading.Event()
+    claimed = threading.Event()
+    held_token = {}
+
+    original_is_alive = registry._is_pid_alive
+
+    def pausing_is_alive(pid: int) -> bool:
+        # the reader has read the record and is about to act on it
+        if pid == 2 ** 22 - 1:
+            reader_is_inside.set()
+            let_reader_finish.wait(timeout=10)
+            return False
+        return original_is_alive(pid)
+
+    def reader() -> None:
+        registry.read_busy_lock(config.AGENT_CODEX, session_id)
+
+    def claimer() -> None:
+        try:
+            with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_real'):
+                with open(path, 'r', encoding='utf-8') as f:
+                    held_token['token'] = json.load(f).get('token')
+                claimed.set()
+                time.sleep(0.2)
+        except Exception as e:
+            held_token['error'] = f'{type(e).__name__}: {e}'
+
+    registry._is_pid_alive = pausing_is_alive
+    try:
+        reading = threading.Thread(target=reader)
+        reading.start()
+        check('the reader reached its decision about the stale lock',
+              reader_is_inside.wait(timeout=10))
+
+        claiming = threading.Thread(target=claimer)
+        claiming.start()
+        # with the transition guard held by the reader, the claimer cannot get in front of it
+        check('a claimer cannot slip in while a stale clear is half-done',
+              not claimed.wait(timeout=1.0), str(held_token))
+
+        let_reader_finish.set()
+        check('and once the clear is finished the claim goes through',
+              claimed.wait(timeout=10), str(held_token))
+
+        survivor_exists = os.path.exists(path)
+        survivor = None
+        if survivor_exists:
+            with open(path, 'r', encoding='utf-8') as f:
+                survivor = json.load(f).get('token')
+        claiming.join(timeout=10)
+        reading.join(timeout=10)
+    finally:
+        registry._is_pid_alive = original_is_alive
+        let_reader_finish.set()
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+    check('the new holder\'s lock is still on disk, not deleted by the older reader',
+          survivor_exists and survivor == held_token.get('token'),
+          f'exists={survivor_exists} on_disk={survivor} held={held_token}')
+
+
+def test_the_no_hard_link_fallback_is_still_exclusive_under_contention() -> None:
+    """A filesystem without hard links takes the older claim; the guard has to carry it."""
+    original_link = os.link
+
+    def no_links(src, dst):
+        raise OSError(errno.EPERM, 'hard links not supported here')
+
+    rounds, racers = 12, 6
+    bad_rounds = []
+    os.link = no_links
+    try:
+        for round_number in range(rounds):
+            session_id = f'unit-nolink-{round_number}-' + os.urandom(3).hex()
+            outcomes = []
+            guard = threading.Lock()
+            barrier = threading.Barrier(racers)
+
+            def worker() -> None:
+                barrier.wait()
+                try:
+                    with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_nolink'):
+                        with guard:
+                            outcomes.append('won')
+                        time.sleep(0.01)
+                except registry.SessionBusyError:
+                    with guard:
+                        outcomes.append('refused')
+
+            threads = [threading.Thread(target=worker) for _ in range(racers)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+            if outcomes.count('won') != 1 or len(outcomes) != racers:
+                bad_rounds.append((round_number, list(outcomes)))
+    finally:
+        os.link = original_link
+
+    check('the fallback claim admits exactly one winner too', not bad_rounds,
+          str(bad_rounds[:3]))
+    check('and hard links are back for everything else', os.link is original_link)
+
+
 def run_all() -> None:
     test_busy_lock_is_exclusive()
     test_busy_lock_release_respects_owner()
@@ -3003,6 +3123,8 @@ def run_all() -> None:
     test_the_busy_lock_survives_a_sustained_race()
     test_a_lock_being_written_is_never_mistaken_for_debris()
     test_a_claimed_lock_is_readable_the_instant_it_exists()
+    test_a_stale_clear_cannot_delete_the_lock_that_replaced_it()
+    test_the_no_hard_link_fallback_is_still_exclusive_under_contention()
 
 if __name__ == '__main__':
     # Delivery records are written by any finished job, so a test run left rows like
