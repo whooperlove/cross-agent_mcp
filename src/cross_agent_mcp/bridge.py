@@ -322,16 +322,33 @@ AUTH_ENV_HINTS = (
 
 
 def _auth_hint(env: Dict[str, str]) -> str:
-    """A note naming the auth variables this process has and the child was not given."""
+    """A note naming what this process has that the child was not given, and how to pass it.
+
+    Two kinds end up here: an agent CLI's own credentials, which were never on the baseline,
+    and a proxy setting that turned out to carry a username and password in its URL, which is
+    on the baseline but withheld for exactly that reason. Both look the same to whoever is
+    reading the failure - something that works in their shell does not work through the
+    bridge - so both are named, and neither value is ever printed.
+    """
     withheld = [name for name in AUTH_ENV_HINTS if name in os.environ and name not in env]
-    if not withheld:
+    proxies = [name for name in config.withheld_proxy_vars() if name not in env]
+    if not withheld and not proxies:
         return ''
-    return (f' This process has {", ".join(withheld)} set and the peer CLI was not given '
-            f'{"them" if len(withheld) > 1 else "it"}: the bridge starts a child with a named '
-            f'baseline rather than its own environment. If that CLI authenticates through '
-            f'{"those" if len(withheld) > 1 else "that"}, list '
-            f'{"them" if len(withheld) > 1 else "it"} in '
-            f'{config.ENV_CHILD_PASSTHROUGH}={",".join(withheld)}.')
+
+    parts = []
+    if withheld:
+        parts.append(f'{", ".join(withheld)} (never passed to a child: the bridge starts one '
+                     'with a named baseline rather than its own environment)')
+    if proxies:
+        parts.append(f'{", ".join(proxies)} (withheld because the URL contains a username and '
+                     'password; it is passed whole or not at all, never with the credential '
+                     'stripped out)')
+    names = withheld + proxies
+    return (f' This process has {"; ".join(parts)}. If the peer CLI needs '
+            f'{"them" if len(names) > 1 else "it"}, name '
+            f'{"them" if len(names) > 1 else "it"} in '
+            f'{config.ENV_CHILD_PASSTHROUGH}={",".join(names)} - each name listed there is '
+            'visible to the peer agent and to everything it runs.')
 
 
 def _terminate_group(process: subprocess.Popen) -> None:
@@ -654,7 +671,8 @@ def _call_claude(message: str, session_id: Optional[str], cwd: str, env: Dict[st
                           f'{detail}{_auth_hint(env)}')
 
     if payload.get('is_error'):
-        raise BridgeError(f'claude CLI error: {str(payload.get("result"))[:800]}')
+        # an authentication failure usually arrives here rather than as a missing result
+        raise BridgeError(f'claude CLI error: {str(payload.get("result"))[:800]}{_auth_hint(env)}')
 
     return {
         'session_id': payload.get('session_id') or target_id,

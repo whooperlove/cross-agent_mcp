@@ -321,6 +321,45 @@ def child_env_passthrough() -> tuple:
     return tuple(name.strip() for name in raw.split(',') if name.strip())
 
 
+# A proxy setting is on the baseline because a CLI behind one cannot reach anything without
+# it. But the variable is a URL, and a URL has a place to put a username and password -
+# `https://alice:s3cret@proxy.corp:3128` is an ordinary way to configure an authenticating
+# proxy, and it is a credential sitting inside an allowlisted variable.
+PROXY_ENV_NAMES: frozenset = frozenset({
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY',
+    'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
+})
+
+
+def has_embedded_credentials(value: str) -> bool:
+    """Whether a proxy setting carries userinfo in any of its entries.
+
+    The `@` that separates userinfo from the host is always literal - a username or password
+    containing one is percent-encoded as %40 - so finding one in the authority is enough, and
+    it does not matter whether the credential itself is encoded. A scheme is optional for the
+    same reason: `user:pass@host:8080` is accepted by the CLIs and says just as much.
+    """
+    for entry in value.split(','):
+        authority = entry.strip().split('://', 1)[-1].split('/', 1)[0]
+        if '@' in authority:
+            return True
+    return False
+
+
+def withheld_proxy_vars() -> list:
+    """Proxy variables this process has that a child will not be given, and why.
+
+    Withheld whole rather than rewritten. Stripping the credential out would hand the child a
+    proxy URL that cannot authenticate, so it would fail at the first request with an error
+    about the proxy rather than about the bridge - and the user would be debugging a proxy
+    that works perfectly well everywhere else.
+    """
+    opted_in = set(child_env_passthrough())
+    return [name for name in sorted(PROXY_ENV_NAMES)
+            if name in os.environ and name not in opted_in
+            and has_embedded_credentials(os.environ[name])]
+
+
 def child_env() -> dict:
     """The environment an agent process spawned by this bridge starts with.
 
@@ -329,7 +368,9 @@ def child_env() -> dict:
     particular user happens to export.
     """
     names = list(CHILD_ENV_BASELINE) + list(CHILD_ENV_BRIDGE) + list(child_env_passthrough())
-    return {name: os.environ[name] for name in names if name in os.environ}
+    withheld = set(withheld_proxy_vars())
+    return {name: os.environ[name] for name in names
+            if name in os.environ and name not in withheld}
 
 
 def ensure_dirs() -> None:

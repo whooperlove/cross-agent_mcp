@@ -581,8 +581,13 @@ The child is built up from a named baseline instead (`config.CHILD_ENV_BASELINE`
 - `PATH`, `HOME`, `SHELL`, `USER`, `LOGNAME` — finding and running the binary
 - `LANG`, `LC_*`, `TERM`, `COLORTERM`, `TZ` — locale and terminal
 - `TMPDIR`/`TEMP`/`TMP` and the `XDG_*` roots — where the CLIs keep state
-- `HTTP(S)_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`,
-  `NODE_EXTRA_CA_CERTS` — reaching the network through a proxy and trusting its CA
+- `HTTP(S)_PROXY`, `NO_PROXY`, `ALL_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`,
+  `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS` — reaching the network through a proxy and
+  trusting its CA — **except** a proxy variable whose URL carries a username and password
+  (`https://alice:s3cret@proxy.corp:3128`, or the scheme-less `user:pass@host:8080`), which
+  is withheld whole. It is never rewritten into a credential-free copy: that would hand the
+  CLI a proxy it cannot authenticate to, and the failure would look like a broken proxy
+  rather than a bridge decision. Name it in `CROSS_AGENT_CHILD_ENV` to pass it
 - `__CF_USER_TEXT_ENCODING` — macOS Core Foundation
 - `CLAUDE_CONFIG_DIR`, `CODEX_HOME` — the session stores the bridge itself resolves against
 - the bridge's own settings from the table above, so a spawned agent runs a bridge
