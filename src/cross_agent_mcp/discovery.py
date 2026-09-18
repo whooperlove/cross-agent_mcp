@@ -670,9 +670,21 @@ REQUEST_TOKEN_PATTERN = re.compile(r'\breq_\d+_[0-9a-f]{6}\b')
 
 
 def request_token_in(text: str) -> Optional[str]:
-    """The request id a peer echoed back, if it echoed one."""
+    """The FIRST request id in a message. Use `request_tokens_in` to ask whether one is there."""
     match = REQUEST_TOKEN_PATTERN.search(text)
     return match.group(0) if match else None
+
+
+def request_tokens_in(text: str) -> List[str]:
+    """Every request id a message mentions.
+
+    An answer often names more than one: agents quote the request they are answering, refer
+    back to an earlier one, or paste a delivery id out of a status report. Comparing only the
+    first meant an answer that mentioned an older request and then ended with the right token
+    - exactly the shape the envelope asks for, the id on its own final line - was read as
+    answering something else.
+    """
+    return REQUEST_TOKEN_PATTERN.findall(text)
 
 
 def _parsed(lines: List[str]) -> Iterator[Dict[str, Any]]:
@@ -816,10 +828,10 @@ def _pick_answer(turns: List[Dict[str, Any]], after: Optional[float], token: Opt
 
     if token is not None:
         for turn in spoken:
-            if request_token_in(turn['text']) == token:
+            if token in request_tokens_in(turn['text']):
                 return turn, None
         if fresh:
-            echoed = [e for e in (request_token_in(t['text']) for t in fresh) if e]
+            echoed = sorted({e for t in fresh for e in request_tokens_in(t['text'])})
             logger.info(f'_pick_answer [unmatched]: {label} finished a turn after the request '
                         f'but it does not echo {token}'
                         + (f' (it answers {echoed})' if echoed else '')

@@ -5659,6 +5659,41 @@ def test_a_forced_new_codex_session_is_not_resumed() -> None:
         bridge._run_cli = original
 
 
+def test_an_answer_that_mentions_two_requests_is_matched_by_the_right_one() -> None:
+    """Agents quote ids. An answer that refers back to an earlier request and then ends with
+    this one - exactly the shape the envelope asks for - was read as answering the other."""
+    sent_at = 1_788_600_000.0
+    mine = 'req_1788600000000_aaaaaa'
+    older = 'req_1788500000000_bbbbbb'
+    answer = (f'Picking up where {older} left off - the registry change is done and the '
+              f'tests pass.\n{mine}')
+
+    with tempfile.TemporaryDirectory(prefix='claude-two-tokens-') as store:
+        path = store + '/session.jsonl'
+        original = discovery.find_session
+        discovery.find_session = lambda agent, sid: {'path': path}
+        try:
+            open(path, 'w', encoding='utf-8').write(
+                _claude_line(answer, 'end_turn', 'r1', sent_at + 100) + '\n')
+
+            check('every id a message mentions is found, not just the first',
+                  discovery.request_tokens_in(answer) == [older, mine],
+                  str(discovery.request_tokens_in(answer)))
+            check('an answer quoting an older request still answers this one',
+                  discovery.last_agent_message('claude', 'sid', after=sent_at, token=mine)
+                  == answer)
+            check('and it is not filed as an unrelated turn',
+                  discovery.peer_progress('claude', 'sid', after=sent_at,
+                                          token=mine).get('unmatched_turn') is None)
+            check('while a request it only quotes is still not answered by it',
+                  discovery.last_agent_message('claude', 'sid', after=sent_at - 1000,
+                                               token='req_1788400000000_cccccc') is None)
+            check('the transcript check agrees',
+                  bridge._transcript_answer('claude', 'sid', sent_at, mine) == answer)
+        finally:
+            discovery.find_session = original
+
+
 def run_all() -> None:
     test_the_suite_writes_nowhere_near_the_real_bridge()
     test_busy_lock_is_exclusive()
@@ -5799,6 +5834,7 @@ def run_all() -> None:
     test_require_refuses_a_fresh_conversation_the_panel_cannot_open()
     test_a_fresh_cli_session_is_created_under_the_id_the_caller_was_given()
     test_a_forced_new_codex_session_is_not_resumed()
+    test_an_answer_that_mentions_two_requests_is_matched_by_the_right_one()
 
 if __name__ == '__main__':
     # The delivery directory used to be redirected here on its own, because finished jobs left

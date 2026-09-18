@@ -574,7 +574,7 @@ def _transcript_answer(target_agent: Optional[str], session_id: Optional[str],
         return None
 
     answer = (progress or {}).get('answer')
-    if answer and discovery.request_token_in(answer) == token:
+    if answer and token in discovery.request_tokens_in(answer):
         return answer
     return None
 
@@ -1568,6 +1568,7 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
                 f'delivery={delivery_id} state={job.state}')
 
     is_new_target = is_new_session or target_id is None
+    resolved_session_id = job.resolved_session_id or target_id
     warnings: List[str] = []
     if is_new_over_cli:
         warnings.append(
@@ -1620,7 +1621,8 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
             'turn, not your wait - this call already returned - so a shorter value only '
             'aborts work that would have finished. Pass a larger one to allow more time.')
 
-    delivery = 'ide-panel' if (target or {}).get('ui_shim') else 'cli-resume'
+    delivery = ('ide-panel' if (target or {}).get('ui_shim')
+                else 'cli-new-session' if is_new_over_cli else 'cli-resume')
     is_carried_by_a_turn = _is_bridge_started_turn()
     if is_carried_by_a_turn:
         warnings.append(_short_lived_carrier_warning(target_agent, delivery))
@@ -1648,11 +1650,14 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
                  else QUEUED_NOTE if has_return_panel_now else QUEUED_NOTE_WITH_NO_RETURN_PANEL),
         'warning': ' '.join(warnings) or None,
         'target_agent': target_agent,
-        'target_session_id': target_id,
+        # What the delivery actually resolved to, when the worker got that far before this
+        # returned - a panel that opened a conversation reports its id on acceptance, and
+        # throwing that away to print the id we started with would be a worse answer.
+        'target_session_id': resolved_session_id,
         'target_last_activity_seconds_ago': idle_seconds,
-        # the id the fresh session will have, when it is ours to choose; otherwise the peer
-        # issues it and bridge_status reports it as soon as the delivery is accepted
-        'new_session_id': target_id if is_new_target else None,
+        # the id the fresh session will have, when it is ours to choose; null only while it is
+        # genuinely unknown, and bridge_status reports it once the peer issues one
+        'new_session_id': resolved_session_id if is_new_target else None,
         'session_origin': 'created' if is_new_target else (target or {}).get('source', 'unknown'),
         'target_selected_by': selected_by,
         'caller_supplied_session_id': selected_by == SELECTED_CALLER,
