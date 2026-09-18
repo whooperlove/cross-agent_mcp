@@ -114,15 +114,55 @@ FILE_MODE: int = 0o600
 # whether this process has already repaired a state tree created before those modes
 _is_repaired: bool = False
 
-# Directories the repair walk must never descend into, however CROSS_AGENT_HOME is set: the
-# user's own files, and the two agents' transcript stores, are not the bridge's to re-mode.
-_PROTECTED_ROOTS = {os.path.realpath(p) for p in (
-    '/', os.path.expanduser('~'), CLAUDE_HOME_DIR, CLAUDE_PROJECTS_DIR,
-    CODEX_HOME_DIR, CODEX_SESSIONS_DIR)}
+# Places the bridge must never re-mode, however CROSS_AGENT_HOME is set. Two different rules,
+# because the home directory is both the thing to protect and the thing the state tree
+# normally lives inside:
+#
+#   equality  - the state root may not BE one of these. `/` and `~` are here only: the normal
+#               `~/.cross-agent` is inside the home directory and must keep working.
+#   inside    - the state root may not be, or contain, one of these. Both agents' stores are
+#               here, so a state root pointed at one, symlinked to one, or merely sitting
+#               above one is refused, and a store nested under a legitimate root is walked
+#               past rather than into.
+_PROTECTED_EXACTLY = {os.path.realpath(p) for p in ('/', os.path.expanduser('~'))}
+_PROTECTED_TREES = {os.path.realpath(p) for p in (
+    CLAUDE_HOME_DIR, CLAUDE_PROJECTS_DIR, CODEX_HOME_DIR, CODEX_SESSIONS_DIR)}
+_PROTECTED_ROOTS = _PROTECTED_EXACTLY | _PROTECTED_TREES
+
+
+def _within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def is_protected_path(path: str) -> bool:
+    """Whether this path is one the bridge must not create, follow into, or re-mode.
+
+    Answered on the *resolved* path, so a symlink pointing into a protected store is refused
+    as firmly as the store itself - `chmod` follows symlinks, so a state root that is a link
+    to `~/.claude` would otherwise re-mode the real thing.
+    """
+    real = os.path.realpath(path)
+    if real in _PROTECTED_EXACTLY:
+        return True
+    # Only "is, or is inside, a store". A directory that merely *contains* one is a legitimate
+    # state root - the walk prunes the store out of it rather than refusing the whole tree.
+    return any(_within(real, root) for root in _PROTECTED_TREES)
 
 
 def secure_makedirs(path: str) -> None:
-    """Create a state directory nobody else can read, whatever the umask says."""
+    """Create a state directory nobody else can read, whatever the umask says.
+
+    The resolved path is checked first. `chmod` follows symlinks, so a state directory that is
+    a link into one of the agents' stores would otherwise tighten the real store - and it is
+    the user's own configuration doing it, which makes it neither an attack nor a reason to
+    let it happen.
+    """
+    if is_protected_path(path):
+        raise ValueError(
+            f'{path} resolves to {os.path.realpath(path)}, which is the home directory or one '
+            'of the agents\' session stores. The bridge will not keep its state there or '
+            'change its permissions; point CROSS_AGENT_HOME somewhere of its own.')
+
     os.makedirs(path, mode=DIR_MODE, exist_ok=True)
     # makedirs applies the umask to `mode`, and says nothing at all about a directory that
     # already existed; chmod is what actually settles both cases.
@@ -162,11 +202,18 @@ def repair_state_permissions(root: Optional[str] = None) -> int:
     # CROSS_AGENT_HOME is user-supplied. Pointed at a home directory or a transcript store it
     # would walk the user's own files and tighten them, so a root that is not a directory of
     # the bridge's own is left alone.
-    if os.path.realpath(base) in _PROTECTED_ROOTS:
+    if is_protected_path(base):
         return 0
 
     repaired = 0
-    for current, _, files in os.walk(base, followlinks=False):
+    for current, dirs, files in os.walk(base, followlinks=False):
+        # Prune rather than only refuse at the top: a store can sit *beneath* a legitimate
+        # state root - CLAUDE_CONFIG_DIR inside CROSS_AGENT_HOME is all it takes - and a walk
+        # that only checked its starting point would march straight into it.
+        pruned = [name for name in dirs if is_protected_path(os.path.join(current, name))]
+        for name in pruned:
+            dirs.remove(name)
+
         for path, wanted in ([(current, DIR_MODE)]
                              + [(os.path.join(current, name), FILE_MODE) for name in files]):
             try:

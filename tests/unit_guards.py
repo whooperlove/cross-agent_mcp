@@ -3328,26 +3328,92 @@ def test_an_installation_from_before_this_is_repaired_on_startup() -> None:
 
 
 def test_the_repair_never_touches_the_agents_own_transcript_stores() -> None:
-    """CROSS_AGENT_HOME is user-supplied; pointed at ~ it must not re-mode the user's files."""
+    """CROSS_AGENT_HOME is user-supplied; it must not become a licence to re-mode a store."""
     with tempfile.TemporaryDirectory(prefix='cross-agent-test-protected-') as store:
         victim = store + '/notes.txt'
         with open(victim, 'w', encoding='utf-8') as f:
             f.write('mine')
         os.chmod(victim, 0o644)
 
-        saved = config._PROTECTED_ROOTS
-        config._PROTECTED_ROOTS = saved | {os.path.realpath(store)}
+        saved = config._PROTECTED_TREES
+        config._PROTECTED_TREES = saved | {os.path.realpath(store)}
         try:
             repaired = config.repair_state_permissions(store)
         finally:
-            config._PROTECTED_ROOTS = saved
+            config._PROTECTED_TREES = saved
 
         check('a protected root is refused outright', repaired == 0, str(repaired))
         check('and nothing under it was re-moded', _mode(victim) == 0o644, oct(_mode(victim)))
         check('the real protected set covers home and both transcript stores',
-              os.path.realpath(os.path.expanduser('~')) in config._PROTECTED_ROOTS
-              and os.path.realpath(config.CLAUDE_PROJECTS_DIR) in config._PROTECTED_ROOTS
-              and os.path.realpath(config.CODEX_SESSIONS_DIR) in config._PROTECTED_ROOTS)
+              os.path.realpath(os.path.expanduser('~')) in config._PROTECTED_EXACTLY
+              and os.path.realpath(config.CLAUDE_PROJECTS_DIR) in config._PROTECTED_TREES
+              and os.path.realpath(config.CODEX_SESSIONS_DIR) in config._PROTECTED_TREES)
+        check('while the ordinary state root is not protected, or nothing would be repaired',
+              not config.is_protected_path(os.path.expanduser('~/.cross-agent')))
+
+
+def test_a_store_nested_under_the_state_root_is_walked_past_not_into() -> None:
+    """Refusing only at the starting point is not enough: CLAUDE_CONFIG_DIR set inside
+    CROSS_AGENT_HOME is all it takes for the walk to march straight into a transcript store."""
+    with _throwaway_state_home() as home:
+        nested = home + 'claude-store/'
+        os.makedirs(nested + 'projects/-w', exist_ok=True)
+        transcript = nested + 'projects/-w/session.jsonl'
+        with open(transcript, 'w', encoding='utf-8') as f:
+            f.write('{}')
+        for path in (nested, nested + 'projects', nested + 'projects/-w'):
+            os.chmod(path, 0o755)
+        os.chmod(transcript, 0o644)
+
+        ours = home + 'deliveries/req_ours_000000.json'
+        os.makedirs(home + 'deliveries', exist_ok=True)
+        with open(ours, 'w', encoding='utf-8') as f:
+            f.write('{}')
+        os.chmod(ours, 0o644)
+
+        saved = config._PROTECTED_TREES
+        config._PROTECTED_TREES = saved | {os.path.realpath(nested)}
+        try:
+            config.repair_state_permissions(home)
+        finally:
+            config._PROTECTED_TREES = saved
+
+        check('a store nested under the state root keeps its own permissions',
+              _mode(transcript) == 0o644 and _mode(nested + 'projects/-w') == 0o755,
+              f'{oct(_mode(transcript))} {oct(_mode(nested + "projects/-w"))}')
+        check('while the bridge\'s own files beside it are still repaired',
+              _mode(ours) == 0o600, oct(_mode(ours)))
+
+
+def test_a_state_root_that_points_into_a_store_is_refused_before_it_is_followed() -> None:
+    """chmod follows symlinks, so a state root linked into a store would re-mode the store."""
+    with tempfile.TemporaryDirectory(prefix='cross-agent-test-symlink-') as outer:
+        real_store = outer + '/claude-store'
+        os.makedirs(real_store + '/projects', exist_ok=True)
+        os.chmod(real_store, 0o755)
+        os.chmod(real_store + '/projects', 0o755)
+        link = outer + '/state-root'
+        os.symlink(real_store, link)
+
+        saved = config._PROTECTED_TREES
+        config._PROTECTED_TREES = saved | {os.path.realpath(real_store)}
+        try:
+            check('a symlinked state root is seen for what it resolves to',
+                  config.is_protected_path(link))
+            try:
+                config.secure_makedirs(link + '/locks')
+                check('creating state under it is refused', False, 'no error raised')
+            except ValueError as e:
+                check('creating state under it is refused',
+                      'session stores' in str(e) or 'home directory' in str(e), str(e))
+            check('and repairing through it does nothing',
+                  config.repair_state_permissions(link) == 0)
+        finally:
+            config._PROTECTED_TREES = saved
+
+        check('the store it pointed at is untouched',
+              _mode(real_store) == 0o755 and _mode(real_store + '/projects') == 0o755,
+              f'{oct(_mode(real_store))} {oct(_mode(real_store + "/projects"))}')
 
 
 def run_all() -> None:
@@ -3434,6 +3500,8 @@ def run_all() -> None:
     test_a_rotated_log_generation_is_owner_only()
     test_an_installation_from_before_this_is_repaired_on_startup()
     test_the_repair_never_touches_the_agents_own_transcript_stores()
+    test_a_store_nested_under_the_state_root_is_walked_past_not_into()
+    test_a_state_root_that_points_into_a_store_is_refused_before_it_is_followed()
 
 if __name__ == '__main__':
     # The delivery directory used to be redirected here on its own, because finished jobs left
