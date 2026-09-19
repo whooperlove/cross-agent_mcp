@@ -1145,6 +1145,65 @@ def test_a_conversations_own_name_is_what_it_is_called_by() -> None:
             discovery.list_sessions = originals
 
 
+def _write_long_claude_transcript(path: str, first_message: str, name: str = '') -> None:
+    """A transcript long enough that its end is past the head window, named only at the end.
+
+    This is the shape every real conversation reaches. `_write_claude_transcript` puts the
+    first name ahead of the first message, so its sessions are named inside the head no
+    matter how they grow - the one shape that cannot reproduce a late rename.
+    """
+    lines = [json.dumps({
+        'type': 'user', 'isSidechain': False, 'cwd': '/w', 'entrypoint': 'claude-vscode',
+        'message': {'content': first_message}})]
+    lines += [json.dumps({'type': 'assistant', 'isSidechain': False, 'cwd': '/w',
+                          'message': {'content': f'turn {i}'}})
+              for i in range(discovery.CLAUDE_HEAD_LINES * 2)]
+    if name:
+        lines.append(json.dumps({'type': 'custom-title', 'customTitle': name}))
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+
+
+def test_a_rename_after_the_head_window_is_still_the_conversations_name() -> None:
+    """A conversation named once it was long could not be reached by the name on its panel.
+
+    The name entry is appended wherever the transcript currently ends. The head was searched
+    for it and the tail was only re-read when the head had already shown one, so a session
+    named for the first time after CLAUDE_HEAD_LINES lines kept answering to its generated
+    title - and `session_id='<the name on the panel>'` failed, which is the one address a
+    human can be expected to give. Seen on a real store: 5391 lines, renamed at line 5388.
+
+    Naming a conversation is how you address it, and conversations are named once they have
+    turned out to matter - which is to say, once they are long.
+    """
+    with tempfile.TemporaryDirectory(prefix='claude-late-rename-') as store:
+        late = store + '/44444444-4444-4444-4444-444444444444.jsonl'
+        _write_long_claude_transcript(late, 'start on the store units', name='Implementation')
+        parsed = discovery._parse_claude_session(late)
+        check('a conversation named after the head window answers to that name',
+              parsed is not None and parsed['title'] == 'Implementation',
+              str(parsed and parsed['title']))
+        check('and is marked as named', parsed is not None and parsed['is_named'] is True)
+
+        # the tail is now read for every session, so a nameless one must not acquire a name
+        nameless = store + '/55555555-5555-5555-5555-555555555555.jsonl'
+        _write_long_claude_transcript(nameless, 'start on the store units')
+        parsed = discovery._parse_claude_session(nameless)
+        check('a long conversation with no name is still unnamed',
+              parsed is not None and parsed['is_named'] is False,
+              str(parsed and parsed['title']))
+
+        original = discovery.list_sessions
+        discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: [
+            discovery._parse_claude_session(late), discovery._parse_claude_session(nameless)]
+        try:
+            check('and the late name is what the lookup finds it by',
+                  (discovery.find_session_by_name('claude', 'Implementation') or {})
+                  .get('session_id') == '44444444-4444-4444-4444-444444444444')
+        finally:
+            discovery.list_sessions = original
+
+
 def test_a_session_name_matches_exactly_or_not_at_all() -> None:
     """The incident: 'koppa_studio' matched a path quoted inside an old session's first message.
 
@@ -2870,6 +2929,7 @@ def run_all() -> None:
     test_a_cli_delivery_does_not_wait_for_a_turn_that_was_killed()
     test_recovery_is_skipped_when_the_transport_already_answered()
     test_a_conversations_own_name_is_what_it_is_called_by()
+    test_a_rename_after_the_head_window_is_still_the_conversations_name()
     test_a_session_name_matches_exactly_or_not_at_all()
     test_a_named_session_is_never_silently_created()
     test_naming_a_session_and_forcing_a_new_one_is_refused()
