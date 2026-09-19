@@ -120,10 +120,16 @@ def _latest_custom_title(path: str) -> Optional[str]:
     """The name a conversation carries *now*.
 
     The entry is re-emitted as the transcript grows, so the copy near the head is the name the
-    session opened with - and renames happen. Only sessions that already showed a name in the
-    head reach this, so the extra read is paid by the few that have one.
+    session opened with - and renames happen.
+
+    Every session pays this read, not only the ones that showed a name in the head. A rename
+    is appended where the transcript currently ends, so a session named after its first
+    CLAUDE_HEAD_LINES lines has nothing in the head to trigger the check: a 5391-line
+    transcript renamed at line 5388 kept answering to its generated title and could not be
+    reached by the name on its own panel. The read is bounded to the last RENAME_TAIL_BYTES,
+    not the 2MB an answer needs, because the entry sits at the very end.
     """
-    for line in reversed(_tail_lines(path)):
+    for line in reversed(_tail_lines(path, RENAME_TAIL_BYTES)):
         if '"custom-title"' not in line:
             continue
         try:
@@ -182,8 +188,7 @@ def _parse_claude_session(path: str) -> Optional[Dict[str, Any]]:
     # A name the human gave the conversation, shown at the top of its panel. It outranks the
     # generated title and the first message, because it is the only one they can be expected
     # to say back to us - "the koppa_studio session" means this, not the words it opened with.
-    if custom_title:
-        custom_title = _latest_custom_title(path) or custom_title
+    custom_title = _latest_custom_title(path) or custom_title
 
     info: Dict[str, Any] = {
         'agent': config.AGENT_CLAUDE,
@@ -437,14 +442,18 @@ def suggest_session_names(agent: str, name: str, limit: int = 500,
 # how much of a transcript's tail is read when recovering an answer from it
 TAIL_BYTES = 2_000_000
 
+# how much is read when only the rename entry is wanted - every listed session pays this one,
+# so it is the last few hundred lines rather than the last two megabytes
+RENAME_TAIL_BYTES = 65_536
 
-def _tail_lines(path: str) -> List[str]:
+
+def _tail_lines(path: str, limit_bytes: int = TAIL_BYTES) -> List[str]:
     """The end of a transcript. A rollout runs to thousands of lines; the answer is at the end."""
     try:
         size = os.path.getsize(path)
         with open(path, 'rb') as f:
-            if size > TAIL_BYTES:
-                f.seek(size - TAIL_BYTES)
+            if size > limit_bytes:
+                f.seek(size - limit_bytes)
                 f.readline()  # the seek lands mid-line; drop the fragment
             data = f.read()
     except OSError:
