@@ -14,8 +14,6 @@ import shutil
 import sys
 import tempfile
 
-from typing import Optional
-
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -41,14 +39,15 @@ def _text_of(result) -> str:
     return ''
 
 
-def _server(agent: str, ambient: Optional[str] = None) -> StdioServerParameters:
+def _server(agent: str, ambient: bool = False) -> StdioServerParameters:
     """A bridge server told which agent it is, rather than inferring it from its parent.
 
-    `ambient` drops the override, to prove the isolation holds without it.
+    `ambient=True` drops the override, to prove the isolation holds without it. `agent` is
+    then unused: the server infers its identity from its parent, which is the whole point.
     """
     env = {**os.environ, 'PYTHONPATH': ROOT_DIR + '/src'}
     env.pop('CROSS_AGENT_SELF', None)
-    if ambient is None:
+    if not ambient:
         env['CROSS_AGENT_SELF'] = agent
     # sys.executable, not a .venv path: a fresh checkout has no .venv, and the interpreter
     # running this file is by definition one that can import mcp
@@ -139,10 +138,10 @@ async def main() -> int:
         if await _refuses_its_own_agent(agent):
             return 1
 
-    # the case that used to send for real: a Codex runner reaching for Claude. Nothing here
-    # forces the identity, so this is the ambient path, and the isolated stores are what has
-    # to keep it harmless.
-    async with stdio_client(_server('claude', ambient='codex')) as (read, write):
+    # The ambient path, with nothing forcing the identity - the shape in which a Codex runner
+    # used to reach a real Claude session. No send is attempted here: it lists the sessions the
+    # server can see, and finding none is what would have made such a send harmless.
+    async with stdio_client(_server('claude', ambient=True)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             listing = json.loads(_text_of(await session.call_tool(

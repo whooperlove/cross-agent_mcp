@@ -5,10 +5,21 @@
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
 import time
+
+# `config` resolves every state path at import time, so the run has to be pointed somewhere
+# else before `cross_agent_mcp` is imported - not patched afterwards. Without this the suite
+# writes to the user's own bridge: the pin tests call set_pin/update_registry against the real
+# registry.json, and the busy-lock tests take locks in the real lock directory. A pin for
+# `/home/u/git/sophos` - a fixture, not a directory - was found in a real registry that way.
+STATE_ROOT = tempfile.mkdtemp(prefix='cross-agent-unit-')
+os.environ['CROSS_AGENT_HOME'] = STATE_ROOT + '/state'
+os.environ['CLAUDE_CONFIG_DIR'] = STATE_ROOT + '/claude'
+os.environ['CODEX_HOME'] = STATE_ROOT + '/codex'
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/src')
 
@@ -34,6 +45,34 @@ def _quiet_log():
     if not log.handlers:
         log.addHandler(logging.NullHandler())
     return log
+
+
+# ------------------------------------------------- the suite cannot touch real bridge state
+
+def test_the_suite_writes_nowhere_near_the_real_bridge() -> None:
+    """Every configured root must be the temporary one, compared as a real path.
+
+    A prefix test is not a containment test: `<root>-elsewhere` starts with `<root>`. These
+    are exact identities, so a root that was resolved from the environment before the
+    overrides above - or from a `~` that is a symlink - fails here rather than silently
+    writing to the user's own state.
+    """
+    expected = {
+        'bridge state': (config.HOME_DIR, STATE_ROOT + '/state/'),
+        'claude store': (config.CLAUDE_HOME_DIR, STATE_ROOT + '/claude/'),
+        'codex store': (config.CODEX_HOME_DIR, STATE_ROOT + '/codex/'),
+    }
+    for label, (configured, intended) in expected.items():
+        check(f'the {label} root is the temporary one',
+              os.path.realpath(configured) == os.path.realpath(intended),
+              f'{configured!r} != {intended!r}')
+
+    real_home = os.path.realpath(os.path.expanduser('~/.cross-agent'))
+    for label, path in (('registry', config.REGISTRY_PATH), ('locks', config.LOCK_DIR),
+                        ('deliveries', config.DELIVERY_DIR), ('logs', config.LOG_DIR)):
+        check(f'the {label} path is outside the real ~/.cross-agent',
+              os.path.commonpath([os.path.realpath(path), real_home]) != real_home,
+              os.path.realpath(path))
 
 
 # ------------------------------------------------- busy lock is really exclusive
@@ -2834,6 +2873,7 @@ def uuid_hex() -> str:
 
 
 def run_all() -> None:
+    test_the_suite_writes_nowhere_near_the_real_bridge()
     test_busy_lock_is_exclusive()
     test_busy_lock_release_respects_owner()
     test_prune_spares_sticky_pins()
@@ -2906,14 +2946,15 @@ def run_all() -> None:
     test_servers_from_before_in_flight_records_share_the_directory_safely()
 
 if __name__ == '__main__':
-    # Delivery records are written by any finished job, so a test run left rows like
-    # "sid-normal" in the real ~/.cross-agent/deliveries/ and they sat there among genuine
-    # ones - which cost real time when a lost reply had to be found among them. Redirect the
-    # whole run rather than each test: the next test to submit a job is covered without
-    # anyone remembering to.
-    with tempfile.TemporaryDirectory(prefix='cross-agent-test-deliveries-') as store:
-        outbox.config.DELIVERY_DIR = store + '/'
+    # The delivery directory used to be redirected here on its own, because finished jobs left
+    # rows like "sid-normal" among the genuine ones in the real store. The whole state root is
+    # temporary now, so that redirection is gone: deliveries, the registry, the locks and the
+    # logs are all already inside STATE_ROOT, and a test that starts writing something new is
+    # covered without anyone remembering to add it.
+    try:
         run_all()
+    finally:
+        shutil.rmtree(STATE_ROOT, ignore_errors=True)
 
     print(f'\n{"ALL UNIT CHECKS PASSED" if not FAILURES else str(len(FAILURES)) + " CHECK(S) FAILED"}')
     sys.exit(1 if FAILURES else 0)
