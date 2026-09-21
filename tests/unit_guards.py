@@ -3625,27 +3625,53 @@ def uuid_hex() -> str:
 
 
 def test_the_busy_lock_survives_a_sustained_race() -> None:
-    """One round of six threads let the old claim through about one run in five. This runs the
-    race often enough that a claim which is only nearly exclusive cannot pass it."""
-    rounds, racers = 40, 8
+    """Eight threads reach for one session at once, and exactly one may hold it.
+
+    Every racer is held at a rendezvous until all of them have tried, so the winner still owns
+    the claim when the last one arrives. Holding it for a fixed time instead made the verdict a
+    property of the machine rather than of the lock: a racer scheduled after the winner had
+    already released acquired it legitimately, and was counted as a second winner. Sweeping
+    that hold shows it plainly - 157 bad rounds in 240 with no hold at all, 54 at 2ms, none at
+    the 10ms this used to use - which is why the rounds here are few and decisive instead of
+    many and probabilistic.
+
+    A rendezvous that times out, or a worker that fails some other way, is recorded apart from
+    the outcomes: it says the round never became a test of exclusivity, which is not the same
+    as the lock letting two claimers through.
+    """
+    rounds, racers = 12, 8
     bad_rounds = []
 
     for round_number in range(rounds):
         session_id = f'unit-race-{round_number}-' + os.urandom(3).hex()
         outcomes = []
+        mishaps = []
         guard = threading.Lock()
-        barrier = threading.Barrier(racers)
+        ready = threading.Barrier(racers)
+        attempted = threading.Barrier(racers)
+
+        def rendezvous() -> None:
+            try:
+                attempted.wait(timeout=30)
+            except threading.BrokenBarrierError:
+                with guard:
+                    mishaps.append('rendezvous never completed')
 
         def worker() -> None:
-            barrier.wait()
             try:
-                with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_race'):
+                ready.wait(timeout=30)
+                try:
+                    with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_race'):
+                        with guard:
+                            outcomes.append('won')
+                        rendezvous()
+                except registry.SessionBusyError:
                     with guard:
-                        outcomes.append('won')
-                    time.sleep(0.01)
-            except registry.SessionBusyError:
+                        outcomes.append('refused')
+                    rendezvous()
+            except Exception as e:
                 with guard:
-                    outcomes.append('refused')
+                    mishaps.append(f'{type(e).__name__}: {e}')
 
         threads = [threading.Thread(target=worker) for _ in range(racers)]
         for t in threads:
@@ -3653,10 +3679,14 @@ def test_the_busy_lock_survives_a_sustained_race() -> None:
         for t in threads:
             t.join(timeout=30)
 
-        if outcomes.count('won') != 1 or len(outcomes) != racers:
+        still_running = [t for t in threads if t.is_alive()]
+        if still_running:
+            bad_rounds.append((round_number, f'{len(still_running)} worker(s) never finished'))
+        if mishaps:
+            bad_rounds.append((round_number, f'round did not test exclusivity: {mishaps[:2]}'))
+        elif outcomes.count('won') != 1 or len(outcomes) != racers:
             bad_rounds.append((round_number, list(outcomes)))
-        check_lock = registry.read_busy_lock(config.AGENT_CODEX, session_id)
-        if check_lock is not None:
+        if registry.read_busy_lock(config.AGENT_CODEX, session_id) is not None:
             bad_rounds.append((round_number, 'lock left behind'))
 
     check(f'exactly one of {racers} claimers wins, in every one of {rounds} rounds',
