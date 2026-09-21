@@ -359,8 +359,9 @@ def busy_lock(agent: str, session_id: str, conversation_id: str,
               ttl_seconds: Optional[float] = None) -> Iterator[None]:
     """Claim a session for the duration of the block.
 
-    The claim is an atomic O_EXCL create, so checking whether a session is busy and marking
-    it busy are one step: two relays racing for the same session cannot both win.
+    The record is written to a temporary and linked into place, so checking whether a session
+    is busy and marking it busy are one step: two relays racing for the same session cannot
+    both win, and the file is complete at the instant it appears.
 
     `ttl_seconds` is how long the claim stays believable to other processes. A panel delivery
     now listens for as long as the peer's turn takes, which is longer than two turn budgets;

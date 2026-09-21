@@ -2969,6 +2969,54 @@ def test_a_claimed_lock_is_readable_the_instant_it_exists() -> None:
     check('and it did actually observe the lock', len(seen) > 0, str(len(seen)))
 
 
+def test_a_claim_is_linked_into_place_already_complete() -> None:
+    """The claim reaches `os.link`, and what it links is already the whole record.
+
+    The racing-reader test above can only catch a torn read if the reader thread happens to be
+    scheduled inside the window between the create and the write. That is a property of the
+    machine, not of the code: reverting the atomic claim fails it on one host and passes ten
+    runs on another. This observes the claim directly instead, so it fails on any host.
+    """
+    session_id = 'unit-link-' + os.urandom(4).hex()
+    path = registry._lock_path(config.AGENT_CODEX, session_id)
+    config.ensure_dirs()
+
+    observed = []
+    real_link = os.link
+
+    def watched_link(src, dst, *args, **kwargs):
+        with open(src, 'r', encoding='utf-8') as f:
+            payload = f.read()
+        observed.append({'payload': payload, 'target_existed': os.path.exists(dst)})
+        return real_link(src, dst, *args, **kwargs)
+
+    os.link = watched_link
+    try:
+        with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_link'):
+            pass
+    finally:
+        os.link = real_link
+
+    check('the claim goes through os.link at all', len(observed) == 1, str(len(observed)))
+    if observed:
+        try:
+            record = json.loads(observed[0]['payload'])
+        except ValueError as e:
+            record = None
+            check('what is linked parses as JSON', False, f'{type(e).__name__}: {e}')
+        check('the record is already whole when it is linked',
+              bool(record) and record.get('conversation_id') == 'conv_link',
+              str(observed[0]['payload'])[:120])
+        check('and the lock name is still free at that instant',
+              observed[0]['target_existed'] is False, str(observed[0]['target_existed']))
+
+    check('no temporary is left behind',
+          not [n for n in os.listdir(config.LOCK_DIR) if n.endswith('.tmp')],
+          str([n for n in os.listdir(config.LOCK_DIR) if n.endswith('.tmp')]))
+    with contextlib.suppress(OSError):
+        os.remove(path)
+
+
 def test_a_stale_clear_cannot_delete_the_lock_that_replaced_it() -> None:
     """The second race, in the other direction: a reader decides a lock is abandoned, somebody
     else clears and reclaims it first, and the reader's unlink then deletes their good lock."""
@@ -3248,6 +3296,7 @@ def run_all() -> None:
     test_the_busy_lock_survives_a_sustained_race()
     test_a_lock_being_written_is_never_mistaken_for_debris()
     test_a_claimed_lock_is_readable_the_instant_it_exists()
+    test_a_claim_is_linked_into_place_already_complete()
     test_a_stale_clear_cannot_delete_the_lock_that_replaced_it()
     test_the_no_hard_link_fallback_is_still_exclusive_under_contention()
     test_the_transition_guard_cannot_be_held_hostage_by_another_account()
