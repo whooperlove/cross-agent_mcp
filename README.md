@@ -500,7 +500,8 @@ installation made before that was enforced the first time it runs. Two things fo
 `CROSS_AGENT_HOME`:
 
 - **It has to be a directory of the bridge's own.** If it resolves to `/`, to your home
-  directory, or to — or inside — either agent's session store, it is refused rather than used:
+  directory, or to — or inside — either agent's own directory (`~/.claude`, `~/.codex`, or
+  wherever `CLAUDE_CONFIG_DIR` / `CODEX_HOME` point), it is refused rather than used:
   the bridge would be changing the permissions of files that aren't its own, and a symlink
   pointing there is refused as firmly as the path itself. A directory that merely *contains* a
   store is fine; the repair walk steps around the store rather than refusing the whole tree.

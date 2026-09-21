@@ -3804,10 +3804,15 @@ def test_the_repair_never_touches_the_agents_own_transcript_stores() -> None:
 
         check('a protected root is refused outright', repaired == 0, str(repaired))
         check('and nothing under it was re-moded', _mode(victim) == 0o644, oct(_mode(victim)))
-        check('the real protected set covers home and both transcript stores',
+        check('the real protected set covers home, both agent directories and both stores',
               os.path.realpath(os.path.expanduser('~')) in config._PROTECTED_EXACTLY
+              and os.path.realpath(config.CLAUDE_HOME_DIR) in config._PROTECTED_TREES
+              and os.path.realpath(config.CODEX_HOME_DIR) in config._PROTECTED_TREES
               and os.path.realpath(config.CLAUDE_PROJECTS_DIR) in config._PROTECTED_TREES
               and os.path.realpath(config.CODEX_SESSIONS_DIR) in config._PROTECTED_TREES)
+        check('so a path inside an agent directory is refused even where no transcript lives',
+              config.is_protected_path(config.CLAUDE_HOME_DIR + 'bridge')
+              and config.is_protected_path(config.CODEX_HOME_DIR + 'bridge'))
         check('while the ordinary state root is not protected, or nothing would be repaired',
               not config.is_protected_path(os.path.expanduser('~/.cross-agent')))
 
@@ -3867,7 +3872,7 @@ def test_a_state_root_that_points_into_a_store_is_refused_before_it_is_followed(
                 check('creating state under it is refused', False, 'no error raised')
             except ValueError as e:
                 check('creating state under it is refused',
-                      'session stores' in str(e) or 'home directory' in str(e), str(e))
+                      'own directories' in str(e) or 'home directory' in str(e), str(e))
             check('and repairing through it does nothing',
                   config.repair_state_permissions(link) == 0)
         finally:

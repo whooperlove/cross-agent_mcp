@@ -169,7 +169,7 @@ def secure_makedirs(path: str) -> None:
     if is_protected_path(path):
         raise ValueError(
             f'{path} resolves to {os.path.realpath(path)}, which is the home directory or one '
-            'of the agents\' session stores. The bridge will not keep its state there or '
+            'of the agents\' own directories. The bridge will not keep its state there or '
             'change its permissions; point CROSS_AGENT_HOME somewhere of its own.')
 
     os.makedirs(path, mode=DIR_MODE, exist_ok=True)
