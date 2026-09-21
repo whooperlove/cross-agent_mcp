@@ -470,7 +470,7 @@ Every delivered message carries a header with the sender, conversation ID, and h
 
 | Variable | Default | Description |
 |---|---|---|
-| `CROSS_AGENT_HOME` | `~/.cross-agent` | Location of the registry, locks, and logs |
+| `CROSS_AGENT_HOME` | `~/.cross-agent` | Location of the registry, locks, logs, delivery records and panel registrations. Must be a directory of the bridge's own — see below |
 | `CROSS_AGENT_ACTIVE_WINDOW_MIN` | `240` | Maximum elapsed time (minutes) for a session to still count as active |
 | `CROSS_AGENT_MAX_HOPS` | `4` | Maximum number of relays per conversation |
 | `CROSS_AGENT_TIMEOUT` | `600` | Budget (seconds) for the peer's turn itself. Doesn't make the caller wait |
@@ -494,6 +494,19 @@ in Codex: `codex mcp add cross-agent --env KEY=VALUE -- <script>`.
 `codex exec resume` has no sandbox argument, so resuming an existing session keeps whatever
 setting it was originally started with. `CROSS_AGENT_CLAUDE_PERMISSION_MODE`, on the other
 hand, applies to both new sessions and resumed ones.
+
+The bridge keeps its own state owner-only — `0700` directories, `0600` files — and tightens an
+installation made before that was enforced the first time it runs. Two things follow for
+`CROSS_AGENT_HOME`:
+
+- **It has to be a directory of the bridge's own.** If it resolves to `/`, to your home
+  directory, or to — or inside — either agent's session store, it is refused rather than used:
+  the bridge would be changing the permissions of files that aren't its own, and a symlink
+  pointing there is refused as firmly as the path itself. A directory that merely *contains* a
+  store is fine; the repair walk steps around the store rather than refusing the whole tree.
+- **Its filesystem has to support `chmod`.** If the state directory can't be made owner-only,
+  the bridge stops with an error instead of carrying on, rather than write session ids, working
+  directories and message summaries somewhere it has just failed to make private.
 
 ## 8. Verification
 

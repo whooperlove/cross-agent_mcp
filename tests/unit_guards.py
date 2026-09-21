@@ -3751,7 +3751,10 @@ def test_a_store_nested_under_the_state_root_is_walked_past_not_into() -> None:
     """Refusing only at the starting point is not enough: CLAUDE_CONFIG_DIR set inside
     CROSS_AGENT_HOME is all it takes for the walk to march straight into a transcript store."""
     with _throwaway_state_home() as home:
-        nested = home + 'claude-store/'
+        # Inside a managed subdirectory, not merely beside one: the walk only ever enters
+        # MANAGED_SUBDIRS, so a store placed elsewhere under the root is never reached and
+        # would be left alone whether the walk prunes or not.
+        nested = home + 'deliveries/claude-store/'
         os.makedirs(nested + 'projects/-w', exist_ok=True)
         transcript = nested + 'projects/-w/session.jsonl'
         with open(transcript, 'w', encoding='utf-8') as f:
@@ -3761,7 +3764,6 @@ def test_a_store_nested_under_the_state_root_is_walked_past_not_into() -> None:
         os.chmod(transcript, 0o644)
 
         ours = home + 'deliveries/req_ours_000000.json'
-        os.makedirs(home + 'deliveries', exist_ok=True)
         with open(ours, 'w', encoding='utf-8') as f:
             f.write('{}')
         os.chmod(ours, 0o644)
