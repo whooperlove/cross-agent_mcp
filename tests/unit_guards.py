@@ -352,6 +352,54 @@ def test_new_session_is_the_last_resort() -> None:
 
 # --------------------------------------- which conversation tab a relay lands in
 
+def test_an_unaddressed_relay_says_it_was_aimed_by_the_human() -> None:
+    """A send with no session_id is addressed by panel focus, and must say so.
+
+    A relay that names no session lands in whichever conversation tab the human most recently
+    typed into. That is a reasonable convenience when someone is watching, and a moving target
+    for anything else: a status update in an ongoing exchange was delivered into an unrelated
+    thread this way, which then began acting on it. The receipt is the only place that can say
+    the address came from the human rather than from the caller.
+    """
+    from cross_agent_mcp import uihook
+
+    now = time.time()
+    shim = {'agent': 'codex', 'pid': 1, 'socket': '/s1', 'ancestors': [99], 'started_at': now}
+    status = {'ok': True, 'last_user_activity': now - 5,
+              'sessions': [{'session_id': 'whatever-tab-is-open', 'cwd': '/w'}]}
+
+    originals = (uihook.is_enabled, uihook.list_shims, uihook.process_ancestry,
+                 uihook.read_status, uihook._transcript_mtime, discovery.find_session)
+    uihook.is_enabled = lambda: True
+    uihook.list_shims = lambda agent=None: [shim] if agent in (None, 'codex') else []
+    uihook.process_ancestry = lambda pid, depth=12: [99]
+    uihook.read_status = lambda s: status
+    uihook._transcript_mtime = lambda agent, session_id: now - 10
+    discovery.find_session = lambda agent, session_id: (
+        {'agent': agent, 'session_id': session_id, 'cwd': '/w', 'mtime': now}
+        if session_id == 'whatever-tab-is-open' else None)
+    try:
+        unaddressed = bridge._resolve_target('codex', None, 'cwd', '/w', False, [])
+        addressed = bridge._resolve_target('codex', 'whatever-tab-is-open', 'cwd', '/w',
+                                           False, [])
+    finally:
+        (uihook.is_enabled, uihook.list_shims, uihook.process_ancestry,
+         uihook.read_status, uihook._transcript_mtime, discovery.find_session) = originals
+
+    check('a relay naming no session is recorded as aimed by panel focus',
+          (unaddressed or {}).get('selected_by') == bridge.SELECTED_PANEL_FOCUS,
+          str(unaddressed and unaddressed.get('selected_by')))
+    check('and one naming a session is recorded as the caller\'s own address',
+          (addressed or {}).get('selected_by') == bridge.SELECTED_CALLER,
+          str(addressed and addressed.get('selected_by')))
+    check('panel focus is not treated as an address the caller chose',
+          bridge.SELECTED_PANEL_FOCUS in bridge.UNADDRESSED_SELECTIONS
+          and bridge.SELECTED_CALLER not in bridge.UNADDRESSED_SELECTIONS)
+    check('both reached the same conversation, so only the addressing differs',
+          (unaddressed or {}).get('session_id') == (addressed or {}).get('session_id')
+          == 'whatever-tab-is-open')
+
+
 def test_panel_session_selection() -> None:
     from cross_agent_mcp import uihook
 
@@ -3184,6 +3232,7 @@ def run_all() -> None:
     test_timeout_kills_descendants()
     test_subagent_threads_are_rejected()
     test_new_session_is_the_last_resort()
+    test_an_unaddressed_relay_says_it_was_aimed_by_the_human()
     test_panel_session_selection()
     test_another_window_is_reachable_only_when_named()
     test_the_caller_identifies_its_own_session_exactly()

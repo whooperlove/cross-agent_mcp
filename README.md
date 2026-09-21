@@ -324,6 +324,25 @@ Observed human input **always takes priority** over transcript timing. Turns the
 
 `bridge_status`'s `ide_panels` shows the list of open tabs and the selection result as-is. If it's not the tab you want, pin one with `pin_agent_session`.
 
+> **A send with no `session_id` is addressed by the human, not by you.**
+>
+> Rules 3 to 5 pick from what the person at the keyboard is doing. That is what you want for
+> "ask Codex about this" while they watch. It is not an address: it moves when they switch
+> tabs, so two sends in a row can land in different conversations, and a reply that arrives
+> minutes later belongs to whichever tab was in front at the time. A status update in an
+> ongoing exchange has been delivered into an unrelated thread this way, which then began
+> acting on it.
+>
+> Pass `session_id` explicitly for anything automated, delayed, or part of an exchange that
+> continues over several messages — **every time, not only the first**. A long conversation
+> with one peer starts to feel like an addressed channel and is not one.
+>
+> The receipt tells you which happened: `target_selected_by` is `caller` when you named the
+> session, `pin` when a pin did, and `panel-focus` or `discovery` when nobody did —
+> `is_explicitly_addressed` is the same thing as a boolean. An unaddressed relay also returns
+> a `warning`. Check `target_session_id` is the conversation you meant before reporting a send
+> as done; a misdelivered message cannot be recalled.
+
 #### Conversations in another VS Code window
 
 The shim socket is an ordinary unix socket and isn't tied to a window. What process-ancestor detection determines is **"which window," not "can it be reached."** So the rule splits into two.

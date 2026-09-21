@@ -640,6 +640,18 @@ PANEL_SETTING = {
 }
 
 
+# How a relay's target was arrived at. Only SELECTED_CALLER and SELECTED_PIN are addresses
+# the caller controls; the rest move with what the human is doing.
+SELECTED_CALLER = 'caller'
+SELECTED_PIN = 'pin'
+SELECTED_PANEL_FOCUS = 'panel-focus'
+SELECTED_DISCOVERY = 'discovery'
+SELECTED_CREATED = 'created'
+SELECTED_FORCED_NEW = 'forced-new'
+
+UNADDRESSED_SELECTIONS = (SELECTED_PANEL_FOCUS, SELECTED_DISCOVERY)
+
+
 def _panel_session(target_agent: str, wanted_id: Optional[str],
                    exclude_ids: List[str]) -> Optional[Dict[str, Any]]:
     """An already-open conversation in this window's panel, or None."""
@@ -724,16 +736,22 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
     caller meant to reach, which in the middle of a long task looks like the peer forgetting
     everything. Everything else is tried first.
     """
+    def chosen(target: Optional[Dict[str, Any]], how: str) -> Optional[Dict[str, Any]]:
+        if target is not None:
+            target['selected_by'] = how
+        return target
+
     if is_new_forced:
-        return _new_panel_conversation(target_agent)
+        return chosen(_new_panel_conversation(target_agent), SELECTED_FORCED_NEW)
 
     wanted_id, requested = _requested_session_id(target_agent, session_id, cwd)
 
     # 1. the session that was named (or pinned) - in the panel if it happens to be open there
     if wanted_id:
+        how = SELECTED_CALLER if requested else SELECTED_PIN
         panel = _panel_session(target_agent, wanted_id, exclude_ids)
         if panel:
-            return panel
+            return chosen(panel, how)
 
         found = discovery.find_session(target_agent, wanted_id)
         if not found:
@@ -742,21 +760,23 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
                 f'{target_agent} session {label!r} no longer exists. Nothing was sent and no '
                 'session was created; clear the pin with pin_agent_session or name another one.')
         found['source'] = 'name' if requested else 'pin'
-        return found
+        return chosen(found, how)
 
-    # 2. the conversation the user is working in, in this window's panel
+    # 2. the conversation the user is working in, in this window's panel. Nothing the caller
+    #    said chose this one: it is whichever tab the human most recently typed into, which is
+    #    a convenience for an interactive ask and an address that moves under anything else.
     panel = _panel_session(target_agent, None, exclude_ids)
     if panel:
-        return panel
+        return chosen(panel, SELECTED_PANEL_FOCUS)
 
     # 3. an existing session on disk. The panel will not show the exchange, but the peer keeps
     #    its context - always better than starting over
     active = discovery.find_active_session(target_agent, scope, cwd, exclude_ids)
     if active:
-        return active
+        return chosen(active, SELECTED_DISCOVERY)
 
     # 4. nothing to resume anywhere
-    return _new_panel_conversation(target_agent)
+    return chosen(_new_panel_conversation(target_agent), SELECTED_CREATED)
 
 
 # --------------------------------------------------------- outbox delivery
@@ -1213,6 +1233,18 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
             'conversation will be started. It has none of the earlier context. Tell the user '
             'this happened, and pass session_id (an id or the conversation name) or '
             'pin_agent_session to target a specific one.')
+    selected_by = (target or {}).get('selected_by', SELECTED_CREATED)
+    if selected_by in UNADDRESSED_SELECTIONS and target_id:
+        where = ('the conversation tab this editor window was most recently used in'
+                 if selected_by == SELECTED_PANEL_FOCUS
+                 else 'the most recently active session on disk')
+        warnings.append(
+            f'You did not say which {target_agent} session to reach, so this went to '
+            f'{where}: {target_id}. That is chosen from what the human is doing, not from '
+            'anything you said, and it moves when they switch tabs - two sends in a row can '
+            'land in different conversations. Check target_session_id is the one you meant. '
+            'For anything automated, delayed, or part of an ongoing exchange, pass session_id '
+            'explicitly every time.')
     if not self_session_id:
         warnings.append(
             'Your own session could not be identified, so the peer\'s answer cannot be '
@@ -1241,6 +1273,8 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         'target_agent': target_agent,
         'target_session_id': target_id,
         'session_origin': 'created' if is_new_target else (target or {}).get('source', 'unknown'),
+        'target_selected_by': selected_by,
+        'is_explicitly_addressed': selected_by == SELECTED_CALLER,
         'will_create_session': is_new_target,
         'delivery': 'ide-panel' if (target or {}).get('ui_shim') else 'cli-resume',
         'is_visible_in_panel': bool((target or {}).get('ui_shim')),
