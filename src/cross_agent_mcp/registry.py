@@ -172,8 +172,25 @@ def get_conversation(conversation_id: str) -> Dict[str, Any]:
 
 # --------------------------------------------------------------- busy locking
 
+class UnusableSessionId(ValueError):
+    """A session id that must not be turned into a path."""
+
+
 def _lock_path(agent: str, session_id: str) -> str:
-    return config.LOCK_DIR + f'{agent}__{session_id}.lock'
+    """The lock file for one session, refusing a name that would not stay in the lock directory.
+
+    Not every id reaching here was resolved from a store. A reply is addressed with the session
+    the calling agent declared in its own turn metadata, which is whatever the client sent, and
+    that value is interpolated straight into this name. A `/` in it puts the lock somewhere
+    other than where every other claim is looked for, so the bridge would hold a lock nobody
+    else consults - exclusion that silently is not.
+    """
+    path = config.LOCK_DIR + f'{agent}__{session_id}.lock'
+    if os.path.dirname(os.path.realpath(path)) != os.path.realpath(config.LOCK_DIR):
+        raise UnusableSessionId(
+            f'session id {session_id!r} does not name a lock inside {config.LOCK_DIR}. A '
+            'session id is a name, not a path.')
+    return path
 
 
 def _guard_path() -> str:
@@ -257,7 +274,12 @@ def read_busy_lock(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
 
 def _read_busy_lock_held(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
     """As read_busy_lock, for a caller that is already holding the transition guard."""
-    path = _lock_path(agent, session_id)
+    try:
+        path = _lock_path(agent, session_id)
+    except UnusableSessionId:
+        # Asking whether an unusable id is busy is answerable - nothing can hold a lock that
+        # could never be named - and only claiming one has to fail.
+        return None
     try:
         with open(path, 'r', encoding='utf-8') as f:
             record = json.load(f)

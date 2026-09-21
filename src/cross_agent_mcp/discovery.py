@@ -385,6 +385,21 @@ def is_session_id(value: Any) -> bool:
     return isinstance(value, str) and SESSION_ID_PATTERN.fullmatch(value) is not None
 
 
+def is_inside(path: str, root: str) -> bool:
+    """Whether a path really sits under a root once every link in it is resolved.
+
+    A store entry is found by its name, and a name is not a location: a transcript in the
+    store can be a symlink to a file outside it, and reading it would answer for a
+    conversation the store does not hold, with whatever that file contains.
+    """
+    try:
+        real_root = os.path.realpath(root)
+        real_path = os.path.realpath(path)
+    except OSError:
+        return False
+    return real_path == real_root or real_path.startswith(real_root.rstrip(os.sep) + os.sep)
+
+
 def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
     """Look up one session by id. Both stores encode the id in the file name.
 
@@ -400,6 +415,8 @@ def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
 
     if agent == config.AGENT_CLAUDE:
         for path in glob.glob(config.CLAUDE_PROJECTS_DIR + f'*/{session_id}.jsonl'):
+            if not is_inside(path, config.CLAUDE_PROJECTS_DIR):
+                continue
             info = _parse_claude_session(path)
             if info:
                 return info
@@ -408,8 +425,13 @@ def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
     paths = glob.glob(config.CODEX_SESSIONS_DIR + f'**/rollout-*-{session_id}.jsonl',
                       recursive=True)
     for path in sorted(paths, key=_safe_mtime, reverse=True):
+        if not is_inside(path, config.CODEX_SESSIONS_DIR):
+            continue
         info = _parse_codex_session(path)
-        if info:
+        # The name of a rollout is not what makes it that session's: the record inside says
+        # whose it is, and a file whose two disagree answers for a conversation nobody asked
+        # about. Same mistake as reading an id out of a glob, one layer further in.
+        if info and str(info.get('session_id', '')).lower() == session_id:
             info['title'] = _load_codex_thread_names().get(session_id, '')
             info['is_named'] = bool(info['title'])
             return info

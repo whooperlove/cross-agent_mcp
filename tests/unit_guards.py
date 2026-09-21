@@ -2077,6 +2077,93 @@ def test_an_ambiguous_name_stops_the_send_rather_than_reaching_a_conversation() 
         (discovery.list_sessions, discovery.find_session) = originals
 
 
+def test_a_store_entry_answers_only_for_the_session_it_actually_holds() -> None:
+    """Two ways a lookup by id can answer for a conversation nobody asked about.
+
+    A name is not a location: a transcript in the store can be a symlink to a file outside it,
+    and reading it answers with whatever that file contains. And the name of a Codex rollout is
+    not what makes it that session's - the record inside says whose it is - so a file whose two
+    disagree answers for the session named in its payload rather than the one that was asked
+    for. Both are the mistake the id-shape check fixed, one layer further in: trusting a name
+    to say what something is.
+    """
+    saved = (config.CLAUDE_PROJECTS_DIR, config.CODEX_SESSIONS_DIR)
+    asked = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    other = 'ffffffff-9999-8888-7777-666666666666'
+    try:
+        with tempfile.TemporaryDirectory(prefix='codex-mismatch-') as codex_store:
+            _write_rollout(codex_store, other, '/w', time.time())
+            day = codex_store + '/2026/08/08'
+            # a copy carrying the asked-for id in its name while still declaring `other`
+            shutil.copyfile(f'{day}/rollout-2026-08-08T00-00-00-{other}.jsonl',
+                            f'{day}/rollout-2026-08-08T00-00-00-{asked}.jsonl')
+            config.CODEX_SESSIONS_DIR = codex_store + '/'
+
+            check('a rollout named for one session but declaring another is not an answer',
+                  discovery.find_session('codex', asked) is None,
+                  str(discovery.find_session('codex', asked)))
+            check('while the session it really holds is still reachable by its own id',
+                  (discovery.find_session('codex', other) or {}).get('session_id') == other)
+
+        with tempfile.TemporaryDirectory(prefix='outside-store-') as outside:
+            real = outside + '/secret.jsonl'
+            with open(real, 'w', encoding='utf-8') as f:
+                f.write(json.dumps({'sessionId': asked, 'cwd': '/elsewhere', 'type': 'user',
+                                    'message': {'role': 'user', 'content': 'outside'}}) + '\n')
+            with tempfile.TemporaryDirectory(prefix='claude-store-') as claude_store:
+                os.makedirs(claude_store + '/-w')
+                os.symlink(real, f'{claude_store}/-w/{asked}.jsonl')
+                config.CLAUDE_PROJECTS_DIR = claude_store + '/'
+
+                check('a transcript that resolves outside the store is not read from it',
+                      discovery.find_session('claude', asked) is None,
+                      str(discovery.find_session('claude', asked)))
+                check('and the containment test agrees about where that file really is',
+                      not discovery.is_inside(f'{claude_store}/-w/{asked}.jsonl', claude_store)
+                      and discovery.is_inside(real, outside))
+
+            _write_rollout(outside, asked, '/elsewhere', time.time())
+            with tempfile.TemporaryDirectory(prefix='codex-store-') as codex_store:
+                day = codex_store + '/2026/08/08'
+                os.makedirs(day)
+                os.symlink(f'{outside}/2026/08/08/rollout-2026-08-08T00-00-00-{asked}.jsonl',
+                           f'{day}/rollout-2026-08-08T00-00-00-{asked}.jsonl')
+                config.CODEX_SESSIONS_DIR = codex_store + '/'
+
+                check('nor is a rollout that resolves outside the Codex store',
+                      discovery.find_session('codex', asked) is None,
+                      str(discovery.find_session('codex', asked)))
+    finally:
+        (config.CLAUDE_PROJECTS_DIR, config.CODEX_SESSIONS_DIR) = saved
+
+
+def test_a_session_id_cannot_name_a_lock_outside_the_lock_directory() -> None:
+    """The id a reply is addressed with is whatever the calling client declared about itself.
+
+    `caller_session_from_meta` takes the thread id out of the turn metadata and nothing checks
+    its shape, so it reaches the lock name as it arrived. Interpolated into that name, a `/`
+    puts the claim somewhere other than where every other claim is looked for: the bridge would
+    believe it held a lock that nothing else consults, which is exclusion that silently is not.
+    """
+    ordinary = '01a0b4b3-c75a-77d2-95b6-be4299edf5f9'
+    check('an ordinary id still names a lock, in the lock directory',
+          os.path.dirname(os.path.realpath(registry._lock_path(config.AGENT_CODEX, ordinary)))
+          == os.path.realpath(config.LOCK_DIR))
+
+    for crafted in ('../../../../tmp/escaped', 'a/b', '../sibling'):
+        raised = None
+        try:
+            registry._lock_path(config.AGENT_CODEX, crafted)
+        except Exception as e:
+            raised = e
+        check(f'{crafted!r} is refused as a lock name',
+              isinstance(raised, registry.UnusableSessionId),
+              f'{type(raised).__name__}: {raised}')
+
+    check('asking whether such an id is busy is answered, not raised',
+          registry.read_busy_lock(config.AGENT_CODEX, '../../../../tmp/escaped') is None)
+
+
 def test_a_session_name_matches_exactly_or_not_at_all() -> None:
     """The incident: 'koppa_studio' matched a path quoted inside an old session's first message.
 
@@ -4593,6 +4680,8 @@ def run_all() -> None:
     test_a_name_that_straddles_a_chunk_boundary_is_still_whole()
     test_a_record_cut_off_by_the_search_bound_is_not_half_read()
     test_a_name_further_back_than_the_search_bound_is_not_found()
+    test_a_store_entry_answers_only_for_the_session_it_actually_holds()
+    test_a_session_id_cannot_name_a_lock_outside_the_lock_directory()
     test_a_session_name_matches_exactly_or_not_at_all()
     test_a_name_two_conversations_answer_to_is_refused_rather_than_guessed()
     test_the_candidates_say_whether_each_name_was_assigned_or_generated()
