@@ -1340,6 +1340,65 @@ def test_the_current_name_is_found_however_the_transcript_ends() -> None:
         check('a conversation with no name is not given one', is_named is False, str(title))
 
 
+def test_a_name_that_straddles_a_chunk_boundary_is_still_whole() -> None:
+    """The chunk boundary is not a record boundary, so records are rejoined across it.
+
+    The read works backwards in fixed chunks. A record that begins in one chunk and ends in
+    the next arrives in two pieces, and a reader that judged each piece on its own would see
+    two fragments of JSON and no name. These place a rename exactly across that seam, and
+    make one longer than a whole chunk so it has to survive being split more than once.
+    """
+    with tempfile.TemporaryDirectory(prefix='claude-chunk-seam-') as store:
+        path = store + '/88888888-8888-4888-8888-888888888888.jsonl'
+
+        def title_after(trailing: int, name: str = 'Across the seam'):
+            _transcript_with_records(path, [_named(name), _bulk(trailing)])
+            parsed = discovery._parse_claude_session(path)
+            return parsed and parsed['title']
+
+        # walk the rename through a whole chunk's worth of offsets: wherever the boundary
+        # falls inside it, it must still be read as one record
+        misses = [offset for offset in range(65_400, 65_700, 17)
+                  if title_after(offset) != 'Across the seam']
+        check('a rename split across a chunk boundary is rejoined',
+              not misses, f'missed at trailing offsets {misses[:5]}')
+
+        long_name = 'Name ' + 'y' * 100_000
+        _transcript_with_records(path, [_named(long_name), _bulk(70_000)])
+        parsed = discovery._parse_claude_session(path)
+        check('and a rename record longer than a chunk survives being split repeatedly',
+              parsed is not None and parsed['title'] == long_name,
+              str(parsed and parsed['title'])[:60])
+
+
+def test_a_record_cut_off_by_the_search_bound_is_not_half_read() -> None:
+    """The record the bound lands inside is incomplete by definition and is dropped.
+
+    Everything before it is unreachable anyway, so a partial record carries no meaning - and
+    feeding half a line to the parser is how a reader invents a name that was never written.
+    """
+    with tempfile.TemporaryDirectory(prefix='claude-cut-record-') as store:
+        path = store + '/99999999-9999-4999-8999-999999999999.jsonl'
+        # a rename made enormous so the cap falls inside it rather than between records
+        straddling = 'Cut in half ' + 'z' * (discovery.TAIL_BYTES // 2)
+        _transcript_with_records(path, [_named(straddling), _bulk(discovery.TAIL_BYTES)])
+
+        records = list(discovery._reversed_records(path, discovery.TAIL_BYTES))
+        unparsable = []
+        for line in records:
+            try:
+                json.loads(line)
+            except ValueError:
+                unparsable.append(line[:40])
+        check('every record handed back is whole enough to parse', not unparsable,
+              str(unparsable[:2]))
+
+        parsed = discovery._parse_claude_session(path)
+        check('and a rename the bound cuts through does not name the conversation',
+              parsed is not None and parsed['is_named'] is False,
+              str(parsed and parsed['title'])[:60])
+
+
 def test_a_name_further_back_than_the_search_bound_is_not_found() -> None:
     """The bound is a real limit, and this is what reaching it looks like.
 
@@ -3392,6 +3451,8 @@ def run_all() -> None:
     test_a_conversations_own_name_is_what_it_is_called_by()
     test_a_rename_after_the_head_window_is_still_the_conversations_name()
     test_the_current_name_is_found_however_the_transcript_ends()
+    test_a_name_that_straddles_a_chunk_boundary_is_still_whole()
+    test_a_record_cut_off_by_the_search_bound_is_not_half_read()
     test_a_name_further_back_than_the_search_bound_is_not_found()
     test_a_session_name_matches_exactly_or_not_at_all()
     test_a_named_session_is_never_silently_created()
