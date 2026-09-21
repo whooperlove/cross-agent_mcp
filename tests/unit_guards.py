@@ -1234,15 +1234,135 @@ def test_a_rename_after_the_head_window_is_still_the_conversations_name() -> Non
               parsed is not None and parsed['is_named'] is False,
               str(parsed and parsed['title']))
 
-        original = discovery.list_sessions
-        discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: [
-            discovery._parse_claude_session(late), discovery._parse_claude_session(nameless)]
-        try:
+        # A real store rather than a stubbed list_sessions: the lookup is free to reach the
+        # transcripts by whichever route it likes, so this keeps testing the same thing if
+        # that route changes.
+        with tempfile.TemporaryDirectory(prefix='claude-late-rename-store-') as root:
+            project = root + '/projects/-w'
+            os.makedirs(project)
+            shutil.copy(late, project + '/44444444-4444-4444-4444-444444444444.jsonl')
+            shutil.copy(nameless, project + '/55555555-5555-5555-5555-555555555555.jsonl')
+
+            saved = config.CLAUDE_PROJECTS_DIR
+            config.CLAUDE_PROJECTS_DIR = root + '/projects/'
+            try:
+                found = discovery.find_session_by_name('claude', 'Implementation')
+            finally:
+                config.CLAUDE_PROJECTS_DIR = saved
+
             check('and the late name is what the lookup finds it by',
-                  (discovery.find_session_by_name('claude', 'Implementation') or {})
-                  .get('session_id') == '44444444-4444-4444-4444-444444444444')
-        finally:
-            discovery.list_sessions = original
+                  (found or {}).get('session_id') == '44444444-4444-4444-4444-444444444444',
+                  str(found and found.get('session_id')))
+
+
+def _transcript_with_records(path: str, records: list) -> None:
+    """A Claude transcript whose given records all fall past the head window.
+
+    Without the padding the head scan finds the name and the tail reader is never reached, so
+    every check here would pass with the tail reader broken - which is how these were first
+    written.
+    """
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(json.dumps({
+            'type': 'user', 'isSidechain': False, 'cwd': '/w', 'entrypoint': 'claude-vscode',
+            'message': {'content': 'open the store units'}}) + '\n')
+        for index in range(discovery.CLAUDE_HEAD_LINES * 2):
+            f.write(json.dumps({'type': 'assistant', 'isSidechain': False, 'cwd': '/w',
+                                'message': {'content': f'turn {index}'}}) + '\n')
+        for record in records:
+            f.write(json.dumps(record) + '\n')
+
+
+def _named(name: str) -> dict:
+    return {'type': 'custom-title', 'customTitle': name}
+
+
+def _bulk(size: int) -> dict:
+    return {'type': 'assistant', 'isSidechain': False, 'cwd': '/w',
+            'message': {'content': 'x' * size}}
+
+
+def test_the_current_name_is_found_however_the_transcript_ends() -> None:
+    """The end of a transcript is read backwards until a name is found, not in a fixed window.
+
+    A single record here has been measured at 481,799 bytes, so a window chosen to mean "the
+    last few hundred lines" can be spent entirely inside one record and miss the name written
+    just before it. These are the shapes that a fixed window gets wrong.
+    """
+    with tempfile.TemporaryDirectory(prefix='claude-rename-shapes-') as store:
+        def title_of(records):
+            path = store + '/66666666-6666-4666-8666-666666666666.jsonl'
+            _transcript_with_records(path, records)
+            parsed = discovery._parse_claude_session(path)
+            return parsed and parsed['title'], parsed and parsed['is_named']
+
+        title, is_named = title_of([_named('Renamed late'), _bulk(70_000)])
+        check('a name followed by one record larger than 64 KiB is still found',
+              title == 'Renamed late' and is_named is True, str(title))
+
+        title, _ = title_of([_named('Renamed late'), _bulk(481_799)])
+        check('and one record larger than any plausible fixed window is still found',
+              title == 'Renamed late', str(title))
+
+        title, _ = title_of([_named('First name'), _bulk(2_000),
+                             _named('Second name'), _bulk(2_000),
+                             _named('Current name'), _bulk(2_000)])
+        check('the most recent of several names is the one it answers to',
+              title == 'Current name', str(title))
+
+        quoting = {'type': 'assistant', 'isSidechain': False, 'cwd': '/w', 'message': {
+            'content': 'the entry looks like {"type":"custom-title","customTitle":"Not this"}'}}
+        title, is_named = title_of([_named('The real name'), quoting])
+        check('a record merely quoting "custom-title" is not mistaken for one',
+              title == 'The real name', str(title))
+
+        title, is_named = title_of([quoting])
+        check('and quoting it does not name an unnamed conversation',
+              is_named is False, f'{title!r} named={is_named}')
+
+        # A record that is not a rename but carries the field anyway. The type is what makes a
+        # record a rename; taking any customTitle found would answer to this one.
+        # The key spelled "custom-title" puts that exact text in the raw line, so this record
+        # reaches the parse rather than being dropped by the cheap pre-filter. What rejects it
+        # is its type.
+        impostor = {'type': 'assistant', 'isSidechain': False, 'cwd': '/w',
+                    'custom-title': 'a field, not a record type',
+                    'customTitle': 'Not this either', 'message': {'content': 'a tool result'}}
+        title, is_named = title_of([_named('The real name'), impostor])
+        check('a record of another type carrying customTitle is not a rename',
+              title == 'The real name', str(title))
+
+        title, is_named = title_of([impostor])
+        check('and it alone does not name the conversation',
+              is_named is False, f'{title!r} named={is_named}')
+
+        title, is_named = title_of([_bulk(200)])
+        check('a conversation with no name is not given one', is_named is False, str(title))
+
+
+def test_a_name_further_back_than_the_search_bound_is_not_found() -> None:
+    """The bound is a real limit, and this is what reaching it looks like.
+
+    The read stops after TAIL_BYTES so that listing sessions cannot be made arbitrarily
+    expensive by one enormous transcript. A name buried further back than that is not found,
+    and the conversation falls back to its generated title - reachable by id, not by name.
+    This is a deliberate trade rather than an oversight, so it is pinned here.
+    """
+    with tempfile.TemporaryDirectory(prefix='claude-rename-bound-') as store:
+        path = store + '/77777777-7777-4777-8777-777777777777.jsonl'
+        beyond = discovery.TAIL_BYTES + 100_000
+        _transcript_with_records(path, [_named('Too far back'), _bulk(beyond)])
+
+        parsed = discovery._parse_claude_session(path)
+        check('a name further back than the bound is not found',
+              parsed is not None and parsed['title'] != 'Too far back', str(parsed['title']))
+        check('and the conversation is reported as unnamed rather than mis-named',
+              parsed is not None and parsed['is_named'] is False, str(parsed['is_named']))
+
+        read = list(discovery._reversed_records(path, discovery.TAIL_BYTES))
+        check('the reader stopped at the bound rather than reading the whole file',
+              sum(len(line) for line in read) <= discovery.TAIL_BYTES,
+              f'{sum(len(line) for line in read)} of {os.path.getsize(path)} bytes')
 
 
 def test_a_session_name_matches_exactly_or_not_at_all() -> None:
@@ -3271,6 +3391,8 @@ def run_all() -> None:
     test_recovery_is_skipped_when_the_transport_already_answered()
     test_a_conversations_own_name_is_what_it_is_called_by()
     test_a_rename_after_the_head_window_is_still_the_conversations_name()
+    test_the_current_name_is_found_however_the_transcript_ends()
+    test_a_name_further_back_than_the_search_bound_is_not_found()
     test_a_session_name_matches_exactly_or_not_at_all()
     test_a_named_session_is_never_silently_created()
     test_naming_a_session_and_forcing_a_new_one_is_refused()

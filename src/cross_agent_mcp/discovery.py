@@ -119,17 +119,19 @@ def _extract_text(message: Any) -> str:
 def _latest_custom_title(path: str) -> Optional[str]:
     """The name a conversation carries *now*.
 
-    The entry is re-emitted as the transcript grows, so the copy near the head is the name the
-    session opened with - and renames happen.
+    A rename is appended wherever the transcript currently ends, so a session named after its
+    first CLAUDE_HEAD_LINES lines has nothing in its head to find: a 5391-line transcript
+    renamed at line 5388 kept answering to its generated title and could not be reached by the
+    name on its own panel. Every session therefore pays a read of the end, not only the ones
+    that already showed a name.
 
-    Every session pays this read, not only the ones that showed a name in the head. A rename
-    is appended where the transcript currently ends, so a session named after its first
-    CLAUDE_HEAD_LINES lines has nothing in the head to trigger the check: a 5391-line
-    transcript renamed at line 5388 kept answering to its generated title and could not be
-    reached by the name on its own panel. The read is bounded to the last RENAME_TAIL_BYTES,
-    not the 2MB an answer needs, because the entry sits at the very end.
+    The end is read backwards a chunk at a time and stopped at the first name found, so a
+    session renamed recently - the ordinary case - costs one chunk rather than the whole bound.
+    A fixed byte window cannot do this: a single record here has been measured at 481,799
+    bytes, so a window sized for "the last few hundred lines" can be spent entirely on one of
+    them and miss a name written just before it.
     """
-    for line in reversed(_tail_lines(path, RENAME_TAIL_BYTES)):
+    for line in _reversed_records(path, TAIL_BYTES):
         if '"custom-title"' not in line:
             continue
         try:
@@ -442,9 +444,40 @@ def suggest_session_names(agent: str, name: str, limit: int = 500,
 # how much of a transcript's tail is read when recovering an answer from it
 TAIL_BYTES = 2_000_000
 
-# how much is read when only the rename entry is wanted - every listed session pays this one,
-# so it is the last few hundred lines rather than the last two megabytes
-RENAME_TAIL_BYTES = 65_536
+
+def _reversed_records(path: str, limit_bytes: int) -> Iterator[str]:
+    """Whole records from the end of a transcript, newest first, within `limit_bytes`.
+
+    Reading backwards lets a caller stop as soon as it has what it wants. The chunk boundary
+    is not a record boundary, so the leading fragment of each chunk is carried over and joined
+    to the tail of the chunk before it; a record longer than a chunk simply accumulates across
+    several. Only the final, incomplete-by-definition fragment at the start of the bound is
+    dropped, and only once the bound is reached.
+
+    The caller parses what it gets: a raw substring search would match a record that merely
+    quotes the text, and message and tool content routinely does.
+    """
+    chunk_size = 65_536
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            position = size
+            carry = b''
+            while position > 0 and size - position < limit_bytes:
+                step = min(chunk_size, position, limit_bytes - (size - position))
+                position -= step
+                f.seek(position)
+                block = f.read(step) + carry
+                lines = block.split(b'\n')
+                carry = lines[0]
+                for raw in reversed(lines[1:]):
+                    text = raw.decode('utf-8', 'replace').strip()
+                    if text:
+                        yield text
+            if position == 0 and carry.strip():
+                yield carry.decode('utf-8', 'replace').strip()
+    except OSError:
+        return
 
 
 def _tail_lines(path: str, limit_bytes: int = TAIL_BYTES) -> List[str]:
