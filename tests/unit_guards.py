@@ -352,6 +352,69 @@ def test_new_session_is_the_last_resort() -> None:
 
 # --------------------------------------- which conversation tab a relay lands in
 
+def test_the_receipt_says_who_chose_the_conversation() -> None:
+    """The receipt is the contract, so it is what gets asserted - not the resolver behind it.
+
+    A caller has only this to go on: a send that went where it asked and one that went
+    wherever the human was looking are otherwise identical. Every way a target can be arrived
+    at is checked here, including the two that produce no target object at all.
+    """
+    originals = (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
+                 outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome)
+    bridge.caller.detect_caller = lambda: {'agent': config.AGENT_CLAUDE, 'chain': []}
+    bridge._own_session_id = lambda agent: 'sender-sid'
+    outbox.OUTBOX.submit = lambda job: 'dlv_receipt'
+    outbox.OUTBOX.await_outcome = lambda job: None
+
+    def receipt(selected_by, session_id='peer-sid', is_new_session=False, no_target=False):
+        bridge._resolve_target = lambda *a, **kw: None if no_target else {
+            'agent': config.AGENT_CODEX, 'session_id': session_id, 'cwd': None,
+            'source': 'stub', 'ui_shim': None, 'selected_by': selected_by}
+        return bridge.send_message(config.AGENT_CODEX, 'hello',
+                                   is_new_session=is_new_session)
+
+    try:
+        for how, expected_flag in ((bridge.SELECTED_CALLER, True),
+                                   (bridge.SELECTED_PIN, False),
+                                   (bridge.SELECTED_PANEL_FOCUS, False),
+                                   (bridge.SELECTED_DISCOVERY, False),
+                                   (bridge.SELECTED_CREATED, False)):
+            got = receipt(how)
+            check(f'a {how} target is reported as {how}',
+                  got.get('target_selected_by') == how, str(got.get('target_selected_by')))
+            check(f'and caller_supplied_session_id is {expected_flag} for {how}',
+                  got.get('caller_supplied_session_id') is expected_flag,
+                  str(got.get('caller_supplied_session_id')))
+
+        warned = receipt(bridge.SELECTED_PANEL_FOCUS, session_id='whichever-tab')
+        check('an unaddressed relay warns, and names the session it actually reached',
+              'whichever-tab' in (warned.get('warning') or ''), str(warned.get('warning')))
+        for how in (bridge.SELECTED_CALLER, bridge.SELECTED_PIN):
+            quiet = receipt(how)
+            check(f'a {how} target draws no addressing warning',
+                  'did not say which' not in (quiet.get('warning') or ''),
+                  str(quiet.get('warning')))
+
+        hosted = receipt(bridge.SELECTED_FORCED_NEW, session_id=None, is_new_session=True)
+        check('a forced-new conversation a panel can host says forced-new',
+              hosted.get('target_selected_by') == bridge.SELECTED_FORCED_NEW,
+              str(hosted.get('target_selected_by')))
+
+        # nothing could host it, so there is no target object to carry the label
+        homeless = receipt(bridge.SELECTED_FORCED_NEW, is_new_session=True, no_target=True)
+        check('and one nothing could host still says forced-new, not created',
+              homeless.get('target_selected_by') == bridge.SELECTED_FORCED_NEW,
+              str(homeless.get('target_selected_by')))
+
+        ordinary = receipt(bridge.SELECTED_CREATED, no_target=True)
+        check('while a conversation nobody asked for is created',
+              ordinary.get('target_selected_by') == bridge.SELECTED_CREATED,
+              str(ordinary.get('target_selected_by')))
+    finally:
+        (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
+         outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome) = originals
+
+
 def test_an_unaddressed_relay_says_it_was_aimed_by_the_human() -> None:
     """A send with no session_id is addressed by panel focus, and must say so.
 
@@ -3232,6 +3295,7 @@ def run_all() -> None:
     test_timeout_kills_descendants()
     test_subagent_threads_are_rejected()
     test_new_session_is_the_last_resort()
+    test_the_receipt_says_who_chose_the_conversation()
     test_an_unaddressed_relay_says_it_was_aimed_by_the_human()
     test_panel_session_selection()
     test_another_window_is_reachable_only_when_named()

@@ -640,8 +640,9 @@ PANEL_SETTING = {
 }
 
 
-# How a relay's target was arrived at. Only SELECTED_CALLER and SELECTED_PIN are addresses
-# the caller controls; the rest move with what the human is doing.
+# How a relay's target was arrived at. SELECTED_CALLER is the only one the call itself
+# chose: a pin is stable configuration set earlier, and the rest move with what the human is
+# doing at the time.
 SELECTED_CALLER = 'caller'
 SELECTED_PIN = 'pin'
 SELECTED_PANEL_FOCUS = 'panel-focus'
@@ -1233,7 +1234,10 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
             'conversation will be started. It has none of the earlier context. Tell the user '
             'this happened, and pass session_id (an id or the conversation name) or '
             'pin_agent_session to target a specific one.')
-    selected_by = (target or {}).get('selected_by', SELECTED_CREATED)
+    # No target object at all means nothing could host the conversation, so the choice
+    # is still the caller's when they asked for a new one.
+    selected_by = (target or {}).get(
+        'selected_by', SELECTED_FORCED_NEW if is_new_session else SELECTED_CREATED)
     if selected_by in UNADDRESSED_SELECTIONS and target_id:
         where = ('the conversation tab this editor window was most recently used in'
                  if selected_by == SELECTED_PANEL_FOCUS
@@ -1274,7 +1278,7 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         'target_session_id': target_id,
         'session_origin': 'created' if is_new_target else (target or {}).get('source', 'unknown'),
         'target_selected_by': selected_by,
-        'is_explicitly_addressed': selected_by == SELECTED_CALLER,
+        'caller_supplied_session_id': selected_by == SELECTED_CALLER,
         'will_create_session': is_new_target,
         'delivery': 'ide-panel' if (target or {}).get('ui_shim') else 'cli-resume',
         'is_visible_in_panel': bool((target or {}).get('ui_shim')),

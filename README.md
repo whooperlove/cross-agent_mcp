@@ -338,9 +338,10 @@ Observed human input **always takes priority** over transcript timing. Turns the
 > with one peer starts to feel like an addressed channel and is not one.
 >
 > The receipt tells you which happened: `target_selected_by` is `caller` when you named the
-> session, `pin` when a pin did, and `panel-focus` or `discovery` when nobody did —
-> `is_explicitly_addressed` is the same thing as a boolean. An unaddressed relay also returns
-> a `warning`. Check `target_session_id` is the conversation you meant before reporting a send
+> session, `pin` when a pin set earlier did, and `panel-focus` or `discovery` when nobody
+> did — `caller_supplied_session_id` is true only for the first, because a pin is standing
+> configuration rather than a choice this call made. An unaddressed relay also returns a
+> `warning`. Check `target_session_id` is the conversation you meant before reporting a send
 > as done; a misdelivered message cannot be recalled.
 
 #### Conversations in another VS Code window
