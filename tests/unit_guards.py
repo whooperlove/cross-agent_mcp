@@ -464,6 +464,71 @@ def test_an_unaddressed_relay_says_it_was_aimed_by_the_human() -> None:
           == 'whatever-tab-is-open')
 
 
+def test_the_resolver_labels_a_pin_a_disk_find_and_a_fresh_start() -> None:
+    """The labels nothing reaches through the real resolver.
+
+    The receipt check stubs `_resolve_target`, so it pins what the receipt does with a label
+    rather than which label the resolver assigns, and the addressing check covers `caller`
+    and `panel-focus` only. That left the rest free to be reported as each other - a pin
+    read as `caller` would claim the call named a session it never named - with nothing
+    failing. `_new_panel_conversation` is stubbed because it is a leaf the resolver calls,
+    not the unit under test.
+    """
+    from cross_agent_mcp import uihook
+
+    now = time.time()
+    pinned_session = {'agent': 'codex', 'session_id': 'pinned-sid', 'cwd': '/w', 'mtime': now}
+    disk_session = {'agent': 'codex', 'session_id': 'on-disk-sid', 'cwd': '/w', 'mtime': now}
+    fresh_panel = {'agent': 'codex', 'session_id': None, 'cwd': None,
+                   'source': 'ide-panel-new', 'ui_shim': '/s1', 'mtime': now}
+
+    originals = (uihook.is_enabled, registry.get_pin, discovery.find_session,
+                 discovery.find_active_session, bridge._new_panel_conversation)
+    uihook.is_enabled = lambda: False
+    discovery.find_session = lambda agent, sid: (
+        dict(pinned_session) if sid == 'pinned-sid' else None)
+    bridge._new_panel_conversation = lambda agent: dict(fresh_panel)
+    try:
+        discovery.find_active_session = (
+            lambda agent, scope, cwd, exclude=None: dict(disk_session))
+        registry.get_pin = lambda agent, cwd: {'session_id': 'pinned-sid', 'is_sticky': True}
+        pinned = bridge._resolve_target('codex', None, 'cwd', '/w', False, [])
+
+        registry.get_pin = lambda agent, cwd: None
+        discovered = bridge._resolve_target('codex', None, 'cwd', '/w', False, [])
+
+        discovery.find_active_session = lambda agent, scope, cwd, exclude=None: None
+        created = bridge._resolve_target('codex', None, 'cwd', '/w', False, [])
+        forced = bridge._resolve_target('codex', None, 'cwd', '/w', True, [])
+    finally:
+        (uihook.is_enabled, registry.get_pin, discovery.find_session,
+         discovery.find_active_session, bridge._new_panel_conversation) = originals
+
+    check('a sticky pin the caller never named is recorded as a pin',
+          (pinned or {}).get('selected_by') == bridge.SELECTED_PIN,
+          str(pinned and pinned.get('selected_by')))
+    check('and the conversation it reached is the pinned one, sourced as a pin',
+          (pinned or {}).get('session_id') == 'pinned-sid'
+          and (pinned or {}).get('source') == 'pin',
+          f"{pinned and pinned.get('session_id')} {pinned and pinned.get('source')}")
+    check('a session found on disk is recorded as discovery',
+          (discovered or {}).get('selected_by') == bridge.SELECTED_DISCOVERY,
+          str(discovered and discovered.get('selected_by')))
+    check('and it reached the session discovery turned up',
+          (discovered or {}).get('session_id') == 'on-disk-sid',
+          str(discovered and discovered.get('session_id')))
+    check('a conversation opened because nothing could be resumed is recorded as created',
+          (created or {}).get('selected_by') == bridge.SELECTED_CREATED,
+          str(created and created.get('selected_by')))
+    check('and one opened because the caller asked for a new one is recorded as forced-new',
+          (forced or {}).get('selected_by') == bridge.SELECTED_FORCED_NEW,
+          str(forced and forced.get('selected_by')))
+    check('so the two fresh conversations are told apart by the request, not by the panel '
+          'they came from',
+          (created or {}).get('source') == (forced or {}).get('source') == 'ide-panel-new',
+          f"{created and created.get('source')} {forced and forced.get('source')}")
+
+
 def test_panel_session_selection() -> None:
     from cross_agent_mcp import uihook
 
@@ -3913,6 +3978,7 @@ def run_all() -> None:
     test_new_session_is_the_last_resort()
     test_the_receipt_says_who_chose_the_conversation()
     test_an_unaddressed_relay_says_it_was_aimed_by_the_human()
+    test_the_resolver_labels_a_pin_a_disk_find_and_a_fresh_start()
     test_panel_session_selection()
     test_another_window_is_reachable_only_when_named()
     test_the_caller_identifies_its_own_session_exactly()
