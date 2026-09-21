@@ -776,7 +776,10 @@ def _requested_session_id(target_agent: str, session_id: Optional[str],
     if session_id:
         if discovery.find_session(target_agent, session_id):
             return session_id, session_id
-        named = discovery.find_session_by_name(target_agent, session_id)
+        try:
+            named = discovery.find_session_by_name(target_agent, session_id)
+        except (discovery.AmbiguousSessionName, discovery.UnprovenSessionName) as e:
+            raise BridgeError(f'{e} Nothing was sent and no session was created.')
         if named:
             logger.info(f'_requested_session_id [resolved by name]: '
                         f'{session_id!r} -> {named["session_id"]}')

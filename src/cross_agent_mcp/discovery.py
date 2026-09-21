@@ -305,7 +305,8 @@ def _parse_codex_session(path: str) -> Optional[Dict[str, Any]]:
 
 
 def list_codex_sessions(scope: str, cwd: str, limit: int = 20,
-                        since_mtime: Optional[float] = None) -> List[Dict[str, Any]]:
+                        since_mtime: Optional[float] = None,
+                        stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Scan the Codex rollout store, newest first.
 
     Codex keeps every project's rollouts in one date-partitioned store, so a directory filter
@@ -332,6 +333,8 @@ def list_codex_sessions(scope: str, cwd: str, limit: int = 20,
         if not is_filtering and examined >= config.CODEX_SCAN_LIMIT:
             logger.info(f'list_codex_sessions [truncated]: stopped after {examined} of '
                         f'{len(paths)} rollout files')
+            if stats is not None:
+                stats['is_truncated'] = True
             break
         examined += 1
 
@@ -348,6 +351,7 @@ def list_codex_sessions(scope: str, cwd: str, limit: int = 20,
         if previous and previous['mtime'] >= info['mtime']:
             continue
         info['title'] = thread_names.get(info['session_id'], '')
+        info['is_named'] = bool(info['title'])
         info['cwd_relation'] = relation
         by_session[info['session_id']] = info
 
@@ -357,11 +361,14 @@ def list_codex_sessions(scope: str, cwd: str, limit: int = 20,
 # ------------------------------------------------------------------ shared
 
 def list_sessions(agent: str, scope: str, cwd: str, limit: int = 20,
-                  since_mtime: Optional[float] = None) -> List[Dict[str, Any]]:
+                  since_mtime: Optional[float] = None,
+                  stats: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """`stats` collects what the listing itself knows and the returned list cannot show -
+    at present only whether the scan stopped at a cap rather than at the end of the store."""
     if agent == config.AGENT_CLAUDE:
         return list_claude_sessions(scope, cwd, limit)
     if agent == config.AGENT_CODEX:
-        return list_codex_sessions(scope, cwd, limit, since_mtime)
+        return list_codex_sessions(scope, cwd, limit, since_mtime, stats=stats)
     raise ValueError(f'unknown agent: {agent}')
 
 
@@ -404,11 +411,125 @@ def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
         info = _parse_codex_session(path)
         if info:
             info['title'] = _load_codex_thread_names().get(session_id, '')
+            info['is_named'] = bool(info['title'])
             return info
     return None
 
 
-def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Dict[str, Any]]:
+# how many sessions a lookup by name will look through before it gives up on proving the
+# name unique
+TITLE_SEARCH_LIMIT = 500
+
+# how many candidates an error spells out before it starts counting instead
+DESCRIBED_SESSION_LIMIT = 5
+
+
+def _normalised(value: Any) -> str:
+    return ' '.join(str(value or '').split()).casefold()
+
+
+def find_exact_title_matches(
+        agent: str, name: str,
+        limit: Optional[int] = None) -> Tuple[List[Dict[str, Any]], bool, int]:
+    """Every session answering exactly to a name, whether the search saw all there are, and
+    how many it actually looked at.
+
+    The second value is the one that matters. A scan that stopped at its cap cannot say a
+    name is unique - only that it did not meet a second holder before it ran out - and a
+    caller told "found it" on that basis has been guessed at. The third is what the caller
+    was really told about, which is not the cap it asked for: Codex stops at its own rollout
+    bound, so a search asked for 500 can have looked at four.
+    """
+    wanted = _normalised(name)
+    if not wanted:
+        return [], True, 0
+
+    cap = TITLE_SEARCH_LIMIT if limit is None else limit
+    stats: Dict[str, Any] = {}
+    seen = list_sessions(agent, SCOPE_ANY, os.getcwd(), limit=cap + 1, stats=stats)
+    # Fewer sessions than the cap does not settle it on its own: the Codex scan stops after
+    # CODEX_SCAN_LIMIT rollout files whatever the cap is, and a short list produced that way
+    # is a scan that ran out, not a store that did.
+    is_exhaustive = len(seen) <= cap and not stats.get('is_truncated')
+    examined = seen[:cap]
+    matches = [candidate for candidate in examined
+               if _normalised(candidate.get('title')) == wanted]
+    return sorted(matches, key=lambda s: -s['mtime']), is_exhaustive, len(examined)
+
+
+def describe_sessions(sessions: List[Dict[str, Any]],
+                      limit: int = DESCRIBED_SESSION_LIMIT) -> str:
+    """One line per candidate: which session, when it was last used, and where its name
+    came from.
+
+    Whether the title was assigned or generated from a first message is the fastest way to
+    tell a retired conversation from its replacement - the replacement was usually named on
+    purpose - and a generated title is shared by every session that opened the same way,
+    which is how a name comes to mean several conversations in the first place.
+
+    Only the first few are spelled out. A name twenty conversations answer to is a name to
+    stop using, not a list to read.
+    """
+    shown = '; '.join(
+        f'{s["session_id"]} (last active {s.get("updated_at")}, {s.get("age_minutes")} min ago'
+        f'{"" if s.get("is_active") else ", idle"}, '
+        f'{"name assigned" if s.get("is_named") else "title generated from its first message"}'
+        f', cwd={s.get("cwd") or "unknown"})'
+        for s in sessions[:limit])
+    if len(sessions) > limit:
+        shown += f'; and {len(sessions) - limit} more'
+    return shown
+
+
+RENAME_ADVICE = ('If one of them is retired or replaced, renaming it - and leaving the name '
+                 'to the conversation still in use - makes the name mean one conversation '
+                 'again.')
+
+
+class AmbiguousSessionName(LookupError):
+    """More than one conversation answers to a name, so none of them can be delivered to.
+
+    Carries the candidates rather than only the count: the caller's way out is to name one by
+    id, and it can only do that if it is told which ones there are.
+    """
+
+    def __init__(self, agent: str, name: str, matches: List[Dict[str, Any]],
+                 is_count_exact: bool = True) -> None:
+        self.agent = agent
+        self.name = name
+        self.matches = matches
+        self.is_count_exact = is_count_exact
+        super().__init__(
+            f'{"" if is_count_exact else "at least "}{len(matches)} {agent} sessions answer to '
+            f'{name!r}, so it does not name one conversation: {describe_sessions(matches)}. '
+            f'Address one of them by its id. {RENAME_ADVICE}')
+
+
+class UnprovenSessionName(LookupError):
+    """One session carries this name, out of the ones the scan got to.
+
+    Kept apart from "no match" and from "several matches" because it is neither: the name may
+    well identify exactly this conversation, and the search simply cannot say so. Delivering
+    on it would be choosing the first match found under a cap, which is the same guess
+    AmbiguousSessionName exists to refuse - only harder to notice, because from the outside it
+    looks like an ordinary successful lookup.
+    """
+
+    def __init__(self, agent: str, name: str, match: Dict[str, Any], scanned: int) -> None:
+        self.agent = agent
+        self.name = name
+        self.match = match
+        self.scanned = scanned
+        super().__init__(
+            f'one {agent} session answering to {name!r} was found among the {scanned} '
+            f'session(s) the search reached, but it stopped there, so nothing rules out '
+            f'another one '
+            f'further back: {describe_sessions([match])}. Its id addresses it exactly, whatever '
+            f'else carries the name.')
+
+
+def find_session_by_name(agent: str, name: str,
+                         limit: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """Look one session up by the title the user sees, not by its uuid.
 
     A conversation the human named answers to that name; one they did not falls back to a
@@ -420,25 +541,22 @@ def find_session_by_name(agent: str, name: str, limit: int = 500) -> Optional[Di
     while the session actually named koppa_studio went unseen.
 
     A name the caller half-remembers must fail loudly. Guessing is how a message ends up in a
-    conversation nobody is watching.
+    conversation nobody is watching. A name several conversations answer to is the same
+    problem wearing a better disguise: taking the most recently active one is a guess about
+    which conversation the human meant, made at the moment the message is about to be written
+    into it, and a retired session keeps its name until somebody changes it.
     """
-    wanted = ' '.join(name.split()).casefold()
-    if not wanted:
-        return None
-
-    matches = [
-        candidate for candidate in list_sessions(agent, SCOPE_ANY, os.getcwd(), limit=limit)
-        if ' '.join(str(candidate.get('title') or '').split()).casefold() == wanted
-    ]
+    matches, is_exhaustive, examined = find_exact_title_matches(agent, name, limit=limit)
+    if len(matches) > 1:
+        raise AmbiguousSessionName(agent, name, matches, is_count_exact=is_exhaustive)
     if not matches:
         return None
+    if not is_exhaustive:
+        raise UnprovenSessionName(agent, name, matches[0], examined)
 
-    best = max(matches, key=lambda s: s['mtime'])
+    best = matches[0]
     best['source'] = 'name'
     best['matched_name'] = name
-    if len(matches) > 1:
-        logger.info(f'find_session_by_name [ambiguous]: {len(matches)} sessions are titled '
-                    f'{name!r}; took the freshest ({best["session_id"]})')
     return best
 
 

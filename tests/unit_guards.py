@@ -1872,6 +1872,211 @@ def test_a_name_further_back_than_the_search_bound_is_not_found() -> None:
               f'{sum(len(line) for line in read)} of {os.path.getsize(path)} bytes')
 
 
+def _titled(session_id, title, mtime, is_named, is_active=True, age_minutes=5):
+    return {'session_id': session_id, 'title': title, 'mtime': mtime, 'is_named': is_named,
+            'updated_at': '2026-09-21 10:00', 'age_minutes': age_minutes,
+            'is_active': is_active, 'cwd': '/w', 'agent': 'claude'}
+
+
+def test_a_name_two_conversations_answer_to_is_refused_rather_than_guessed() -> None:
+    """Taking the freshest is a guess, made where the message is about to be written.
+
+    A retired session keeps its name until somebody renames it, so "the newest" picks the
+    replacement only by luck. The caller is told which conversations answer to the name, so it
+    can address one exactly, and how to stop the name meaning two things.
+    """
+    shared = [_titled('replacement', 'billing-api', 300.0, True),
+              _titled('retired', 'billing-api', 100.0, True, is_active=False, age_minutes=28800),
+              _titled('unrelated', 'Studio primer', 50.0, True)]
+    original = discovery.list_sessions
+    discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: list(shared)
+    try:
+        raised = None
+        try:
+            discovery.find_session_by_name('claude', 'billing-api')
+        except Exception as e:
+            raised = e
+        check('a name two conversations answer to is refused, not resolved',
+              isinstance(raised, discovery.AmbiguousSessionName),
+              f'{type(raised).__name__}: {raised}')
+        check('and both are listed, so the caller can address one by id',
+              raised is not None and 'replacement' in str(raised) and 'retired' in str(raised),
+              str(raised))
+        check('and the refusal says to address one by its id',
+              raised is not None and 'by its id' in str(raised), str(raised))
+        check('and points at renaming the retired one, which is what fixes it for good',
+              raised is not None and 'renaming' in str(raised), str(raised))
+        check('a name only one conversation answers to still resolves',
+              (discovery.find_session_by_name('claude', 'Studio primer') or {})
+              .get('session_id') == 'unrelated')
+    finally:
+        discovery.list_sessions = original
+
+
+def test_the_candidates_say_whether_each_name_was_assigned_or_generated() -> None:
+    """Which is how a caller tells a retired conversation from its replacement.
+
+    A generated title is not an address at all: the same opening prompt produces the same
+    title, so it can be shared by conversations that were never named anything.
+    """
+    generated = [_titled('first-run', 'Fix the failing build', 300.0, False),
+                 _titled('second-run', 'Fix the failing build', 100.0, False)]
+    original = discovery.list_sessions
+    discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: list(generated)
+    try:
+        raised = None
+        try:
+            discovery.find_session_by_name('claude', 'Fix the failing build')
+        except Exception as e:
+            raised = e
+        check('two sessions sharing a generated title are refused as well',
+              isinstance(raised, discovery.AmbiguousSessionName),
+              f'{type(raised).__name__}: {raised}')
+        check('and the refusal says the title was generated, not chosen',
+              raised is not None and 'generated from its first message' in str(raised),
+              str(raised))
+
+        discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: [
+            _titled('named-one', 'billing-api', 300.0, True),
+            _titled('named-two', 'billing-api', 100.0, True)]
+        raised = None
+        try:
+            discovery.find_session_by_name('claude', 'billing-api')
+        except Exception as e:
+            raised = e
+        check('while a name somebody assigned is described as assigned',
+              raised is not None and 'name assigned' in str(raised)
+              and 'generated from its first message' not in str(raised), str(raised))
+    finally:
+        discovery.list_sessions = original
+
+
+def test_a_name_found_only_inside_the_search_window_is_not_called_unique() -> None:
+    """One match out of a capped scan is not proof of one match.
+
+    It looks exactly like an ordinary successful lookup from the outside, which is why it is
+    refused rather than logged: the alternative is delivering on the first match found under a
+    cap, which is the guess AmbiguousSessionName exists to refuse.
+    """
+    many = [_titled('needle', 'billing-api', 300.0, True)] + [
+        _titled(f'hay-{i}', f'something else {i}', 200.0 - i, True) for i in range(3)]
+    original = discovery.list_sessions
+    discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: list(many)[:limit]
+    try:
+        raised = None
+        try:
+            discovery.find_session_by_name('claude', 'billing-api', limit=3)
+        except Exception as e:
+            raised = e
+        check('a single match from a scan that hit its cap is refused',
+              isinstance(raised, discovery.UnprovenSessionName),
+              f'{type(raised).__name__}: {raised}')
+        check('and the refusal says how far the search actually got',
+              isinstance(raised, discovery.UnprovenSessionName) and raised.scanned == 3
+              and ' 3 session(s)' in str(raised),
+              str(raised))
+        check('and says the id addresses the conversation whatever else carries the name',
+              raised is not None and 'id addresses it exactly' in str(raised), str(raised))
+
+        check('the same name resolves once the scan can see every session',
+              (discovery.find_session_by_name('claude', 'billing-api', limit=10) or {})
+              .get('session_id') == 'needle')
+    finally:
+        discovery.list_sessions = original
+
+
+def test_a_codex_name_is_read_from_the_store_and_the_scan_bound_is_respected() -> None:
+    """Two things a stubbed listing cannot show, so this builds a real Codex store.
+
+    The Codex scan gives up after CODEX_SCAN_LIMIT rollout files whatever the name cap is, so
+    a short result can be a scan that ran out rather than a store that did - and the count the
+    caller is told has to be what was actually reached, not the cap that was asked for. The
+    same store is the only place the name in session_index.jsonl is read, which is what makes
+    a Codex thread's name an assigned one rather than something generated.
+    """
+    saved = (config.CODEX_SESSIONS_DIR, config.CODEX_SCAN_LIMIT,
+             config.CODEX_SESSION_INDEX_PATH)
+    with tempfile.TemporaryDirectory(prefix='codex-truncated-') as store:
+        now = time.time()
+        wanted = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        twin = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff'
+        _write_rollout(store, wanted, store + '/w', now)
+        _write_rollout(store, twin, store + '/w', now - 5)
+        for i in range(12):
+            _write_rollout(store, f'0000000{i:04d}-0000-0000-0000-00000000000{i % 10}',
+                           store + '/w', now - 100 - i)
+
+        index = store + '/session_index.jsonl'
+        with open(index, 'w', encoding='utf-8') as f:
+            f.write(json.dumps({'id': wanted, 'thread_name': 'billing-api'}) + '\n')
+            f.write(json.dumps({'id': twin, 'thread_name': 'billing-api'}) + '\n')
+
+        config.CODEX_SESSIONS_DIR = store + '/'
+        config.CODEX_SESSION_INDEX_PATH = index
+        try:
+            config.CODEX_SCAN_LIMIT = 500
+            raised = None
+            try:
+                discovery.find_session_by_name('codex', 'billing-api', limit=100)
+            except Exception as e:
+                raised = e
+            check('two Codex threads sharing an indexed name are refused',
+                  isinstance(raised, discovery.AmbiguousSessionName),
+                  f'{type(raised).__name__}: {raised}')
+            check('and a name that came from session_index.jsonl is described as assigned',
+                  raised is not None and 'name assigned' in str(raised)
+                  and 'generated from its first message' not in str(raised), str(raised))
+
+            with open(index, 'w', encoding='utf-8') as f:
+                f.write(json.dumps({'id': wanted, 'thread_name': 'billing-api'}) + '\n')
+
+            resolved = discovery.find_session_by_name('codex', 'billing-api', limit=100)
+            check('one thread carrying the name resolves when the scan reaches the whole store',
+                  (resolved or {}).get('session_id') == wanted, str(resolved))
+
+            config.CODEX_SCAN_LIMIT = 4
+            raised = None
+            try:
+                discovery.find_session_by_name('codex', 'billing-api', limit=100)
+            except Exception as e:
+                raised = e
+            check('a name found inside a truncated Codex scan is not called unique',
+                  isinstance(raised, discovery.UnprovenSessionName),
+                  f'{type(raised).__name__}: {raised}')
+            check('and the refusal counts what the search reached, not the cap it was given',
+                  isinstance(raised, discovery.UnprovenSessionName)
+                  and raised.scanned == 4 and ' 4 session(s)' in str(raised),
+                  f'scanned={raised and getattr(raised, "scanned", None)}: {raised}')
+        finally:
+            (config.CODEX_SESSIONS_DIR, config.CODEX_SCAN_LIMIT,
+             config.CODEX_SESSION_INDEX_PATH) = saved
+
+
+def test_an_ambiguous_name_stops_the_send_rather_than_reaching_a_conversation() -> None:
+    """The refusal has to reach the caller as a failed tool call, with nothing sent."""
+    shared = [_titled('one', 'billing-api', 300.0, True),
+              _titled('two', 'billing-api', 100.0, True)]
+    originals = (discovery.list_sessions, discovery.find_session)
+    discovery.list_sessions = lambda agent, scope, cwd, limit=500, **kw: list(shared)
+    discovery.find_session = lambda agent, sid: None
+    try:
+        raised = None
+        try:
+            bridge._requested_session_id('claude', 'billing-api', '/w')
+        except Exception as e:
+            raised = e
+        check('the bridge refuses the send outright, as a bridge failure',
+              isinstance(raised, bridge.BridgeError),
+              f'{type(raised).__name__}: {raised}')
+        check('and says nothing was sent and nothing was created',
+              raised is not None and 'Nothing was sent' in str(raised)
+              and 'no session was created' in str(raised), str(raised))
+        check('and carries the candidates through to the caller',
+              raised is not None and 'one' in str(raised) and 'two' in str(raised), str(raised))
+    finally:
+        (discovery.list_sessions, discovery.find_session) = originals
+
+
 def test_a_session_name_matches_exactly_or_not_at_all() -> None:
     """The incident: 'koppa_studio' matched a path quoted inside an old session's first message.
 
@@ -4359,6 +4564,11 @@ def run_all() -> None:
     test_a_record_cut_off_by_the_search_bound_is_not_half_read()
     test_a_name_further_back_than_the_search_bound_is_not_found()
     test_a_session_name_matches_exactly_or_not_at_all()
+    test_a_name_two_conversations_answer_to_is_refused_rather_than_guessed()
+    test_the_candidates_say_whether_each_name_was_assigned_or_generated()
+    test_a_name_found_only_inside_the_search_window_is_not_called_unique()
+    test_a_codex_name_is_read_from_the_store_and_the_scan_bound_is_respected()
+    test_an_ambiguous_name_stops_the_send_rather_than_reaching_a_conversation()
     test_a_session_id_is_recognised_by_its_shape_and_never_used_as_a_pattern()
     test_a_named_session_is_never_silently_created()
     test_naming_a_session_and_forcing_a_new_one_is_refused()

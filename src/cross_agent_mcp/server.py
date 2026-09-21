@@ -420,7 +420,13 @@ async def pin_agent_session(
 
     found = await _run_blocking(discovery.find_session, agent, session_id)
     if not found:
-        found = await _run_blocking(discovery.find_session_by_name, agent, session_id)
+        try:
+            found = await _run_blocking(discovery.find_session_by_name, agent, session_id)
+        except (discovery.AmbiguousSessionName, discovery.UnprovenSessionName) as e:
+            # A pin aims every later relay that names nothing, so an ambiguous name is refused
+            # here for the reason it is refused when sending - and for longer.
+            return {'ok': False, 'agent': agent, 'cwd': target_cwd,
+                    'error': f'{e} Nothing was pinned.'}
     if not found:
         return {'ok': False,
                 'error': f'no {agent} session matches {session_id!r}, by id or by name'}
