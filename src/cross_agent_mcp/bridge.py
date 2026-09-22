@@ -851,8 +851,14 @@ def _requested_session_id(target_agent: str, session_id: Optional[str],
     hands the agent. A sticky pin stands in when nothing was named.
     """
     if session_id:
-        if discovery.find_session(target_agent, session_id):
-            return session_id, session_id
+        found = discovery.find_session(target_agent, session_id)
+        if found:
+            # The id the store knows this session by, not the spelling the caller typed. A
+            # uuid is case-insensitive and `find_session` matches it that way, but the panel
+            # registry compares ids as plain strings: a session named in capitals resolved
+            # perfectly well, missed its own open panel, and was delivered by starting a
+            # second process for it - with the conversation sitting right there in the editor.
+            return str(found.get('session_id') or session_id).lower(), session_id
         try:
             named = discovery.find_session_by_name(target_agent, session_id)
         except (discovery.AmbiguousSessionName, discovery.UnprovenSessionName) as e:

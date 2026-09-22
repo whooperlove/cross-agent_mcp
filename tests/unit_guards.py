@@ -2375,6 +2375,56 @@ def test_a_session_id_cannot_name_a_lock_outside_the_lock_directory() -> None:
           registry.read_busy_lock(config.AGENT_CODEX, '../../../../tmp/escaped') is None)
 
 
+def test_a_session_named_in_capitals_still_reaches_its_own_panel() -> None:
+    """A uuid is case-insensitive; the panel registry is not, and the two disagreed.
+
+    `find_session` lowercases before it looks, so an id given in capitals resolves perfectly
+    well - but the caller's own spelling was what got carried forward, and `find_live_session`
+    compares ids as plain strings. So the panel showing that very conversation was not
+    recognised as its panel, and the message was delivered by resuming the session in a new
+    process instead: a second agent started for a conversation open in the editor.
+
+    Nothing rejects a capitalised id, and nothing warns - the send succeeds and reports a
+    `cli-resume`, which is exactly what it would say for a session that really was dormant.
+    """
+    from cross_agent_mcp import uihook
+
+    canonical = 'a1b2c3d4-0000-4000-8000-0123456789ab'
+    shouted = canonical.upper()
+    panel = {'session_id': canonical, 'cwd': '/w', 'shim': {'pid': 7, 'socket': '/tmp/p.sock'},
+             'last_seen': 1.0, 'is_foreign_window': False}
+
+    originals = (uihook.is_enabled, uihook.find_live_sessions, uihook.find_foreign_sessions,
+                 discovery.find_session)
+    uihook.is_enabled = lambda: True
+    uihook.find_live_sessions = lambda agent: [panel]
+    uihook.find_foreign_sessions = lambda agent: []
+    # the store answers for either spelling, because find_session lowercases before looking
+    discovery.find_session = lambda agent, sid: (
+        {'session_id': canonical, 'cwd': '/w', 'mtime': 1.0, 'is_active': True,
+         'agent': agent, 'source': 'disk'} if str(sid).lower() == canonical else None)
+    try:
+        check('the lowercase spelling reaches the panel, as it always did',
+              (bridge._resolve_target(config.AGENT_CLAUDE, canonical, 'cwd', '/w', False, [])
+               or {}).get('ui_shim') is not None)
+
+        wanted, requested = bridge._requested_session_id(config.AGENT_CLAUDE, shouted, '/w')
+        check('a capitalised id resolves to the one the store knows it by',
+              wanted == canonical, str(wanted))
+        check("while the caller's own spelling is kept for reporting back to them",
+              requested == shouted, str(requested))
+
+        target = bridge._resolve_target(config.AGENT_CLAUDE, shouted, 'cwd', '/w', False, [])
+        check('so the same session reaches the same panel when it is named in capitals',
+              (target or {}).get('ui_shim') is not None,
+              f'routed to {"panel" if (target or {}).get("ui_shim") else "cli resume"}')
+        check('and it is the panel for that conversation, not some other one',
+              (target or {}).get('session_id') == canonical, str((target or {}).get('session_id')))
+    finally:
+        (uihook.is_enabled, uihook.find_live_sessions, uihook.find_foreign_sessions,
+         discovery.find_session) = originals
+
+
 def test_a_session_name_matches_exactly_or_not_at_all() -> None:
     """The incident: 'koppa_studio' matched a path quoted inside an old session's first message.
 
@@ -5350,6 +5400,7 @@ def run_all() -> None:
     test_a_name_further_back_than_the_search_bound_is_not_found()
     test_a_store_entry_answers_only_for_the_session_it_actually_holds()
     test_a_session_id_cannot_name_a_lock_outside_the_lock_directory()
+    test_a_session_named_in_capitals_still_reaches_its_own_panel()
     test_a_session_name_matches_exactly_or_not_at_all()
     test_a_name_two_conversations_answer_to_is_refused_rather_than_guessed()
     test_the_candidates_say_whether_each_name_was_assigned_or_generated()
