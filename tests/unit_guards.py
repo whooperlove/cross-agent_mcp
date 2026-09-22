@@ -24,6 +24,14 @@ os.environ['CROSS_AGENT_HOME'] = STATE_ROOT + '/state'
 os.environ['CLAUDE_CONFIG_DIR'] = STATE_ROOT + '/claude'
 os.environ['CODEX_HOME'] = STATE_ROOT + '/codex'
 
+# The bridge hands these to the turns it starts, and a suite run from inside such a turn - a
+# peer reviewing a branch through the bridge, say - inherits that conversation. The hop
+# counter comes with it, so `send_message` raises "reached the hop limit" and the run ends
+# partway through rather than reporting anything. The suite is not part of anyone's exchange.
+for _inherited in ('CROSS_AGENT_CONVERSATION_ID', 'CROSS_AGENT_HOP', 'CROSS_AGENT_SENDER',
+                   'CROSS_AGENT_BUSY', 'CROSS_AGENT_SELF_SESSION'):
+    os.environ.pop(_inherited, None)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/src')
 
 from cross_agent_mcp import bridge, config, discovery, outbox, panel, registry  # noqa: E402
@@ -65,6 +73,13 @@ def test_the_suite_writes_nowhere_near_the_real_bridge() -> None:
         'claude store': (config.CLAUDE_HOME_DIR, STATE_ROOT + '/claude/'),
         'codex store': (config.CODEX_HOME_DIR, STATE_ROOT + '/codex/'),
     }
+    inherited = [name for name in (config.ENV_CONVERSATION_ID, config.ENV_HOP,
+                                   config.ENV_SENDER, config.ENV_BUSY,
+                                   config.ENV_SELF_SESSION)
+                 if os.environ.get(name)]
+    check('and the run is not inside somebody else\'s bridge conversation',
+          inherited == [], f'inherited {inherited}')
+
     for label, (configured, intended) in expected.items():
         check(f'the {label} root is the temporary one',
               os.path.realpath(configured) == os.path.realpath(intended),
