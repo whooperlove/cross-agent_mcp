@@ -23,7 +23,8 @@ useful for:
   Claude's plan, or the other way around, and keep working while it thinks.
 - **Hand off a long task and keep going.** `send_to_*` is asynchronous — it queues the message
   and returns immediately. Whenever the peer's answer is ready, it arrives back as a new message
-  in your own session.
+  in your own session — provided that session is open in a panel. If it isn't, the answer waits
+  on the delivery record for `bridge_status` instead, and the receipt says so up front.
 - **Watch it happen, not just read a log.** With the two panel shims from
   [section 3](#3-registration) installed, both directions render in VS Code's real chat panel
   like any other message, instead of just appending a line to a transcript file.
@@ -89,7 +90,7 @@ a `session_id` for Codex — see [section 6](#6-preventing-infinite-calls).
 
 With the shim attached, the exchange **renders directly in the real VS Code panel** (see section 3).
 
-The exchange is **asynchronous**. `send_to_*` queues the message and returns immediately — it does not carry the peer's reply. A background worker runs the peer's turn, and once a reply exists, it's **delivered to the sender's session as a new message**. Because nothing blocks, neither session is locked while the peer's turn runs, and a turn that takes several minutes won't be lost to a timeout.
+The exchange is **asynchronous**. `send_to_*` queues the message and returns immediately — it does not carry the peer's reply. A background worker runs the peer's turn, and once a reply exists, it's **delivered into the sender's panel as a new message** (see [Return traffic needs a panel](#return-traffic-needs-a-panel)). Because nothing blocks, neither session is locked while the peer's turn runs, and a turn that takes several minutes won't be lost to a timeout.
 
 ```
 send_to_codex ──▶ [outbox queue] ──▶ Codex turn (minutes)
@@ -119,7 +120,21 @@ conversation: conv_7bc3806dc3a8 | hop 1/4
 
 Since the bridge delivers the reply on its own, this line doesn't **establish** the reply. It earns its keep when the automatic path fails, and when the peer sends back a **new request** — it can target that exact session without re-inferring what's active on this side.
 
-Reply delivery runs **from the sender session's directory.** Claude transcripts are stored under their own project directory, so resuming from the directory the request was headed toward produces `No conversation found` even when the session itself is fine.
+Reply delivery runs **from the sender session's directory.** Claude transcripts are stored under their own project directory, so a delivery aimed at the directory the request was headed toward produces `No conversation found` even when the session itself is fine. (A reply is never delivered by resuming the session — see below — but it still carries that session's directory, because a notice and a reply are built the same way and the directory is what makes the address complete.)
+
+#### Return traffic needs a panel
+
+A request is addressed: somebody chose a session and sent to it, and resuming that session over the CLI is the delivery they asked for. **Return traffic is not addressed.** A reply, and the `DELIVERY FAILED` notice that stands in for one, goes back to whichever session started the exchange — and that session was live moments ago, because it was the one that sent.
+
+So return traffic is written into that session's panel, or it is not delivered at all. It is never delivered by resuming the session, because a resume there is not a message arriving in a conversation: it is **a second agent started in a conversation that already has one**, with the same tools, the same permissions and the same directory, answering as that session while the first is still working. Two agents speaking as one conversation is not a delivery problem.
+
+When the sender has no panel:
+
+- the `send_to_*` receipt says so at once — `return_panel_available_now: false`, plus a warning and a note saying where to read the answer instead. It reports the probe, not a promise: the route is resolved again when the answer exists, so a panel opened in the meantime is used, and one closed in the meantime is not replaced by a resume;
+- `bridge_status(delivery_id=...)` reports `is_return_status_only: true`, keeps a **2,000-character `reply_preview`** on the record, and reads the **full answer fresh from the peer's transcript** as `peer_transcript.answer`. If that transcript is later gone, the preview is what remains. Nothing is re-sent;
+- a reply whose panel closes *after* the route was resolved is retried — a reopened tab is found again — and fails as undelivered rather than resuming. The request names that delivery as `return_delivery_id`, and `bridge_status` on the request reports its outcome under `return_delivery`: a request finishes before its answer is delivered, so on its own it cannot say whether the answer landed.
+
+Sending **to** a dormant session is unchanged: it still resumes over the CLI, and the receipt still warns when that session has been idle long enough to look retired.
 
 ---
 
@@ -444,8 +459,9 @@ The return value of `send_to_*` is a **receipt**, not an answer.
 |---|---|
 | `delivery_id` | This delivery's identifier. Look up its status in `bridge_status`'s `deliveries` |
 | `accepted` | Successfully queued |
-| `note` | States that there's no response yet, and that it'll arrive later as a separate message |
-| `reply_lands_in_session` | The sender session id the peer's answer will be delivered to. `null` means there's nowhere for the answer to return to |
+| `note` | States that there's no response yet, and where it will appear — as a message here, or on the delivery record only |
+| `reply_lands_in_session` | The **return address**: the sender session id the peer's answer is aimed at. `null` means there's nowhere for the answer to return to. It names the address, not proof anything lands there |
+| `return_panel_available_now` | Whether that session has a panel to be answered into **as of now**. `false` means that unless one is open when the peer answers, no message will arrive and the answer must be read from `bridge_status` |
 | `queue_depth` | Number of deliveries already waiting ahead of this one for the same target session |
 | `will_create_session` | Whether a new conversation will be opened because no existing session was found |
 
@@ -628,7 +644,11 @@ it finished as, and when an approval prompt appeared and was answered.
     never received by the peer, so no answer is looked up from the transcript for it. A
     finished delivery can also be read via `reply_preview` in `bridge_status`'s
     `deliveries.earlier`, and a delivery another server has recorded as in progress shows up
-    in `deliveries.in_flight_elsewhere`. The payload and child environment variables are
+    in `deliveries.in_flight_elsewhere`. A record carrying `is_return_status_only: true` is one
+    whose answer — or failure notice — was never put into the sender's session, because that
+    session had no panel to put it into. `reply_preview` holds the first 2,000 characters of
+    the answer if there was one; the whole answer is read fresh from the peer's own transcript
+    as `peer_transcript.answer`, so the record is a summary of it, not a copy. The payload and child environment variables are
     **never stored** — env holds every variable of this process.
     - Why the in-flight record lives in a subfolder: a server running a version prior to this
       feature treats any `deliveries/*.json` record without a `finished_at` as expired and
@@ -707,9 +727,10 @@ it finished as, and when an approval prompt appeared and was answered.
   happens within this window (see section 3). A session with no panel open in any window still
   goes through headless CLI resume, and gets rejected with `thread-store conflict` if some
   window's panel is holding onto that conversation.
-- **A reply wakes the sender session** — delivering the answer creates a new turn in the
-  sender's session. If a human is doing something else in that session, it interrupts that
-  flow.
+- **A reply arrives in the sender's panel, or not at all** — delivering the answer writes into
+  the panel showing that session, which appears as a new message while a human may be doing
+  something else there. With no panel it is not delivered: the bridge will not answer a session
+  by resuming it, so the answer is read from `bridge_status` instead.
 - **Session discovery is mtime-based.** If several sessions are open at once in the same
   directory, pinning the target with `pin_agent_session` is the more reliable choice.
 

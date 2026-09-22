@@ -50,6 +50,23 @@ def _quiet_log():
     return log
 
 
+def _fake_panel(session_id: str):
+    """A stand-in for `bridge._panel_session` that answers for one open panel.
+
+    Return traffic is delivered into a panel or not at all, so a test that means to exercise
+    anything *else* about a reply - its envelope, the directory it runs in, its timeout - has
+    to say the panel is there. Before that rule the panel was optional, and these tests ran
+    through the CLI resume without saying so; that is why none of them noticed it.
+    """
+    def panel(agent: str, wanted, exclude):
+        if wanted != session_id:
+            return None
+        return {'agent': agent, 'session_id': session_id, 'cwd': None, 'source': 'ide-panel',
+                'ui_shim': {'pid': 4242, 'socket': '/tmp/panel.sock'}, 'is_active': True,
+                'mtime': time.time()}
+    return panel
+
+
 # ------------------------------------------------- the suite cannot touch real bridge state
 
 def test_the_suite_writes_nowhere_near_the_real_bridge() -> None:
@@ -1284,8 +1301,9 @@ def test_a_recovered_answer_says_it_may_not_be_finished() -> None:
 
 
 def test_the_recovered_flag_reaches_the_envelope() -> None:
-    original = discovery.find_session
+    originals = (discovery.find_session, bridge._panel_session)
     discovery.find_session = lambda agent, session_id: None
+    bridge._panel_session = _fake_panel('sender-sid')
     try:
         request = outbox.Job(
             target_agent=config.AGENT_CODEX, target_session_id='peer-sid', payload='x',
@@ -1303,15 +1321,16 @@ def test_the_recovered_flag_reaches_the_envelope() -> None:
         check('and one that arrived normally does not',
               plain is not None and 'RECOVERED' not in plain.payload)
     finally:
-        discovery.find_session = original
+        (discovery.find_session, bridge._panel_session) = originals
 
 
 def test_a_reply_runs_where_the_senders_session_lives() -> None:
     """A Claude transcript is filed under its own project dir; resuming elsewhere fails."""
     with tempfile.TemporaryDirectory(prefix='sender-home-') as sender_home:
-        original = discovery.find_session
+        originals = (discovery.find_session, bridge._panel_session)
         discovery.find_session = lambda agent, session_id: (
             {'session_id': session_id, 'cwd': sender_home} if session_id == 'sender-sid' else None)
+        bridge._panel_session = _fake_panel('sender-sid')
         try:
             request = outbox.Job(
                 target_agent=config.AGENT_CODEX, target_session_id='peer-sid', payload='x',
@@ -1334,7 +1353,7 @@ def test_a_reply_runs_where_the_senders_session_lives() -> None:
                   reply is not None and reply.timeout == config.SEND_TIMEOUT_SECONDS,
                   str(reply and reply.timeout))
         finally:
-            discovery.find_session = original
+            (discovery.find_session, bridge._panel_session) = originals
 
     orphan = outbox.Job(
         target_agent=config.AGENT_CODEX, target_session_id='peer-sid', payload='x',
@@ -1343,6 +1362,183 @@ def test_a_reply_runs_where_the_senders_session_lives() -> None:
         sender_session_id=None, wants_reply=True, summary='req')
     check('a sender with no session produces no undeliverable reply job',
           bridge._build_reply_job(orphan, 'the answer') is None)
+
+
+def _request_job(conversation_id: str, sender_session_id: str = 'sender-sid') -> 'outbox.Job':
+    return outbox.Job(
+        target_agent=config.AGENT_CODEX, target_session_id='peer-sid', payload='x',
+        run_cwd='/w', pin_cwd='/w', env={}, timeout=5, ui_shim=None, title=None,
+        conversation_id=conversation_id, hop=1, sender_agent=config.AGENT_CLAUDE,
+        sender_session_id=sender_session_id, wants_reply=True, summary='req')
+
+
+def test_an_answer_with_no_panel_to_land_in_is_kept_rather_than_resumed() -> None:
+    """The incident: a reply into a panel-less session started a second agent in that session.
+
+    The sender was an ordinary live Claude session with no IDE panel. Its own question came
+    back as an answer, the bridge found no panel to put the answer in, and fell back to
+    `claude -p --resume` - a second headless agent in the same session, with the same tools
+    and permissions, which ran Bash, Grep and AskUserQuestion and answered as that session.
+    Nobody asked for it and nobody could see it.
+
+    A reply is not addressed traffic. It goes where the exchange started, and the session that
+    started it is by definition one that was live a moment ago - so a resume there is a rival
+    agent, not a delivery. Without a panel no answer goes back: a preview of it stays on the
+    record, and the answer itself stays where the peer wrote it.
+    """
+    originals = (discovery.find_session, bridge._panel_session)
+    discovery.find_session = lambda agent, session_id: None
+    try:
+        bridge._panel_session = lambda agent, wanted, exclude: None
+        request = _request_job('conv_held')
+        request.reply = 'the peer said this'
+        request.reply_length = len(request.reply)
+
+        check('no reply job is built when the sender has no panel',
+              bridge._build_reply_job(request, request.reply) is None)
+        check('and the request records that the answer was not put into the sender session',
+              request.is_return_status_only is True)
+        record = request.describe()
+        check('so bridge_status says so',
+              record.get('is_return_status_only') is True, str(record.get(
+                  'is_return_status_only')))
+        check('while still previewing the answer, so the record is not silent about it',
+              record.get('reply_preview') == 'the peer said this',
+              str(record.get('reply_preview')))
+        check('and the preview is a bounded summary, not the answer itself',
+              outbox.REPLY_PREVIEW_LIMIT == 2000
+              and record.get('reply_length') == len('the peer said this'),
+              f'limit {outbox.REPLY_PREVIEW_LIMIT}, length {record.get("reply_length")}')
+
+        # The inverse. Same request, same answer, one difference: a panel exists.
+        bridge._panel_session = _fake_panel('sender-sid')
+        with_panel = _request_job('conv_held')
+        reply = bridge._build_reply_job(with_panel, 'the peer said this')
+        check('the same answer is delivered when there is a panel to deliver it into',
+              reply is not None)
+        check('and goes over that panel rather than by resuming the session',
+              reply is not None and (reply.ui_shim or {}).get('pid') == 4242,
+              str(reply and reply.ui_shim))
+        check('and nothing is marked status-only when it was in fact delivered',
+              with_panel.is_return_status_only is False)
+    finally:
+        (discovery.find_session, bridge._panel_session) = originals
+
+
+def test_a_failure_notice_with_no_panel_is_kept_rather_than_resumed() -> None:
+    """A notice travels the same road as a reply, so it carries the same defect.
+
+    `_build_notice_job` resolves the sender's panel exactly as `_build_reply_job` does and
+    falls back the same way. A request that produced no answer would announce itself by
+    starting an agent in the session waiting to be told.
+    """
+    originals = (discovery.find_session, bridge._panel_session)
+    discovery.find_session = lambda agent, session_id: None
+    try:
+        bridge._panel_session = lambda agent, wanted, exclude: None
+        failed = _request_job('conv_notice')
+        failed.error = 'BridgeError: the peer never answered'
+        failed.finished_at = time.time()
+
+        check('no notice job is built when the sender has no panel',
+              bridge._build_notice_job(failed) is None)
+        check('and the failure is recorded as status-only rather than announced',
+              failed.is_return_status_only is True)
+
+        bridge._panel_session = _fake_panel('sender-sid')
+        with_panel = _request_job('conv_notice')
+        with_panel.error = 'BridgeError: the peer never answered'
+        with_panel.finished_at = time.time()
+        notice = bridge._build_notice_job(with_panel)
+        check('the same failure is announced when there is a panel to announce it into',
+              notice is not None)
+        check('over that panel, not by resuming the session',
+              notice is not None and (notice.ui_shim or {}).get('pid') == 4242,
+              str(notice and notice.ui_shim))
+    finally:
+        (discovery.find_session, bridge._panel_session) = originals
+
+
+def test_a_retry_that_finds_no_panel_does_not_fall_back_to_a_resume() -> None:
+    """The third road back, and the one that survives a fix to the other two.
+
+    `_reroute` runs between retries of a reply that did not land - the sender's tab closed and
+    reopened behind a new socket. It re-resolved the panel and, finding none, set `ui_shim` to
+    None, which is the resume. Only return traffic is ever retried (`_deliver_with_retries`
+    gives a request a single attempt), so everything reaching here is a reply or a notice.
+    """
+    original = bridge._panel_session
+    try:
+        reply = outbox.Job(
+            target_agent=config.AGENT_CLAUDE, target_session_id='sender-sid', payload='answer',
+            run_cwd='/w', pin_cwd='/w', env={}, timeout=5,
+            ui_shim={'pid': 1111, 'socket': '/tmp/gone.sock'}, title=None,
+            conversation_id='conv_reroute', hop=1, sender_agent=config.AGENT_CODEX,
+            sender_session_id='peer-sid', wants_reply=False, summary='answer',
+            kind=outbox.KIND_REPLY)
+
+        bridge._panel_session = _fake_panel('sender-sid')
+        bridge._reroute(reply)
+        check('a reroute that finds the panel again points the retry at it',
+              (reply.ui_shim or {}).get('pid') == 4242, str(reply.ui_shim))
+
+        bridge._panel_session = lambda agent, wanted, exclude: None
+        bridge._reroute(reply)
+        check('and one that finds no panel leaves the retry with nowhere to go',
+              reply.ui_shim is None, str(reply.ui_shim))
+        # The caller is spied on rather than left real: `_call_claude` raises
+        # NotDeliveredError of its own for a session it cannot find, so a check that only
+        # watched for the exception would pass with the guard taken out.
+        reached = []
+        caller = bridge.CALLERS[config.AGENT_CLAUDE]
+        bridge.CALLERS[config.AGENT_CLAUDE] = lambda *a, **kw: reached.append(a) or {}
+        raised = None
+        try:
+            bridge._deliver(reply)
+        except Exception as e:
+            raised = e
+        finally:
+            bridge.CALLERS[config.AGENT_CLAUDE] = caller
+        check('so the retry is refused rather than run as a resume',
+              isinstance(raised, outbox.NotDeliveredError), f'{type(raised).__name__}: {raised}')
+        check('and no agent was started for it',
+              reached == [], str(reached))
+    finally:
+        bridge._panel_session = original
+
+
+def test_a_send_to_a_dormant_session_still_resumes_it() -> None:
+    """The rule is about return traffic only, and this is what says so.
+
+    Someone choosing a session and sending to it has asked for that session to run. Resuming
+    it is the delivery, and nothing above should have taken that away: without this check the
+    fix could be a blanket ban on the CLI path and the suite would look just as green.
+    """
+    called: list = []
+    original = bridge.CALLERS[config.AGENT_CLAUDE]
+    bridge.CALLERS[config.AGENT_CLAUDE] = lambda *a, **kw: called.append((a, kw)) or {
+        'session_id': 'dormant-sid', 'reply': 'done', 'is_new_session': False}
+    try:
+        request = outbox.Job(
+            target_agent=config.AGENT_CLAUDE, target_session_id='dormant-sid', payload='work',
+            run_cwd='/w', pin_cwd='/w', env={}, timeout=5, ui_shim=None, title=None,
+            conversation_id='conv_dormant', hop=1, sender_agent=config.AGENT_CODEX,
+            sender_session_id='peer-sid', wants_reply=True, summary='req',
+            kind=outbox.KIND_REQUEST)
+        result, raised = None, None
+        try:
+            result = bridge._deliver(request)
+        except Exception as e:
+            raised = e
+        check('an addressed request with no panel still reaches the caller',
+              raised is None and len(called) == 1
+              and (result or {}).get('session_id') == 'dormant-sid',
+              f'{type(raised).__name__}: {raised}' if raised else str(called))
+        check('by the resume path, which is what the sender asked for',
+              bool(called) and called[0][0][5] is None,
+              str(called and called[0][0][5]))
+    finally:
+        bridge.CALLERS[config.AGENT_CLAUDE] = original
 
 
 def test_a_message_queued_in_the_wakeup_gap_is_not_lost() -> None:
@@ -3011,6 +3207,223 @@ def test_the_caller_named_by_its_metadata_is_the_return_address() -> None:
          outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome, bridge.registry.touch_pin) = originals
 
 
+def test_the_receipt_says_up_front_when_no_answer_will_arrive_here() -> None:
+    """The other half of the rule: a sender that will never be written to has to be told now.
+
+    Being quietly given no answer is the failure this replaces, not an improvement on it. The
+    sender is told at send time, in the receipt it already reads, rather than finding out by
+    waiting - or by never finding out.
+    """
+    originals = (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
+                 bridge._panel_session, outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome,
+                 bridge.registry.touch_pin)
+    bridge.caller.detect_caller = lambda: {'agent': config.AGENT_CODEX, 'chain': []}
+    bridge._own_session_id = lambda agent: 'sender-sid'
+    bridge._resolve_target = lambda *a, **kw: {
+        'agent': config.AGENT_CLAUDE, 'session_id': 'peer-sid', 'cwd': None,
+        'source': 'ide-panel', 'ui_shim': {'socket': '/s', 'pid': 1}}
+    outbox.OUTBOX.submit = lambda job: job.delivery_id
+    outbox.OUTBOX.await_outcome = lambda job: None
+    bridge.registry.touch_pin = lambda agent, cwd: None
+    try:
+        bridge._panel_session = lambda agent, wanted, exclude: None
+        receipt = bridge.send_message(config.AGENT_CLAUDE, 'question')
+        check('a sender with no panel is told there is none to answer into',
+              receipt.get('return_panel_available_now') is False,
+              str(receipt.get('return_panel_available_now')))
+        check('and the warning says where to read the answer instead',
+              'bridge_status' in (receipt.get('warning') or ''), str(receipt.get('warning')))
+        check('and says why, so it does not read as a fault to work around',
+              'second agent' in (receipt.get('warning') or ''), str(receipt.get('warning')))
+        check('while claiming only what a probe can prove - no panel now, not no answer ever',
+              'Unless one is open when the peer answers' in (receipt.get('warning') or ''),
+              str(receipt.get('warning')))
+        check('and the note is conditional in the same way',
+              'most likely no answer will arrive' in receipt.get('note', ''),
+              receipt.get('note', '')[:180])
+
+        # The inverse: the same send from a session that does have a panel.
+        bridge._panel_session = _fake_panel('sender-sid')
+        receipt = bridge.send_message(config.AGENT_CLAUDE, 'question')
+        check('a sender with a panel is told there is one',
+              receipt.get('return_panel_available_now') is True,
+              str(receipt.get('return_panel_available_now')))
+        check('with no warning about it',
+              'bridge_status(delivery_id=' not in (receipt.get('warning') or ''),
+              str(receipt.get('warning')))
+        check('and the note that has always said so',
+              'arrives later as a separate message in this session' in receipt.get('note', ''),
+              receipt.get('note', '')[:160])
+    finally:
+        (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
+         bridge._panel_session, outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome,
+         bridge.registry.touch_pin) = originals
+
+
+def test_the_route_back_is_resolved_when_the_answer_exists_not_when_it_was_asked_for() -> None:
+    """The receipt reports a probe, and a probe is a moment, not a promise.
+
+    Minutes pass between a send and its answer. A panel that was closed at send time can be
+    open by then, and one that was open can be gone. So the receipt says what is true now and
+    the route is resolved again when there is something to deliver - these are the two
+    transitions that would make a receipt read as a guarantee into a lie.
+    """
+    originals = (discovery.find_session, bridge._panel_session)
+    discovery.find_session = lambda agent, session_id: None
+    try:
+        # absent at send time, present when the answer comes: the answer is delivered
+        bridge._panel_session = lambda agent, wanted, exclude: None
+        opened = _request_job('conv_opened')
+        bridge._panel_session = _fake_panel('sender-sid')
+        reply = bridge._build_reply_job(opened, 'the answer')
+        check('a panel opened during the turn is used, whatever the receipt said',
+              reply is not None and (reply.ui_shim or {}).get('pid') == 4242,
+              str(reply and reply.ui_shim))
+        check('and nothing is marked status-only, because the answer did go back',
+              opened.is_return_status_only is False)
+
+        # present at send time, gone when the answer comes: nothing is resumed
+        bridge._panel_session = _fake_panel('sender-sid')
+        closed = _request_job('conv_closed')
+        closed.reply = 'the answer'
+        closed.reply_length = len(closed.reply)
+        bridge._panel_session = lambda agent, wanted, exclude: None
+        check('a panel closed during the turn is not replaced by a resume',
+              bridge._build_reply_job(closed, closed.reply) is None)
+        check('and the request says the answer never went back',
+              closed.is_return_status_only is True)
+    finally:
+        (discovery.find_session, bridge._panel_session) = originals
+
+
+def test_a_request_records_where_its_answer_went() -> None:
+    """A request is finalised before its answer is delivered, so it cannot report the outcome.
+
+    It can report *where the outcome is*. Without the link a reader holding the request id has
+    no way to reach the delivery that carries the answer, and the request on its own looks
+    like an exchange that completed - which is exactly the case where the answer was built,
+    queued, and then failed because the panel closed.
+    """
+    box = outbox.Outbox()
+    submitted = []
+    box.submit = lambda job: submitted.append(job) or job.delivery_id
+
+    request = _request_job('conv_linked')
+    request.reply = 'the answer'
+    answer = outbox.Job(
+        target_agent=config.AGENT_CLAUDE, target_session_id='sender-sid', payload='answer',
+        run_cwd='/w', pin_cwd='/w', env={}, timeout=5, ui_shim={'pid': 4242}, title=None,
+        conversation_id='conv_linked', hop=1, sender_agent=config.AGENT_CODEX,
+        sender_session_id='peer-sid', wants_reply=False, summary='answer',
+        kind=outbox.KIND_REPLY)
+    box.build_reply = lambda job, reply: answer
+    box._send_reply(request, 'the answer')
+
+    check('the request names the delivery carrying its answer',
+          request.return_delivery_id == answer.delivery_id, str(request.return_delivery_id))
+    check('and the answer names the request it belongs to',
+          answer.parent_delivery_id == request.delivery_id, str(answer.parent_delivery_id))
+    check('both ends are on the records bridge_status reads',
+          request.describe().get('return_delivery_id') == answer.delivery_id
+          and answer.describe().get('parent_delivery_id') == request.delivery_id)
+    check('and the link is set before the delivery is queued, since the record closes after',
+          submitted == [answer]
+          and submitted[0].parent_delivery_id == request.delivery_id, str(submitted))
+
+    # a notice travels the same road and is linked the same way
+    failed = _request_job('conv_linked_notice')
+    failed.error = 'BridgeError: no answer'
+    notice = outbox.Job(
+        target_agent=config.AGENT_CLAUDE, target_session_id='sender-sid', payload='notice',
+        run_cwd='/w', pin_cwd='/w', env={}, timeout=5, ui_shim={'pid': 4242}, title=None,
+        conversation_id='conv_linked_notice', hop=1, sender_agent=config.AGENT_CODEX,
+        sender_session_id='peer-sid', wants_reply=False, summary='notice',
+        kind=outbox.KIND_NOTICE)
+    box.build_notice = lambda job: notice
+    box._send_notice(failed)
+    check('a failure notice is linked to its request in the same way',
+          failed.return_delivery_id == notice.delivery_id
+          and notice.parent_delivery_id == failed.delivery_id,
+          f'{failed.return_delivery_id} / {notice.parent_delivery_id}')
+
+
+def test_a_request_report_carries_the_fate_of_its_answer() -> None:
+    """The reader holds one id - the request's - and that record cannot answer the question.
+
+    It is written final before the answer is delivered, so a request whose answer was built,
+    queued, and then failed because the panel closed still reads as an exchange that finished.
+    `bridge_status` on the request follows the link and reports what actually became of it.
+    """
+    request = _request_job('conv_report')
+    request.reply = 'the answer'
+    request.reply_length = len(request.reply)
+    request.state = outbox.STATE_DELIVERED
+    request.started_at = time.time() - 5
+    request.finished_at = time.time()
+
+    answer = outbox.Job(
+        target_agent=config.AGENT_CLAUDE, target_session_id='sender-sid', payload='answer',
+        run_cwd='/w', pin_cwd='/w', env={}, timeout=5, ui_shim=None, title=None,
+        conversation_id='conv_report', hop=1, sender_agent=config.AGENT_CODEX,
+        sender_session_id='peer-sid', wants_reply=False, summary='answer',
+        kind=outbox.KIND_REPLY)
+    answer.parent_delivery_id = request.delivery_id
+    answer.state = outbox.STATE_FAILED
+    answer.is_undelivered = True
+    answer.error = 'NotDeliveredError: no live panel to deliver into'
+    answer.started_at = time.time() - 2
+    answer.finished_at = time.time()
+    request.return_delivery_id = answer.delivery_id
+
+    outbox.persist(answer)
+    outbox.persist(request)
+
+    report = bridge.delivery_report(request.delivery_id)
+    check('the request is reported as before',
+          report.get('ok') and report['delivery']['delivery_id'] == request.delivery_id,
+          str(report)[:200])
+    returned = report.get('return_delivery') or {}
+    check('and the delivery carrying its answer is reported with it',
+          returned.get('delivery_id') == answer.delivery_id, str(returned)[:200])
+    check('so a reader holding only the request id learns the answer never landed',
+          returned.get('state') == outbox.STATE_FAILED
+          and returned.get('is_undelivered') is True, str(returned)[:200])
+
+    # and when no answer was ever sent back, the report says that instead of staying silent
+    quiet = _request_job('conv_report_none')
+    quiet.reply = 'the answer'
+    quiet.reply_length = len(quiet.reply)
+    quiet.is_return_status_only = True
+    quiet.state = outbox.STATE_DELIVERED
+    quiet.started_at = time.time() - 5
+    quiet.finished_at = time.time()
+    outbox.persist(quiet)
+
+    report = bridge.delivery_report(quiet.delivery_id)
+    note = (report.get('return_delivery') or {}).get('note', '')
+    check('a request whose answer was never sent back says so in the same place',
+          'The answer was not sent back' in note, str(report.get('return_delivery'))[:200])
+    check('and points at the preview and the transcript rather than claiming to hold it all',
+          'reply_preview' in note and 'peer_transcript' in note, note[:200])
+
+    # `is_return_status_only` also covers a request that produced NO answer, where the notice
+    # was the thing not sent. There is no preview to point at, so pointing at one would be
+    # pointing at nothing.
+    silent = _request_job('conv_report_notice')
+    silent.is_return_status_only = True
+    silent.state = outbox.STATE_FAILED
+    silent.error = 'BridgeError: the peer never answered'
+    silent.started_at = time.time() - 5
+    silent.finished_at = time.time()
+    outbox.persist(silent)
+
+    note = (bridge.delivery_report(silent.delivery_id).get('return_delivery') or {}).get('note', '')
+    check('a request that produced no answer says the notice was not sent, not the answer',
+          'No notice was sent back' in note, note[:200])
+    check('and sends the reader to the error rather than to a preview that does not exist',
+          'delivery.error' in note and 'reply_preview' not in note, note[:200])
+
+
 def test_a_recovered_reply_says_why_the_transport_failed() -> None:
     """Defect 3: "RECOVERED, NOT RECEIVED" with no reason left the reader unable to tell a panel
     that refused the message from a socket that ran out of patience."""
@@ -3029,8 +3442,9 @@ def test_a_recovered_reply_says_why_the_transport_failed() -> None:
     check('a reply that arrived normally carries no failure talk',
           'transport failure' not in plain and 'Why the transport failed' not in plain)
 
-    original = discovery.find_session
+    originals = (discovery.find_session, bridge._panel_session)
     discovery.find_session = lambda agent, session_id: None
+    bridge._panel_session = _fake_panel('sender-sid')
     try:
         request = outbox.Job(
             target_agent=config.AGENT_CODEX, target_session_id='peer-sid', payload='x',
@@ -3044,7 +3458,7 @@ def test_a_recovered_reply_says_why_the_transport_failed() -> None:
               reply is not None and f'Why the transport failed: BridgeError: {reason}' in reply.payload,
               str(reply and reply.payload)[:300])
     finally:
-        discovery.find_session = original
+        (discovery.find_session, bridge._panel_session) = originals
 
 
 def test_the_claude_shim_sees_a_turn_waiting_on_a_human() -> None:
@@ -4574,6 +4988,10 @@ def run_all() -> None:
     test_a_recovered_answer_says_it_may_not_be_finished()
     test_the_recovered_flag_reaches_the_envelope()
     test_a_reply_runs_where_the_senders_session_lives()
+    test_an_answer_with_no_panel_to_land_in_is_kept_rather_than_resumed()
+    test_a_failure_notice_with_no_panel_is_kept_rather_than_resumed()
+    test_a_retry_that_finds_no_panel_does_not_fall_back_to_a_resume()
+    test_a_send_to_a_dormant_session_still_resumes_it()
     test_submit_does_not_block_the_caller()
     test_same_session_deliveries_are_serialised()
     test_different_sessions_deliver_in_parallel()
@@ -4621,6 +5039,10 @@ def run_all() -> None:
     test_delivery_report_rereads_the_peer_transcript()
     test_a_finished_turn_that_echoes_the_request_ends_the_wait()
     test_the_caller_named_by_its_metadata_is_the_return_address()
+    test_the_receipt_says_up_front_when_no_answer_will_arrive_here()
+    test_the_route_back_is_resolved_when_the_answer_exists_not_when_it_was_asked_for()
+    test_a_request_records_where_its_answer_went()
+    test_a_request_report_carries_the_fate_of_its_answer()
     test_a_recovered_reply_says_why_the_transport_failed()
     test_the_claude_shim_sees_a_turn_waiting_on_a_human()
     test_the_codex_shim_sees_a_turn_waiting_on_a_human()

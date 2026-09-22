@@ -746,6 +746,32 @@ def _panel_session(target_agent: str, wanted_id: Optional[str],
     }
 
 
+def _return_shim(agent: str, session_id: str, delivery_id: str,
+                 what: str) -> Optional[Dict[str, Any]]:
+    """The panel to deliver return traffic into, or None - and None means *do not deliver*.
+
+    A reply and a failure notice are not messages anyone addressed: they are the bridge coming
+    back to the session that started the exchange, because that session is waiting to hear.
+    Delivered into a panel that is a line of text in a conversation already open. Delivered by
+    resuming the session instead, it is a second agent started in a session nobody asked to
+    have resumed - with that session's tools and permissions, working in its directory, at the
+    same time as the first. Two agents answering as one conversation is not a delivery
+    problem; it is the session no longer being one session.
+
+    So return traffic goes into a panel or it does not go. `_announce_stopped_delivery` has
+    always held this rule for the notice it sends; it belongs to every route back.
+    """
+    panel: Optional[Dict[str, Any]] = None
+    # resolved fresh: the sender's panel may have opened, closed or moved during the turn
+    with contextlib.suppress(Exception):
+        panel = _panel_session(agent, session_id, [])
+    shim = (panel or {}).get('ui_shim')
+    if shim is None:
+        logger.info(f'_return_shim [no panel]: {delivery_id} {what} for {agent} session '
+                    f'{session_id} has no live panel to deliver into; not resuming it')
+    return shim
+
+
 def _new_panel_conversation(target_agent: str) -> Optional[Dict[str, Any]]:
     """Last resort: a panel process that can host a fresh conversation."""
     if not uihook.is_enabled():
@@ -854,6 +880,14 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
 
 def _deliver(job: outbox.Job) -> Dict[str, Any]:
     """Run one queued delivery. Called on an outbox worker thread, never on the caller's."""
+    # The route can go stale between building this job and running it - a tab closed in
+    # between. Return traffic without a panel is refused here rather than resumed, so the rule
+    # holds however the job reached a worker; the retry gives a reopening panel its chance.
+    if job.ui_shim is None and job.kind in (outbox.KIND_REPLY, outbox.KIND_NOTICE):
+        raise outbox.NotDeliveredError(
+            f'{job.kind} for {job.target_agent} session {job.target_session_id} has no live '
+            'panel to deliver into, and return traffic is not delivered by resuming a session')
+
     result = CALLERS[job.target_agent](
         job.payload, job.target_session_id, job.run_cwd, job.env, job.timeout, job.ui_shim,
         job.title,
@@ -879,16 +913,16 @@ def _reroute(job: outbox.Job) -> None:
 
     Used before retrying a reply that did not land. The route was resolved when the answer
     came in; a tab closed and reopened since is a new panel process behind a new socket, and
-    the old one refuses the connection. Without a panel the CLI resume remains.
+    the old one refuses the connection. Only a retry reaches here, and only return traffic is
+    retried, so a re-resolve that finds no panel leaves the job with nowhere to go rather than
+    falling back to a resume - see `_return_shim`.
     """
     if not job.target_session_id:
         return
-    panel: Optional[Dict[str, Any]] = None
-    with contextlib.suppress(Exception):
-        panel = _panel_session(job.target_agent, job.target_session_id, [])
-    job.ui_shim = (panel or {}).get('ui_shim')
+    job.ui_shim = _return_shim(job.target_agent, job.target_session_id, job.delivery_id,
+                               job.kind)
     logger.info(f'_reroute [resolved]: {job.delivery_id} -> '
-                f'{"panel pid=" + str(job.ui_shim.get("pid")) if job.ui_shim else "cli resume"}')
+                f'{"panel pid=" + str(job.ui_shim.get("pid")) if job.ui_shim else "nowhere"}')
 
 
 def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
@@ -910,10 +944,13 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
                                     is_recovered=job.is_reply_recovered,
                                     failure_reason=job.error if job.is_reply_recovered else None)
 
-    # resolved fresh: the sender's panel may have opened, closed or moved during the turn
-    panel: Optional[Dict[str, Any]] = None
-    with contextlib.suppress(Exception):
-        panel = _panel_session(job.sender_agent, job.sender_session_id, [])
+    shim = _return_shim(job.sender_agent, job.sender_session_id, job.delivery_id, 'the answer')
+    if shim is None:
+        job.is_return_status_only = True
+        logger.info(f'_build_reply_job [not sent]: {job.delivery_id} no answer goes back; '
+                    f'{job.reply_length} chars are on the peer transcript and previewed on the '
+                    'record for bridge_status to report')
+        return None
 
     # An answer runs where the sender's session lives, not where the request was aimed. A
     # Claude transcript is filed under its own project directory, so resuming it from the
@@ -937,7 +974,7 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
         # into our own sender's session - two unrelated waits. Too short and the reply fails
         # into transcript recovery, which is how a half-written turn gets read as an answer.
         timeout=max(job.timeout, config.SEND_TIMEOUT_SECONDS),
-        ui_shim=(panel or {}).get('ui_shim'),
+        ui_shim=shim,
         title=_panel_title(job.target_agent, reply),
         conversation_id=job.conversation_id,
         hop=hop,
@@ -964,9 +1001,12 @@ def _build_notice_job(job: outbox.Job) -> Optional[outbox.Job]:
     remaining = max(config.MAX_HOPS - hop, 0)
     payload = _build_notice_envelope(job, remaining)
 
-    panel: Optional[Dict[str, Any]] = None
-    with contextlib.suppress(Exception):
-        panel = _panel_session(job.sender_agent, job.sender_session_id, [])
+    shim = _return_shim(job.sender_agent, job.sender_session_id, job.delivery_id, 'the notice')
+    if shim is None:
+        job.is_return_status_only = True
+        logger.info(f'_build_notice_job [not sent]: {job.delivery_id} no notice goes back; the '
+                    'failure is on the record for bridge_status to report')
+        return None
 
     notice_cwd = job.pin_cwd
     known = discovery.find_session(job.sender_agent, job.sender_session_id)
@@ -981,7 +1021,7 @@ def _build_notice_job(job: outbox.Job) -> Optional[outbox.Job]:
         pin_cwd=notice_cwd,
         env=_child_env(job.conversation_id, hop, job.target_agent, []),
         timeout=config.SEND_TIMEOUT_SECONDS,
-        ui_shim=(panel or {}).get('ui_shim'),
+        ui_shim=shim,
         title=f'bridge: delivery {job.delivery_id} failed',
         conversation_id=job.conversation_id,
         hop=hop,
@@ -1056,6 +1096,44 @@ def delivery_report(delivery_id: str) -> Dict[str, Any]:
                 'error': f'no delivery {delivery_id} is known to this server or kept on disk'}
 
     report: Dict[str, Any] = {'ok': True, 'delivery': record}
+
+    # A request's record is final before its answer has been delivered, so on its own it says
+    # nothing about whether the answer landed. The return delivery is where that outcome is,
+    # and it is read now rather than left for the reader to find by its id.
+    return_id = record.get('return_delivery_id')
+    if return_id:
+        carried = outbox.OUTBOX.find(return_id)
+        returned = (outbox.describe_origin(carried.describe(), is_carried_here=True)
+                    if carried is not None else None)
+        if returned is None:
+            kept_return = outbox.read_record(return_id)
+            returned = outbox.describe_origin(kept_return) if kept_return is not None else None
+        report['return_delivery'] = returned or {
+            'delivery_id': return_id,
+            'state': 'unknown',
+            'is_record_missing': True,
+            # The ordinary path persists on submit, so reaching here means something else:
+            # the submit failed, the process died between the link and the write, or the
+            # record has been deleted, corrupted or aged out. Saying "queued" would name the
+            # one of those we cannot show.
+            'note': 'the request names a return delivery, but no record of it is readable '
+                    'here or on disk. It may never have been queued.'}
+    elif record.get('is_return_status_only'):
+        # Two different things end up here. An answer existed and was not sent back, or there
+        # was no answer and the failure notice was not sent back either - and in the second
+        # case there is no reply_preview to point at, so saying where the answer is would be
+        # pointing at nothing.
+        if record.get('reply_length'):
+            held = ('The answer was not sent back: the sender has no panel to deliver into, '
+                    'and the bridge does not answer a session by resuming it. reply_preview '
+                    f'holds the first {outbox.REPLY_PREVIEW_LIMIT} characters of it; '
+                    'peer_transcript below is read just now and carries it in full.')
+        else:
+            held = ('No notice was sent back: the request produced no answer, and the sender '
+                    'has no panel to be told in. Why it failed is in delivery.error; '
+                    'peer_transcript below says only how far the peer got, and holds no '
+                    'answer to this request.')
+        report['return_delivery'] = {'note': held}
 
     # Orphaned while still queued, the message never reached the peer. Its transcript holds no
     # answer to it, and reading one there - with no request time to filter by - would hand back
@@ -1175,10 +1253,21 @@ STALE_TARGET_SECONDS = 24 * 3600
 
 QUEUED_NOTE = (
     'Queued, not answered. This result carries no reply: the peer\'s answer arrives later as a '
-    'separate message in this session. Do not invent, predict or wait for it - finish what you '
-    'are doing and report that the message was sent. If the delivery fails later, a DELIVERY '
-    'FAILED notice arrives here the same way. Check bridge_status(delivery_id=...) for delivery '
-    'state and the peer\'s progress.')
+    'separate message in this session, and so does a DELIVERY FAILED notice if it comes to '
+    'that. Do not invent, predict or wait for it - finish what you are doing and report that '
+    'the message was sent. Check bridge_status(delivery_id=...) for delivery state and the '
+    'peer\'s progress.')
+
+# Said instead of the note above when the sender has no panel to be written into. The answer
+# is not delivered there, because delivering it would mean resuming the session - a second
+# agent in a conversation that is already running one.
+QUEUED_NOTE_WITH_NO_RETURN_PANEL = (
+    'Queued, not answered. This result carries no reply, and most likely no answer will arrive '
+    'in this session either: it is not open in a panel the bridge can write to, and the bridge '
+    'does not answer a session by resuming it. Unless a panel is open here when the peer '
+    'answers, read the answer with bridge_status(delivery_id=...) once the delivery shows as '
+    'finished - that is also where a failure is reported. Do not invent, predict or wait for '
+    'it - finish what you are doing and report that the message was sent.')
 
 # Said instead of the note above to a session the bridge started itself, because there "finish
 # what you are doing" is the one thing that loses the delivery.
@@ -1383,6 +1472,19 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         warnings.append(
             'Your own session could not be identified, so the peer\'s answer cannot be '
             'delivered back here. It will exist only in the peer\'s transcript.')
+    # Said now rather than discovered later: the answer comes back into a panel or it does not
+    # come back, and a sender that expects a message and is never sent one waits forever.
+    # This is what is true now, not a promise about then - the route is resolved again when
+    # the answer exists, and a panel can open or close in between.
+    has_return_panel_now = bool(self_session_id) and _return_shim(
+        sender_agent, self_session_id, delivery_id, 'the answer') is not None
+    if self_session_id and not has_return_panel_now:
+        warnings.append(
+            'This session is not open in a panel the bridge can write to. Unless one is open '
+            'when the peer answers, the answer will not arrive here as a message: read it with '
+            f'bridge_status(delivery_id="{delivery_id}") instead. The bridge does not answer '
+            'a session by resuming it - that would start a second agent here, working '
+            'alongside you with your tools and permissions.')
     if requested_timeout is not None and requested_timeout < timeout:
         warnings.append(
             f'timeout={requested_timeout}s was raised to {timeout}s. It bounds the peer\'s '
@@ -1413,7 +1515,8 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         # in the queue or for the peer to finish another turn
         'is_in_peer_hands': job.accepted_at is not None,
         'state': job.state,
-        'note': QUEUED_NOTE_IN_A_BRIDGE_TURN if is_carried_by_a_turn else QUEUED_NOTE,
+        'note': (QUEUED_NOTE_IN_A_BRIDGE_TURN if is_carried_by_a_turn
+                 else QUEUED_NOTE if has_return_panel_now else QUEUED_NOTE_WITH_NO_RETURN_PANEL),
         'warning': ' '.join(warnings) or None,
         'target_agent': target_agent,
         'target_session_id': target_id,
@@ -1424,6 +1527,10 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         'will_create_session': is_new_target,
         'delivery': delivery,
         'is_visible_in_panel': bool((target or {}).get('ui_shim')),
+        # Whether this session has a panel to be answered into *as of now*. The route is
+        # resolved again when the answer exists, so false here does not prove no answer will
+        # arrive, and true does not promise one will - a panel can open or close in between.
+        'return_panel_available_now': has_return_panel_now,
         'queue_depth': outbox.OUTBOX.depth(job.key()),
         'sender_agent': sender_agent,
         'reply_lands_in_session': self_session_id,

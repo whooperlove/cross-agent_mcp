@@ -436,6 +436,16 @@ class Job:
         self.is_reply_confirmed_by_transcript = False
         # the message never landed - set only when the transport says so, never inferred
         self.is_undelivered = False
+        # No answer, and no notice, was sent back into the sender's session: it has no panel
+        # to write into, and the bridge does not start a second agent in a session to tell it
+        # something. No return delivery exists, so this record is the only account of it.
+        self.is_return_status_only = False
+        # On a request: the reply or notice built to answer it, once one has been queued. It is
+        # a separate delivery with its own outcome, and the request's record is final before
+        # that outcome is known - so the link is written, not the result.
+        self.return_delivery_id: Optional[str] = None
+        # On a reply or a notice: the request it is the return traffic for.
+        self.parent_delivery_id: Optional[str] = None
         self.attempts = 0
         self.resolved_session_id: Optional[str] = None
         # Until this instant the caller of send_message is still on the line and will be handed
@@ -506,6 +516,13 @@ class Job:
             'is_reply_confirmed_by_transcript': self.is_reply_confirmed_by_transcript or None,
             # true when the peer provably never received the message
             'is_undelivered': self.is_undelivered or None,
+            # true when the answer (or the failure notice) could not be delivered into the
+            # sender's session without starting a second agent there, so none was sent
+            'is_return_status_only': self.is_return_status_only or None,
+            # the delivery carrying the answer back, whose own record says whether it landed
+            'return_delivery_id': self.return_delivery_id,
+            # on return traffic: the request being answered
+            'parent_delivery_id': self.parent_delivery_id,
             # true when the peer's turn was stopped because the server carrying it exited: it
             # may have done part of the work, and it will not answer
             'is_stopped_with_carrier': self.is_stopped_with_carrier or None,
@@ -826,6 +843,11 @@ class Outbox:
             logger.error(f'_send_reply [exception]: {job.delivery_id} {e}')
             return
         if reply_job is not None:
+            # Written before the child is queued, because the request's record is finalised as
+            # soon as this returns: whatever happens to the answer afterwards, the request says
+            # where to go and look for it.
+            reply_job.parent_delivery_id = job.delivery_id
+            job.return_delivery_id = reply_job.delivery_id
             self.submit(reply_job)
 
     def _send_notice(self, job: Job) -> None:
@@ -848,6 +870,8 @@ class Outbox:
             logger.error(f'_send_notice [exception]: {job.delivery_id} {e}')
             return
         if notice is not None:
+            notice.parent_delivery_id = job.delivery_id
+            job.return_delivery_id = notice.delivery_id
             self.submit(notice)
 
     # --------------------------------------------------------------- reporting

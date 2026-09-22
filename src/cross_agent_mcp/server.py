@@ -27,9 +27,12 @@ SERVER_INSTRUCTIONS = (
     'Claude Code session. Both keep the peer\'s existing conversation context. '
     'When no active peer session exists, a fresh one is created automatically. '
     'Sending is asynchronous: the tool returns as soon as the message is queued and never '
-    'carries the peer\'s answer. The answer arrives later as a separate message in this '
-    'session, so send it, say you sent it, and carry on - never wait for it or guess what it '
-    'will say. `bridge_status` shows deliveries still in flight. '
+    'carries the peer\'s answer. If this session is open in an editor panel when the peer '
+    'answers, the answer arrives later as a separate message here; if it is not, no message '
+    'arrives and the answer is read with `bridge_status(delivery_id=...)` instead - the '
+    'receipt says which is likely (return_panel_available_now). Either way: send it, say you '
+    'sent it, and carry on - never wait for it or guess what it will say. `bridge_status` '
+    'shows deliveries still in flight. '
     'Calls are capped by a hop budget so the two agents cannot ping-pong forever.'
 )
 
@@ -128,11 +131,12 @@ server: MCPServer = MCPServer(
         'to ask Codex for a review, a second opinion, a verification pass, or to hand it a '
         'long task. '
         'ASYNCHRONOUS: this returns as soon as the message is queued and NEVER contains '
-        'Codex\'s answer. Codex answers on its own schedule - minutes is normal - and its '
-        'answer is delivered to you as a separate message in this session. So: send, tell '
-        'the user it was sent, and continue. Do not wait for the answer, do not poll for it, '
-        'and never write what you think Codex will say. Use bridge_status to see whether the '
-        'delivery is still in flight.'
+        'Codex\'s answer. Codex answers on its own schedule - minutes is normal. If this '
+        'session is open in an editor panel when it does, the answer is delivered here as a '
+        'separate message; if it is not, the answer is not delivered at all and you read it '
+        'with bridge_status(delivery_id=...) - the receipt says which is likely (return_panel_available_now). '
+        'So: send, tell the user it was sent, and continue. Do not wait for the answer, do '
+        'not poll for it, and never write what you think Codex will say.'
     ),
 )
 async def send_to_codex(
@@ -176,11 +180,12 @@ async def send_to_codex(
         'exists for this working directory, a new one is created and reused for later calls. '
         'Use this to ask Claude to implement, refactor or explain something. '
         'ASYNCHRONOUS: this returns as soon as the message is queued and NEVER contains '
-        'Claude\'s answer. Claude answers on its own schedule - minutes is normal - and its '
-        'answer is delivered to you as a separate message in this session. So: send, tell '
-        'the user it was sent, and continue. Do not wait for the answer, do not poll for it, '
-        'and never write what you think Claude will say. Use bridge_status to see whether the '
-        'delivery is still in flight.'
+        'Claude\'s answer. Claude answers on its own schedule - minutes is normal. If this '
+        'session is open in an editor panel when it does, the answer is delivered here as a '
+        'separate message; if it is not, the answer is not delivered at all and you read it '
+        'with bridge_status(delivery_id=...) - the receipt says which is likely (return_panel_available_now). '
+        'So: send, tell the user it was sent, and continue. Do not wait for the answer, do '
+        'not poll for it, and never write what you think Claude will say.'
     ),
 )
 async def send_to_claude(
