@@ -187,6 +187,7 @@ def main() -> int:
         extension.stop()
 
     check_idle_panel_opens_a_session(real_binary)
+    check_fresh_conversation_as_the_bridge_asks(real_binary)
 
     print('\n' + ('ALL CLAUDE SHIM CHECKS PASSED' if not FAILURES
                   else f'{len(FAILURES)} CHECK(S) FAILED'))
@@ -222,6 +223,73 @@ def check_idle_panel_opens_a_session(real_binary: str) -> None:
               bool(response.get('sessionId')), str(response.get('sessionId')))
         check('idle panel: extension stream received the assistant message',
               bool(extension.messages('assistant')), str(len(extension.messages('assistant'))))
+    finally:
+        extension.stop()
+
+
+def check_fresh_conversation_as_the_bridge_asks(real_binary: str) -> None:
+    """new_session=true as the bridge sends it: a receipt first, the answer on await."""
+    from cross_agent_mcp import bridge
+
+    print('\n--- a fresh conversation, asked for the way the bridge asks ---')
+    extension = FakeExtension(real_binary)
+    try:
+        # long enough for startup hooks to run, which name the session before anyone types
+        time.sleep(3)
+        shims = [s for s in uihook.list_shims('claude') if s['pid'] == extension.proc.pid]
+        if not shims:
+            check('fresh: shim registered itself', False, str(uihook.list_shims('claude'))[:150])
+            return
+        socket_path = shims[0]['socket']
+
+        status = socket_request(socket_path, {'op': 'status'}, 5)
+        check('fresh: a panel with no conversation offers to host one',
+              status.get('can_create_session') is True, str(status)[:200])
+
+        receipt = socket_request(
+            socket_path,
+            {'op': 'send', 'text': 'Reply with exactly: FRESH_OK', 'cwd': ROOT_DIR,
+             'timeout': 240, 'acceptTimeout': 30, 'createNew': True},
+            60)
+        print(f'       receipt -> {json.dumps(receipt, ensure_ascii=False)[:220]}')
+        check('fresh: the message is taken as opening a conversation',
+              receipt.get('accepted') is True and receipt.get('wasCreated') is True,
+              str(receipt)[:250])
+        try:
+            bridge._raise_unless_really_new(receipt, set())
+            check('fresh: the bridge does not refuse the hand-over', True)
+        except bridge.BridgeError as e:
+            check('fresh: the bridge does not refuse the hand-over', False, str(e))
+
+        answer = socket_request(
+            socket_path,
+            {'op': 'await', 'injectionId': receipt.get('injectionId'), 'timeout': 240},
+            260)
+        print(f'       await -> {json.dumps(answer, ensure_ascii=False)[:220]}')
+        check('fresh: the answer comes back under the id the CLI gave the conversation',
+              answer.get('ok') and 'FRESH_OK' in (answer.get('reply') or '')
+              and bool(answer.get('sessionId')), str(answer)[:250])
+        check('fresh: a hand-over that named a session named that same one',
+              not receipt.get('sessionId') or receipt.get('sessionId') == answer.get('sessionId'),
+              f'{receipt.get("sessionId")} vs {answer.get("sessionId")}')
+        check('fresh: and the bridge accepts it as new',
+              bridge._raise_unless_really_new(answer, set()) is True)
+
+        status = socket_request(socket_path, {'op': 'status'}, 5)
+        check('fresh: once it has one, the panel no longer offers to host another',
+              status.get('can_create_session') is False, str(status)[:200])
+
+        before = extension.count()
+        refused = socket_request(
+            socket_path,
+            {'op': 'send', 'text': 'Reply with exactly: SHOULD_NOT_RUN', 'cwd': ROOT_DIR,
+             'timeout': 240, 'acceptTimeout': 30, 'createNew': True},
+            60)
+        check('fresh: a second fresh conversation is refused there',
+              refused.get('accepted') is False, str(refused)[:200])
+        time.sleep(3)
+        written = extension.messages('assistant', before)
+        check('fresh: and nothing was written into the first', not written, str(written)[:200])
     finally:
         extension.stop()
 

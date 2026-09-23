@@ -78,6 +78,10 @@ class ClaudeStreamShim(PanelShim):
         super().__init__(command + args, args)
         self.real_binary = command[0] if command else ''
         self.session_id: Optional[str] = session_id_from_args(args)
+        # Whether this process has a conversation yet, which the session id cannot say: the CLI
+        # announces its id while running startup hooks, before anyone has typed a word. A
+        # resumed process has one from the start; otherwise the first user turn opens it.
+        self.has_conversation = self.session_id is not None
         self.cwd: str = os.getcwd()
         self.is_turn_active = False
         # the bridged turn the CLI is running right now; cleared by the CLI's own `result`
@@ -101,6 +105,7 @@ class ClaudeStreamShim(PanelShim):
         if kind == 'user':
             with self.state_lock:
                 self.is_turn_active = True
+                self.has_conversation = True
                 self.last_seen = time.time()
                 self.last_user_activity = self.last_seen
         elif kind in ('control_response', 'control_cancel_request'):
@@ -199,11 +204,12 @@ class ClaudeStreamShim(PanelShim):
             approval = dict(self.awaiting_approval) if self.awaiting_approval else None
             if approval:
                 approval['waiting_seconds'] = round(time.time() - approval.get('since', 0))
-            can_create = self.session_id is None
+            can_create = not self.has_conversation
             sessions = ([{'session_id': self.session_id, 'thread_id': self.session_id,
                           'cwd': self.cwd, 'last_seen': self.last_seen,
                           'last_user_activity': self.last_user_activity,
                           'is_turn_active': self.is_turn_active,
+                          'has_conversation': self.has_conversation,
                           'awaiting_approval': approval}]
                         if self.session_id else [])
             activity = self.last_user_activity
@@ -232,18 +238,15 @@ class ClaudeStreamShim(PanelShim):
                create_new: bool = False) -> Dict[str, Any]:
         with self.state_lock:
             current = self.session_id
+            has_conversation = self.has_conversation
         if session_id and session_id != current:
             return {'ok': False, 'accepted': False,
                     'error': f'this panel drives session {current}, not {session_id}'}
 
-        # A panel sitting on its conversation list has a process but no conversation yet.
-        # Writing the message anyway makes the CLI open one, and the panel renders it.
-        is_created = current is None
-
         # Asked for a fresh conversation while already driving one, the only thing this shim
         # could do is write into that one - which is the opposite of what was asked for, and
         # it used to do exactly that, because a null session id skipped the check above.
-        if create_new and not is_created:
+        if create_new and has_conversation:
             return {'ok': False, 'accepted': False,
                     'error': f'this panel already drives session {current} and cannot open a '
                              'new conversation; nothing was written to it'}
@@ -254,11 +257,22 @@ class ClaudeStreamShim(PanelShim):
             return {'ok': False, 'accepted': False,
                     'error': 'the panel session is busy with another turn'}
 
-        turn = Turn(current, is_created)
         with self.state_lock:
             if self.injection is not None:
                 return {'ok': False, 'accepted': False,
                         'error': 'another bridged message is already in flight'}
+            # The wait above is long enough for the human to start a conversation here, so what
+            # was checked before it no longer holds; only what is true now, under the lock that
+            # the human's own turn takes too, decides where the message would land.
+            if create_new and self.has_conversation:
+                return {'ok': False, 'accepted': False,
+                        'error': f'this panel started session {self.session_id} while the '
+                                 'message waited, and cannot open a new conversation; nothing '
+                                 'was written to it'}
+            # A panel sitting on its conversation list has a process but no conversation yet.
+            # Writing the message anyway makes the CLI open one, and the panel renders it.
+            turn = Turn(self.session_id, not self.has_conversation)
+            self.has_conversation = True
             self.injection = turn
             self.is_turn_active = True
 

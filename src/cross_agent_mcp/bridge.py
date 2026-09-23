@@ -22,7 +22,7 @@ import subprocess
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import caller, config, discovery, outbox, registry, uihook
 
@@ -538,21 +538,34 @@ def _raise_for_panel_failure(response: Dict[str, Any]) -> None:
     raise BridgeError(f'IDE panel relay failed: {error}')
 
 
-def _raise_unless_really_new(response: Dict[str, Any], existing: set) -> None:
+def _raise_unless_really_new(response: Dict[str, Any], existing: Set[str]) -> bool:
     """Check that a fresh conversation was actually opened, rather than one being reused.
+
+    True once the answer names a session that did not exist before the request, False while it
+    cannot name one yet. A Claude panel whose CLI has not announced its id learns it from the
+    CLI's own output, which comes after the message is written - so the hand-over can name no
+    session, and neither can any answer until the turn ends. Only the turn's end without an id
+    is an answer that says nothing.
 
     The shim refuses what it cannot do, so this should never fire. It is here because the
     failure it guards against is silent by nature: a message landing in a conversation that
     was already running looks, from the receipt, exactly like one landing in a new one.
     """
     landed = response.get('sessionId')
-    if response.get('wasCreated') and landed and landed not in existing:
-        return
+    if landed in existing:
+        reason = 'was already running'
+    elif not response.get('wasCreated'):
+        reason = 'the shim did not report as new'
+    elif landed:
+        return True
+    elif response.get('pending'):
+        return False
+    else:
+        reason = 'the shim never identified'
 
     raise BridgeError(
         'a new conversation was requested but the panel did not open one: the message went to '
-        f'{landed or "an unnamed session"}, which '
-        f'{"was already running" if landed in existing else "the shim did not report as new"}. '
+        f'{landed or "an unnamed session"}, which {reason}. '
         'Nothing further was sent. Address an existing session by id, or send without '
         'new_session to let the bridge resume one.')
 
@@ -579,13 +592,18 @@ def _transcript_answer(target_agent: Optional[str], session_id: Optional[str],
     return None
 
 
-def _live_session_ids(agent: Optional[str]) -> set:
-    """Every panel conversation of this agent that exists right now, this window or another."""
+def _live_session_ids(agent: Optional[str]) -> Set[str]:
+    """Every panel conversation of this agent that exists right now, this window or another.
+
+    A panel process can know its session id before it has a conversation - the CLI announces
+    it while running startup hooks - and opening a conversation there is exactly what a fresh
+    one looks like, so such an id is not counted as a conversation that already existed.
+    """
     if not agent:
         return set()
     try:
-        return {s['session_id'] for s in uihook.find_live_sessions(agent)} | {
-            s['session_id'] for s in uihook.find_foreign_sessions(agent)}
+        sessions = uihook.find_live_sessions(agent) + uihook.find_foreign_sessions(agent)
+        return {s['session_id'] for s in sessions if s.get('has_conversation', True)}
     except Exception as e:
         logger.debug(f'_live_session_ids [exception]: {agent} {e}')
         return set()
@@ -615,15 +633,19 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
     """
     started = time.time()
     budget = patience if patience is not None else timeout
+    # A panel is handed no session id only when it was chosen to host a new conversation -
+    # because one was asked for, or because nothing existed to resume. Either way the message
+    # must open one there: the panel may have taken up a conversation of its own since it was
+    # chosen, and without being told, a shim delivers into whatever it is driving.
+    create_new = is_new_session or session_id is None
     # Recorded before the message goes anywhere: "a new conversation" means one that did not
     # exist a moment ago, and that is only checkable against the sessions that did.
-    existing = _live_session_ids(target_agent) if is_new_session else set()
+    existing = _live_session_ids(target_agent) if create_new else set()
 
     response = uihook.send(message, ui_shim, session_id, timeout, cwd, title,
-                           accept_timeout=PANEL_ACCEPT_SECONDS, create_new=is_new_session)
+                           accept_timeout=PANEL_ACCEPT_SECONDS, create_new=create_new)
     _raise_for_panel_failure(response)
-    if is_new_session:
-        _raise_unless_really_new(response, existing)
+    is_new_unconfirmed = create_new and not _raise_unless_really_new(response, existing)
 
     is_accepted_reported = False
     while response.get('pending'):
@@ -660,6 +682,8 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
         response = uihook.await_turn(ui_shim, str(response.get('injectionId')),
                                      int(min(PANEL_AWAIT_CHUNK_SECONDS, max(remaining, 1))))
         _raise_for_panel_failure(response)
+        if is_new_unconfirmed:
+            is_new_unconfirmed = not _raise_unless_really_new(response, existing)
 
     return {
         'session_id': response.get('sessionId') or session_id or '',
