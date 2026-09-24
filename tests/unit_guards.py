@@ -5861,9 +5861,10 @@ def test_a_conversation_started_while_the_message_waited_is_not_joined() -> None
 
 
 def test_a_panel_chosen_because_nothing_existed_is_told_to_open_one() -> None:
-    """The last-resort panel is chosen exactly as a forced one is, and can be taken up just
-    the same before the message reaches it. Without being told, a Claude shim writes into
-    whatever it drives by then, and a Codex shim hands the message to its newest thread."""
+    """A Codex panel given no thread hands the message to its newest one unless told to open
+    a thread - and resolution may have passed that thread over on purpose. A Claude panel is
+    told only when a new conversation was asked for: as the last resort, one the human has
+    started there since is where the message belongs."""
     sent = []
     originals = (bridge.uihook.send, bridge._live_session_ids)
     bridge.uihook.send = lambda *a, **kw: sent.append(kw.get('create_new')) or {
@@ -5871,13 +5872,71 @@ def test_a_panel_chosen_because_nothing_existed_is_told_to_open_one() -> None:
     bridge._live_session_ids = lambda agent: set()
     try:
         bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w', target_agent='codex')
-        check('a panel given no session to address is told to open one, asked for or not',
+        check('a Codex panel given no thread is told to open one, asked for or not',
               sent == [True], str(sent))
         sent.clear()
         bridge._call_via_panel('hi', 'thr-1', {'socket': '/s'}, 600, '/w', target_agent='codex')
         check('while a named session is addressed as it always was', sent == [False], str(sent))
+        sent.clear()
+        bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w', target_agent='claude')
+        check('a Claude panel chosen as the last resort is not told to open one',
+              sent == [False], str(sent))
+        sent.clear()
+        bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w', target_agent='claude',
+                               is_new_session=True)
+        check('while one asked for a new conversation is', sent == [True], str(sent))
     finally:
         (bridge.uihook.send, bridge._live_session_ids) = originals
+
+
+def test_a_last_resort_claude_panel_the_human_took_up_waits_and_joins() -> None:
+    """Nothing existed to resume, so an idle panel was chosen - and the human started a
+    conversation in it before the message arrived. Had that conversation existed a moment
+    earlier, resolution would have picked it as the one the user is working in, so the message
+    waits for the human's turn to end and goes in, instead of failing."""
+    from cross_agent_mcp import uihook
+    shim = _claude_panel_shim(None)
+    shim._observe_from_client({'type': 'user'})
+    shim._observe_from_agent({'type': 'system', 'session_id': 'sid-human'})
+
+    originals = (uihook.send, uihook.await_turn)
+    uihook.send = _deliver_through(shim)
+    try:
+        # the human's turn is still running when the message arrives
+        shim.is_turn_active = True
+        shim._wait_for_idle = lambda deadline: False
+        try:
+            bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w',
+                                   target_agent='claude')
+            check('a panel busy with the human\'s turn is waited for', False, 'nothing raised')
+        except outbox.PeerBusyError:
+            check('a panel busy with the human\'s turn is waited for, not refused', True)
+        except Exception as e:
+            check('a panel busy with the human\'s turn is waited for, not refused', False,
+                  repr(e))
+        check('and nothing was written while it was busy', shim.writes == [], str(shim.writes))
+
+        # the human's turn ends; the retry finds the panel free
+        shim._observe_from_agent({'type': 'result', 'result': 'human answer',
+                                  'session_id': 'sid-human'})
+        shim._wait_for_idle = lambda deadline: True
+
+        def await_turn(ui_shim, injection_id, timeout):
+            shim._observe_from_agent({'type': 'result', 'result': 'bridged answer',
+                                      'session_id': 'sid-human'})
+            return shim.await_turn(injection_id, timeout)
+
+        uihook.await_turn = await_turn
+        result = bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w',
+                                        target_agent='claude')
+        check('once it is free the message goes into the conversation the human started',
+              result.get('session_id') == 'sid-human' and result.get('reply') == 'bridged answer',
+              str(result))
+        check('reported as joining it, not as opening one',
+              result.get('is_new_session') is False, str(result))
+        check('written exactly once', len(shim.writes) == 1, str(shim.writes))
+    finally:
+        (uihook.send, uihook.await_turn) = originals
 
 
 def run_all() -> None:
@@ -6026,6 +6085,7 @@ def run_all() -> None:
     test_a_panel_whose_cli_announced_its_id_early_can_still_host_one()
     test_a_conversation_started_while_the_message_waited_is_not_joined()
     test_a_panel_chosen_because_nothing_existed_is_told_to_open_one()
+    test_a_last_resort_claude_panel_the_human_took_up_waits_and_joins()
 
 if __name__ == '__main__':
     # The delivery directory used to be redirected here on its own, because finished jobs left

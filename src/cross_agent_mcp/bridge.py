@@ -634,10 +634,14 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
     started = time.time()
     budget = patience if patience is not None else timeout
     # A panel is handed no session id only when it was chosen to host a new conversation -
-    # because one was asked for, or because nothing existed to resume. Either way the message
-    # must open one there: the panel may have taken up a conversation of its own since it was
-    # chosen, and without being told, a shim delivers into whatever it is driving.
-    create_new = is_new_session or session_id is None
+    # because one was asked for, or because nothing existed to resume. One that was asked for
+    # must be new or the delivery fails. One that was only the last resort need not be: a
+    # Claude panel holds a single conversation, and if the human has started one there since
+    # the panel was chosen, that is the conversation the user is working in - the one
+    # resolution would pick now - so the message waits for the panel to be free and goes in.
+    # A Codex panel can always open a thread, and unless told to, it hands the message to its
+    # newest one, which resolution may have passed over on purpose.
+    create_new = is_new_session or (session_id is None and target_agent != config.AGENT_CLAUDE)
     # Recorded before the message goes anywhere: "a new conversation" means one that did not
     # exist a moment ago, and that is only checkable against the sessions that did.
     existing = _live_session_ids(target_agent) if create_new else set()
