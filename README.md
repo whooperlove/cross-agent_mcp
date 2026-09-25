@@ -155,14 +155,12 @@ chmod +x run-server.sh
 
 ## 3. Registration
 
-Register both at the **user (global) level.** Pass along the environment variables so that sessions the bridge newly creates run without sandbox/approval friction.
+Register both at the **user (global) level.**
 
 ### Claude Code
 
 ```bash
 claude mcp add cross-agent -s user \
-  -e CROSS_AGENT_CODEX_SANDBOX=danger-full-access \
-  -e CROSS_AGENT_CLAUDE_PERMISSION_MODE=bypassPermissions \
   -- ~/project/cross-agent_mcp/run-server.sh
 ```
 
@@ -172,11 +170,7 @@ This is written into the top-level `mcpServers` of `~/.claude.json`, so it's ava
 {
   "mcpServers": {
     "cross-agent": {
-      "command": "~/project/cross-agent_mcp/run-server.sh",
-      "env": {
-        "CROSS_AGENT_CODEX_SANDBOX": "danger-full-access",
-        "CROSS_AGENT_CLAUDE_PERMISSION_MODE": "bypassPermissions"
-      }
+      "command": "~/project/cross-agent_mcp/run-server.sh"
     }
   }
 }
@@ -186,8 +180,6 @@ This is written into the top-level `mcpServers` of `~/.claude.json`, so it's ava
 
 ```bash
 codex mcp add cross-agent \
-  --env CROSS_AGENT_CODEX_SANDBOX=danger-full-access \
-  --env CROSS_AGENT_CLAUDE_PERMISSION_MODE=bypassPermissions \
   -- ~/project/cross-agent_mcp/run-server.sh
 ```
 
@@ -197,13 +189,47 @@ This adds the following to `~/.codex/config.toml` (Codex only supports global co
 [mcp_servers.cross-agent]
 command = "~/project/cross-agent_mcp/run-server.sh"
 default_tools_approval_mode = "approve"   # so the UI doesn't show an approval prompt every time (added manually)
-
-[mcp_servers.cross-agent.env]
-CROSS_AGENT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
-CROSS_AGENT_CODEX_SANDBOX = "danger-full-access"
 ```
 
 `default_tools_approval_mode` has no corresponding flag on `codex mcp add`, so it's added directly to config.toml. Valid values are `auto` / `prompt` / `writes` / `approve`; use `approve` to stop the approval prompt from popping up every time (`auto` kept asking). This does **not** fix the cancellation problem with headless `codex exec` (see section 9). Clicking **"Always allow"** once on the UI prompt has the same effect.
+
+> [!NOTE]
+> Right after registering, you need to **reload the VS Code window** or start a new session for the tool to be picked up.
+> MCP servers connect only at session start.
+
+### Unattended use
+
+With the commands above, a session the bridge starts fresh stays at the safe defaults:
+`read-only` for a new Codex session, and Claude's own default permission mode. That means the
+first edit or command either agent wants to make stops and asks — including inside a turn the
+bridge itself started, where there's no human sitting there to answer it.
+
+If you don't want to deal with that prompt, add these two variables to the same registration:
+
+```bash
+claude mcp add cross-agent -s user \
+  -e CROSS_AGENT_CODEX_SANDBOX=danger-full-access \
+  -e CROSS_AGENT_CLAUDE_PERMISSION_MODE=bypassPermissions \
+  -- ~/project/cross-agent_mcp/run-server.sh
+```
+
+```bash
+codex mcp add cross-agent \
+  --env CROSS_AGENT_CODEX_SANDBOX=danger-full-access \
+  --env CROSS_AGENT_CLAUDE_PERMISSION_MODE=bypassPermissions \
+  -- ~/project/cross-agent_mcp/run-server.sh
+```
+
+> [!WARNING]
+> These two variables **turn off the safety rails for an agent reached through the bridge.**
+> Claude edits files and runs commands without confirmation, and newly created Codex sessions
+> run without a sandbox. Use this only for trusted local work.
+> To revert, drop both `-e`/`--env` arguments and re-register; that restores the defaults
+> (`read-only` / the agent's default permission mode).
+
+They affect only the sandbox and permission mode of an agent the bridge **starts**. The bridge's
+own tool calls have a separate approval setting (`default_tools_approval_mode` above for Codex,
+"Turning off the approval prompt" below for Claude Code), and panel integration needs neither.
 
 ### Turning off the approval prompt (Claude Code)
 
@@ -217,16 +243,6 @@ Claude Code asks for approval on every MCP tool call. Add a server-level rule to
 }
 ```
 
-> [!WARNING]
-> The two environment variables above **turn off the safety rails for an agent reached through the bridge.**
-> Claude edits files and runs commands without confirmation, and newly created Codex sessions
-> run without a sandbox. Use this only for trusted local work.
-> To revert, drop both `-e`/`--env` arguments and re-register; that restores the defaults (`read-only` / the agent's default permissions).
-
-> [!NOTE]
-> Right after registering, you need to **reload the VS Code window** or start a new session for the tool to be picked up.
-> MCP servers connect only at session start.
-
 ### Cross-session inbound approval (native `SendMessage`, not this bridge)
 
 Separate from the `mcp__cross-agent__*` tools above, Claude Code also ships its own built-in
@@ -235,9 +251,9 @@ Claude Code session messages another this way, the **recipient** applies a permi
 
 - Unset (default): the message auto-delivers only when the sender's permission-mode class
   matches the recipient's (`bypassPermissions`↔`bypassPermissions` or prompting↔prompting).
-  A mismatch — e.g. the recipient runs `bypassPermissions` (as this bridge tells Claude Code
-  to run, see the registration commands above) but the sender doesn't — holds the message for
-  the recipient's human to approve before Claude ever sees it.
+  A mismatch — e.g. the recipient runs `bypassPermissions` (see "Unattended use" above) but the
+  sender doesn't — holds the message for the recipient's human to approve before Claude ever
+  sees it.
 - To skip that hold, set on the **recipient** session, in its `.claude/settings.json`:
 
   ```json
@@ -251,9 +267,9 @@ Claude Code session messages another this way, the **recipient** applies a permi
 
 > [!WARNING]
 > `"accept"` delivers inbound messages from *any* sending session regardless of its permission
-> mode, straight to a session that (per the registration above) is running `bypassPermissions` —
-> i.e. it acts without confirmation. Only set this where every session able to reach this one is
-> already trusted.
+> mode, straight to a session that — if you've followed "Unattended use" above — is running
+> `bypassPermissions`, i.e. it acts without confirmation. Only set this where every session able
+> to reach this one is already trusted.
 
 ### IDE panel integration (bidirectional)
 
