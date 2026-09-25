@@ -396,6 +396,17 @@ Observed human input **always takes priority** over transcript timing. Turns the
 > `warning`. Check `target_session_id` is the conversation you meant before reporting a send
 > as done; a misdelivered message cannot be recalled.
 
+To have such a send **refused** rather than warned about, set
+`CROSS_AGENT_REQUIRE_EXPLICIT_TARGET=1` in both registrations — each client runs its own
+server, so the setting on one side guards only the sends made from that side. Every send then
+has to say where it goes itself: a `session_id` (an id, or a name that matches exactly) or
+`new_session=true`. Anything else is refused before a target is looked up, so nothing is sent
+and no hop is spent, and the error says what to pass instead. **A pin does not count**: it was
+set at some earlier point and says nothing about whether this call meant to go there, so a
+caller relying on one has to pass `session_id` as well. A blank or whitespace-only
+`session_id` counts as none. The mode is off by default, because "ask Codex about this" while
+you watch is exactly what panel focus is good for.
+
 #### Conversations in another VS Code window
 
 The shim socket is an ordinary unix socket and isn't tied to a window. What process-ancestor detection determines is **"which window," not "can it be reached."** So the rule splits into two.
@@ -470,6 +481,9 @@ The return value of `send_to_*` is a **receipt**, not an answer.
 ## 5. Session resolution rules
 
 On a `send_to_*` call, the target session is determined in the following order.
+Under `CROSS_AGENT_REQUIRE_EXPLICIT_TARGET` only rule 1 applies, alongside `new_session=true`:
+a call with neither is refused before any of this runs, even when a pin exists (see
+[Which conversation tab it goes to](#which-conversation-tab-it-goes-to)).
 
 ```
 1. If a session_id argument is given → that session
@@ -536,6 +550,7 @@ Every delivered message carries a header with the sender, conversation ID, and h
 | `CROSS_AGENT_DELIVERY_TTL` | `604800` | How long finished delivery records are kept (seconds, default 7 days) |
 | `CROSS_AGENT_SCOPE` | `cwd` | Default discovery scope (`cwd` / `tree` / `any`) |
 | `CROSS_AGENT_UI_HOOK` | `auto` | Codex panel injection (`auto` / `off` / `require`) |
+| `CROSS_AGENT_REQUIRE_EXPLICIT_TARGET` | (unset) | Refuse a send that names neither `session_id` nor `new_session=true`; a pin doesn't count. `0` / `false` / `no` / `off` leave it off, any other value turns it on |
 | `CROSS_AGENT_REAL_CODEX` | (auto-discovered) | The real codex binary for the shim to wrap |
 | `CROSS_AGENT_REAL_CLAUDE` | (auto-discovered) | The real claude binary for the shim to wrap |
 | `CROSS_AGENT_CODEX_SANDBOX` | `read-only` | Sandbox for **newly created** Codex sessions (`read-only` / `workspace-write` / `danger-full-access`) |

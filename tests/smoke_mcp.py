@@ -39,7 +39,7 @@ def _text_of(result) -> str:
     return ''
 
 
-def _server(agent: str, ambient: bool = False) -> StdioServerParameters:
+def _server(agent: str, ambient: bool = False, is_strict: bool = False) -> StdioServerParameters:
     """A bridge server told which agent it is, rather than inferring it from its parent.
 
     `ambient=True` drops the override, to prove the isolation holds without it. `agent` is
@@ -49,6 +49,9 @@ def _server(agent: str, ambient: bool = False) -> StdioServerParameters:
     env.pop('CROSS_AGENT_SELF', None)
     if not ambient:
         env['CROSS_AGENT_SELF'] = agent
+    env.pop(config.ENV_REQUIRE_EXPLICIT_TARGET, None)
+    if is_strict:
+        env[config.ENV_REQUIRE_EXPLICIT_TARGET] = '1'
     # sys.executable, not a .venv path: a fresh checkout has no .venv, and the interpreter
     # running this file is by definition one that can import mcp
     return StdioServerParameters(command=sys.executable, args=['-m', 'cross_agent_mcp'],
@@ -79,11 +82,62 @@ async def _refuses_its_own_agent(agent: str) -> int:
     return 0
 
 
+STRICT_INSTRUCTION = 'refuses a send that does not name its target'
+
+
+async def _strict_mode_refuses_an_unaddressed_send() -> int:
+    """Under CROSS_AGENT_REQUIRE_EXPLICIT_TARGET a send naming nothing is refused, pin or not.
+
+    A send that names a session gets past the mode to resolution, which fails here because the
+    stores are empty - so no send in this check reaches an agent.
+    """
+    conversation_id = 'conv_smoke_strict'
+    registry.set_pin('codex', ROOT_DIR, '0a1b2c3d-0000-4000-8000-00000000c0de', ROOT_DIR,
+                     is_sticky=True)
+    async with stdio_client(_server('claude', is_strict=True)) as (read, write):
+        async with ClientSession(read, write) as session:
+            init = await session.initialize()
+            if STRICT_INSTRUCTION not in (init.instructions or ''):
+                print(f'[FAIL] a strict server does not say so in its instructions: '
+                      f'{init.instructions}')
+                return 1
+            status = json.loads(_text_of(await session.call_tool('bridge_status', {})))
+            if status['settings'].get('require_explicit_target') is not True:
+                print(f'[FAIL] a strict server does not report the mode: {status["settings"]}')
+                return 1
+            for args in ({}, {'session_id': ''}, {'session_id': '   '}):
+                refused = json.loads(_text_of(await session.call_tool(
+                    'send_to_codex', {'message': 'strict mode check',
+                                      'conversation_id': conversation_id, **args})))
+                if refused.get('ok') or config.ENV_REQUIRE_EXPLICIT_TARGET not in refused.get(
+                        'error', ''):
+                    print(f'[FAIL] strict mode did not refuse {args}: {refused}')
+                    return 1
+            named = json.loads(_text_of(await session.call_tool(
+                'send_to_codex', {'message': 'strict mode check', 'session_id': 'no-such-session',
+                                  'conversation_id': conversation_id})))
+
+    error = named.get('error', '')
+    if named.get('ok') or 'is named' not in error or config.ENV_REQUIRE_EXPLICIT_TARGET in error:
+        print(f'[FAIL] a send naming a session did not get past the mode: {named}')
+        return 1
+    hops = registry.get_conversation(conversation_id).get('hops', 0)
+    if hops:
+        print(f'[FAIL] the refused sends spent {hops} hop(s)')
+        return 1
+    print('[ok] strict mode -> refused a send naming nothing, blank or pinned; let a named one '
+          'through to resolution; spent no hop')
+    return 0
+
+
 async def main() -> int:
     async with stdio_client(_server('claude')) as (read, write):
         async with ClientSession(read, write) as session:
             init = await session.initialize()
             print(f'[ok] initialize -> {init.server_info.name} v{init.server_info.version}')
+            if STRICT_INSTRUCTION in (init.instructions or ''):
+                print('[FAIL] a server without the strict mode claims it in its instructions')
+                return 1
 
             tools = await session.list_tools()
             names = [t.name for t in tools.tools]
@@ -150,6 +204,9 @@ async def main() -> int:
         print(f'[FAIL] the isolated stores were not empty: {listing}')
         return 1
     print('[ok] ambient identity sees no real session to reach for')
+
+    if await _strict_mode_refuses_an_unaddressed_send():
+        return 1
 
     records = _delivery_records()
     if records:

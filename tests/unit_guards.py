@@ -31,6 +31,8 @@ os.environ['CODEX_HOME'] = STATE_ROOT + '/codex'
 for _inherited in ('CROSS_AGENT_CONVERSATION_ID', 'CROSS_AGENT_HOP', 'CROSS_AGENT_SENDER',
                    'CROSS_AGENT_BUSY', 'CROSS_AGENT_SELF_SESSION'):
     os.environ.pop(_inherited, None)
+# a strict bridge hands that setting on too, and most checks here send without a session_id
+os.environ.pop('CROSS_AGENT_REQUIRE_EXPLICIT_TARGET', None)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/src')
 
@@ -96,6 +98,7 @@ def test_the_suite_writes_nowhere_near_the_real_bridge() -> None:
                  if os.environ.get(name)]
     check('and the run is not inside somebody else\'s bridge conversation',
           inherited == [], f'inherited {inherited}')
+    check('nor under a strict mode it inherited', config.REQUIRE_EXPLICIT_TARGET is False)
 
     for label, (configured, intended) in expected.items():
         check(f'the {label} root is the temporary one',
@@ -576,6 +579,196 @@ def test_the_resolver_labels_a_pin_a_disk_find_and_a_fresh_start() -> None:
           'they came from',
           (created or {}).get('source') == (forced or {}).get('source') == 'ide-panel-new',
           f"{created and created.get('source')} {forced and forced.get('source')}")
+
+
+# ------------------------------------------------- strict addressing
+
+PINNED_SID = '0a1b2c3d-0000-4000-8000-00000000c0de'
+DISK_SID = '0a1b2c3d-0000-4000-8000-0000000d15c0'
+
+
+def _strict_send(is_strict: bool, is_pinned: bool, sender: str = config.AGENT_CLAUDE,
+                 **kwargs) -> dict:
+    """send_message through the real resolver, with only the session store and the outbox
+    stood in. Says whether it was refused, how often resolution was reached, what was handed
+    to the outbox and how many hops the conversation spent."""
+    from cross_agent_mcp import uihook
+
+    cwd = os.path.realpath(tempfile.mkdtemp(prefix='strict-', dir=STATE_ROOT))
+    conversation_id = 'conv_strict_' + os.urandom(4).hex()
+    now = time.time()
+    sessions = {sid: {'agent': 'codex', 'session_id': sid, 'cwd': cwd, 'mtime': now}
+                for sid in (PINNED_SID, DISK_SID)}
+    outcome = {'resolved': 0, 'submitted': []}
+    real_resolve = bridge._resolve_target
+
+    def counting_resolve(*args, **kw):
+        outcome['resolved'] += 1
+        return real_resolve(*args, **kw)
+
+    if is_pinned:
+        registry.set_pin('codex', cwd, PINNED_SID, cwd, is_sticky=True)
+    originals = (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
+                 uihook.is_enabled, discovery.find_session, discovery.find_active_session,
+                 outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome,
+                 config.REQUIRE_EXPLICIT_TARGET)
+    bridge.caller.detect_caller = lambda: {'agent': sender, 'chain': []}
+    bridge._own_session_id = lambda agent: 'sender-sid'
+    bridge._resolve_target = counting_resolve
+    uihook.is_enabled = lambda: False
+    discovery.find_session = lambda agent, sid: dict(sessions[sid]) if sid in sessions else None
+    discovery.find_active_session = (
+        lambda agent, scope, cwd, exclude=None: dict(sessions[DISK_SID]))
+    outbox.OUTBOX.submit = lambda job: outcome['submitted'].append(job) or 'dlv_strict'
+    outbox.OUTBOX.await_outcome = lambda job: None
+    config.REQUIRE_EXPLICIT_TARGET = is_strict
+    try:
+        outcome['receipt'] = bridge.send_message(config.AGENT_CODEX, 'hello', cwd=cwd,
+                                                 conversation_id=conversation_id, **kwargs)
+    except bridge.BridgeError as e:
+        outcome['refusal'] = str(e)
+    finally:
+        (bridge.caller.detect_caller, bridge._own_session_id, bridge._resolve_target,
+         uihook.is_enabled, discovery.find_session, discovery.find_active_session,
+         outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome,
+         config.REQUIRE_EXPLICIT_TARGET) = originals
+    outcome['hops'] = registry.get_conversation(conversation_id).get('hops', 0)
+    return outcome
+
+
+def test_strict_mode_refuses_a_send_that_does_not_name_its_target() -> None:
+    """Under CROSS_AGENT_REQUIRE_EXPLICIT_TARGET only what the call itself says picks a target.
+
+    Measured against the same call with the mode off, which the real resolver delivers where
+    the pin points - so a refusal here is the mode's doing, not a pin nobody found.
+    """
+    lenient = _strict_send(False, True)
+    receipt = lenient.get('receipt') or {}
+    check('without the mode, a send naming nothing goes where the pin points',
+          receipt.get('target_selected_by') == bridge.SELECTED_PIN
+          and receipt.get('target_session_id') == PINNED_SID,
+          str(lenient.get('refusal') or receipt.get('target_selected_by')))
+
+    for label, kwargs in (('naming nothing', {}), ('with an empty session_id', {'session_id': ''}),
+                          ('with a whitespace-only session_id', {'session_id': '   '})):
+        strict = _strict_send(True, True, **kwargs)
+        check(f'under the mode, a send {label} is refused although a pin exists',
+              config.ENV_REQUIRE_EXPLICIT_TARGET in (strict.get('refusal') or '')
+              and 'receipt' not in strict, str(strict.get('receipt', {}).get('target_selected_by')))
+        check(f'and a send {label} is refused before resolution: nothing looked up, queued '
+              'or spent',
+              strict['resolved'] == 0 and not strict['submitted'] and strict['hops'] == 0,
+              f"resolved={strict['resolved']} queued={len(strict['submitted'])} "
+              f"hops={strict['hops']}")
+
+    refusal = _strict_send(True, True).get('refusal') or ''
+    check('the refusal says what to pass: an id, what one looks like, or an exact name',
+          'list_agent_sessions' in refusal and 'new_session=true' in refusal
+          and bridge.EXAMPLE_SESSION_ID in refusal and 'match exactly' in refusal, refusal)
+    check('and that a pin did not count', 'pin_agent_session does not count' in refusal, refusal)
+    check('an omitted session_id is not told it was blank', 'was blank' not in refusal, refusal)
+    blank = _strict_send(True, False, session_id='  ').get('refusal') or ''
+    check('but a blank one is', 'session_id was blank' in blank, blank)
+
+    named = _strict_send(True, True, session_id=PINNED_SID)
+    receipt = named.get('receipt') or {}
+    check('a send naming a session passes the mode, addressed by the caller',
+          receipt.get('target_selected_by') == bridge.SELECTED_CALLER
+          and len(named['submitted']) == 1 and named['hops'] == 1,
+          str(named.get('refusal') or receipt.get('target_selected_by')))
+    fresh = _strict_send(True, True, is_new_session=True)
+    receipt = fresh.get('receipt') or {}
+    check('and so does one asking for a new conversation',
+          receipt.get('target_selected_by') == bridge.SELECTED_FORCED_NEW
+          and len(fresh['submitted']) == 1,
+          str(fresh.get('refusal') or receipt.get('target_selected_by')))
+
+    for is_strict in (True, False):
+        spaced = _strict_send(is_strict, False, session_id='   ', is_new_session=True)
+        receipt = spaced.get('receipt') or {}
+        check(f'{"under" if is_strict else "without"} the mode, a whitespace-only session_id '
+              'with new_session=true asks for a new conversation rather than conflicting',
+              receipt.get('target_selected_by') == bridge.SELECTED_FORCED_NEW
+              and len(spaced['submitted']) == 1,
+              str(spaced.get('refusal') or receipt.get('target_selected_by')))
+    same = _strict_send(False, False, sender=config.AGENT_CODEX, session_id='   ',
+                        is_new_session=True)
+    check('and the same-agent guard still refuses it, as it would with no session_id at all',
+          'refusing to relay' in (same.get('refusal') or '') and not same['submitted'],
+          str(same.get('refusal') or (same.get('receipt') or {}).get('target_selected_by')))
+
+    unspaced = _strict_send(False, True, session_id='   ')
+    receipt = unspaced.get('receipt') or {}
+    check('without the mode, a whitespace-only session_id with no new_session reaches the pin '
+          'like naming nothing does, instead of failing as a name that matches nothing',
+          receipt.get('target_selected_by') == bridge.SELECTED_PIN
+          and receipt.get('target_session_id') == PINNED_SID,
+          str(unspaced.get('refusal') or receipt.get('target_selected_by')))
+
+    unaddressed = _strict_send(False, False)
+    receipt = unaddressed.get('receipt') or {}
+    check('with the mode off, a send naming nothing is still delivered by discovery, and warned',
+          receipt.get('target_selected_by') == bridge.SELECTED_DISCOVERY
+          and 'You did not say which' in (receipt.get('warning') or ''),
+          str(unaddressed.get('refusal') or receipt.get('target_selected_by')))
+
+
+def test_the_strict_flag_is_on_for_anything_but_an_explicit_off() -> None:
+    """A safety setting a typo leaves silently off is worse than none."""
+    name = config.ENV_REQUIRE_EXPLICIT_TARGET
+    for raw in (None, '', '0', 'false', 'No', ' off '):
+        with _environ(**{name: raw}):
+            check(f'{raw!r} leaves the mode off', config.get_env_flag(name) is False)
+    for raw in ('1', 'true', 'YES', 'on', 'ture', '2'):
+        with _environ(**{name: raw}):
+            check(f'{raw!r} turns it on', config.get_env_flag(name) is True)
+
+
+def test_a_strict_bridge_hands_the_setting_to_the_cli_it_starts() -> None:
+    with _environ(**{config.ENV_REQUIRE_EXPLICIT_TARGET: '1'}):
+        env = bridge._child_env('conv_env', 1, 'claude', [])
+    check('a CLI a strict bridge starts gets the setting in its environment',
+          env.get(config.ENV_REQUIRE_EXPLICIT_TARGET) == '1',
+          str(env.get(config.ENV_REQUIRE_EXPLICIT_TARGET)))
+
+
+def test_a_session_id_that_matches_nothing_says_how_to_name_one() -> None:
+    """Under the mode every send names its session, so a miss has to say how to name one."""
+    originals = (bridge.caller.detect_caller, bridge._own_session_id, config.CLAUDE_PROJECTS_DIR)
+    bridge.caller.detect_caller = lambda: {'agent': config.AGENT_CODEX, 'chain': []}
+    bridge._own_session_id = lambda agent: 'sender-sid'
+    missed = {}
+    with tempfile.TemporaryDirectory(prefix='claude-near-') as root:
+        project = root + '/projects/-w'
+        os.makedirs(project)
+        _write_claude_transcript(project + '/0a1b2c3d-0000-4000-8000-00000000a11e.jsonl',
+                                 ['strict review of the bridge'], 'hello')
+        config.CLAUDE_PROJECTS_DIR = root + '/projects/'
+        try:
+            for label, value in (('name', 'no-such-session-' + os.urandom(3).hex()),
+                                 ('id', '0a1b2c3d-0000-4000-8000-0000deadbeef'),
+                                 ('near', 'strict review')):
+                try:
+                    bridge.send_message(config.AGENT_CLAUDE, 'hello', session_id=value)
+                    missed[label] = ''
+                except bridge.BridgeError as e:
+                    missed[label] = str(e)
+        finally:
+            (bridge.caller.detect_caller, bridge._own_session_id,
+             config.CLAUDE_PROJECTS_DIR) = originals
+
+    check('a near miss is offered the titles containing it, and told what an id looks like',
+          "Titles containing it: 'strict review of the bridge'" in missed['near']
+          and 'pass one of these in full' in missed['near']
+          and bridge.EXAMPLE_SESSION_ID in missed['near'], missed['near'])
+    check('a value that is not an id is told what one looks like, and that names match exactly',
+          'not a session id' in missed['name'] and bridge.EXAMPLE_SESSION_ID in missed['name']
+          and 'Names match exactly' in missed['name'], missed['name'])
+    check('an id that matches nothing is told only that',
+          'has the id' in missed['id'] and 'not a session id' not in missed['id'], missed['id'])
+    check('and neither sent nor created anything',
+          all('Nothing was sent and no session was created' in m for m in missed.values()),
+          str(missed))
 
 
 # ------------------------------- a delivery lives and dies with the server that carries it
@@ -5953,6 +6146,10 @@ def run_all() -> None:
     test_the_receipt_says_who_chose_the_conversation()
     test_an_unaddressed_relay_says_it_was_aimed_by_the_human()
     test_the_resolver_labels_a_pin_a_disk_find_and_a_fresh_start()
+    test_strict_mode_refuses_a_send_that_does_not_name_its_target()
+    test_the_strict_flag_is_on_for_anything_but_an_explicit_off()
+    test_a_strict_bridge_hands_the_setting_to_the_cli_it_starts()
+    test_a_session_id_that_matches_nothing_says_how_to_name_one()
     test_a_bridge_started_turn_is_told_its_delivery_ends_with_it()
     test_the_receipt_says_how_long_the_target_has_been_idle()
     test_a_bridge_started_turn_knows_which_session_it_is()

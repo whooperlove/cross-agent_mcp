@@ -35,6 +35,10 @@ SERVER_INSTRUCTIONS = (
     'shows deliveries still in flight. '
     'Calls are capped by a hop budget so the two agents cannot ping-pong forever.'
 )
+if config.REQUIRE_EXPLICIT_TARGET:
+    SERVER_INSTRUCTIONS += (
+        ' This server refuses a send that does not name its target: pass session_id every '
+        'time, or new_session=true for a new conversation. A pin does not count.')
 
 
 def init_logging() -> None:
@@ -154,6 +158,7 @@ async def send_to_codex(
     message: What to ask Codex. Be self-contained; Codex cannot see this conversation.
     session_id: Target a specific Codex thread - its id, or the conversation name shown in
         the panel. Fails loudly rather than creating a new thread when nothing matches.
+        Required under CROSS_AGENT_REQUIRE_EXPLICIT_TARGET unless new_session is set.
     new_session: Force a brand new Codex thread even when an active one exists.
     scope: 'cwd' (default) = same directory or below, 'tree' = also parent directories,
         'any' = every recorded thread.
@@ -204,6 +209,7 @@ async def send_to_claude(
     message: What to ask Claude. Be self-contained; Claude cannot see this conversation.
     session_id: Target a specific Claude session - its id, or the conversation name shown in
         the panel. Fails loudly rather than creating a new session when nothing matches.
+        Required under CROSS_AGENT_REQUIRE_EXPLICIT_TARGET unless new_session is set.
     new_session: Force a brand new Claude session even when an active one exists.
     scope: 'cwd' (default) = same directory or below, 'tree' = also parent directories,
         'any' = every recorded session.
@@ -361,6 +367,7 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
             'max_hops': config.MAX_HOPS,
             'timeout_seconds': config.SEND_TIMEOUT_SECONDS,
             'panel_patience_seconds': config.PANEL_PATIENCE_SECONDS,
+            'require_explicit_target': config.REQUIRE_EXPLICIT_TARGET,
             'codex_sandbox_for_new_sessions': config.CODEX_SANDBOX,
             'claude_permission_mode': config.CLAUDE_PERMISSION_MODE,
             'claude_bin': config.CLAUDE_BIN,

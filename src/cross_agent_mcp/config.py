@@ -32,6 +32,12 @@ def get_env_optional(name: str) -> Optional[str]:
     return value if value else None
 
 
+def get_env_flag(name: str) -> bool:
+    """An on/off setting. Unset, empty, `0`, `false`, `no` and `off` are off; anything else
+    is on, so a mistyped value turns the setting on rather than leaving it silently off."""
+    return (os.environ.get(name) or '').strip().lower() not in ('', '0', 'false', 'no', 'off')
+
+
 # bridge state directories
 HOME_DIR: str = os.path.expanduser(get_env_str('CROSS_AGENT_HOME', '~/.cross-agent')) + '/'
 REGISTRY_PATH: str = HOME_DIR + 'registry.json'
@@ -84,6 +90,10 @@ DEFAULT_SCOPE: str = get_env_str('CROSS_AGENT_SCOPE', 'cwd')
 # 'auto' uses it when a shim is running, 'off' always relays over the CLI, 'require' fails
 # rather than silently falling back to a headless resume the panel will not show.
 UI_HOOK_MODE: str = get_env_str('CROSS_AGENT_UI_HOOK', 'auto')
+
+# Refuse a send that names neither a session_id nor new_session=true; a pin does not count.
+ENV_REQUIRE_EXPLICIT_TARGET: str = 'CROSS_AGENT_REQUIRE_EXPLICIT_TARGET'
+REQUIRE_EXPLICIT_TARGET: bool = get_env_flag(ENV_REQUIRE_EXPLICIT_TARGET)
 
 # applied only when the bridge has to spawn a brand new session
 CODEX_SANDBOX: str = get_env_str('CROSS_AGENT_CODEX_SANDBOX', 'read-only')
@@ -302,6 +312,7 @@ CHILD_ENV_BRIDGE: tuple = (
     'CROSS_AGENT_REAL_CLAUDE', 'CROSS_AGENT_REAL_CODEX',
     'CROSS_AGENT_ACTIVE_WINDOW_MIN', 'CROSS_AGENT_MAX_HOPS', 'CROSS_AGENT_TIMEOUT',
     'CROSS_AGENT_PANEL_PATIENCE', 'CROSS_AGENT_SCOPE', 'CROSS_AGENT_UI_HOOK',
+    'CROSS_AGENT_REQUIRE_EXPLICIT_TARGET',
     'CROSS_AGENT_CODEX_SANDBOX', 'CROSS_AGENT_CODEX_MODEL', 'CROSS_AGENT_CODEX_SCAN_LIMIT',
     'CROSS_AGENT_CLAUDE_PERMISSION_MODE', 'CROSS_AGENT_CLAUDE_MODEL',
     # so the opt-in survives another hop, rather than a grandchild losing it silently

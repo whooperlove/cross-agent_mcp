@@ -839,6 +839,8 @@ SELECTED_FORCED_NEW = 'forced-new'
 
 UNADDRESSED_SELECTIONS = (SELECTED_PANEL_FOCUS, SELECTED_DISCOVERY)
 
+EXAMPLE_SESSION_ID = '0f8fad5b-d9cb-469f-a165-70867728950e'
+
 
 def _panel_session(target_agent: str, wanted_id: Optional[str],
                    exclude_ids: List[str]) -> Optional[Dict[str, Any]]:
@@ -919,6 +921,7 @@ def _requested_session_id(target_agent: str, session_id: Optional[str],
     `session_id` may be a real id or the conversation's name, because that is what a human
     hands the agent. A sticky pin stands in when nothing was named.
     """
+    session_id = session_id.strip() if session_id else None
     if session_id:
         found = discovery.find_session(target_agent, session_id)
         if found:
@@ -936,14 +939,18 @@ def _requested_session_id(target_agent: str, session_id: Optional[str],
             logger.info(f'_requested_session_id [resolved by name]: '
                         f'{session_id!r} -> {named["session_id"]}')
             return named['session_id'], session_id
+        if discovery.is_session_id(session_id):
+            raise BridgeError(
+                f'no {target_agent} session has the id {session_id!r}. Nothing was sent and no '
+                'session was created. Use list_agent_sessions to see what exists.')
         near = discovery.suggest_session_names(target_agent, session_id)
-        hint = (f' Titles containing it: {", ".join(repr(t) for t in near)}. Names match '
+        hint = (f'Titles containing it: {", ".join(repr(t) for t in near)}. Names match '
                 'exactly, so pass one of these in full or use the session id.'
-                if near else '')
+                if near else 'Names match exactly, so part of a title finds nothing.')
         raise BridgeError(
-            f'no {target_agent} session is named {session_id!r}, and no session has that id. '
-            f'Nothing was sent and no session was created.{hint} '
-            'Use list_agent_sessions to see what exists.')
+            f'no {target_agent} session is named {session_id!r}, and it is not a session id '
+            f'either: an id is a uuid, like {EXAMPLE_SESSION_ID}. Nothing was sent and no '
+            f'session was created. {hint} Use list_agent_sessions to see what exists.')
 
     pin = registry.get_pin(target_agent, cwd)
     if pin and pin.get('is_sticky'):
@@ -1441,6 +1448,16 @@ def _short_lived_carrier_warning(target_agent: str, delivery: str) -> str:
             'until it has finished.')
 
 
+def _unaddressed_refusal(target_agent: str, session_id: Optional[str]) -> str:
+    blank = '' if session_id is None else ' session_id was blank, and a blank one names nothing.'
+    return (f'{config.ENV_REQUIRE_EXPLICIT_TARGET} is set, so a send has to say which '
+            f'{target_agent} session it is for.{blank} Nothing was sent. Pass session_id - the '
+            f'session\'s id, a uuid like {EXAMPLE_SESSION_ID}, or its name, which has to match '
+            'exactly; list_agent_sessions shows both - or new_session=true for a new '
+            'conversation. A pin set with pin_agent_session does not count, and neither does '
+            'the tab the human last typed into: neither is something this call said.')
+
+
 def send_message(target_agent: str, message: str, session_id: Optional[str] = None,
                  is_new_session: bool = False, scope: Optional[str] = None,
                  cwd: Optional[str] = None, timeout: Optional[int] = None,
@@ -1484,15 +1501,22 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     if caller_session_id:
         logger.info(f'send_message [caller named itself]: {sender_agent} {caller_session_id}')
 
+    # a blank or whitespace-only session_id names nothing, to every check below
+    has_session = bool((session_id or '').strip())
+
     # Naming a session and asking for a brand new one are opposite intentions. Honouring both
     # would open a fresh conversation while the caller believes it reached the one it named.
-    if session_id and is_new_session:
+    if has_session and is_new_session:
         raise BridgeError(
             'session_id and new_session cannot be combined: one targets an existing '
             f'conversation, the other opens a new one. Nothing was sent. Drop new_session to '
             f'reach {session_id!r}, or drop session_id to start a new conversation.')
 
-    if sender_agent == target_agent and not allows_same_agent and not session_id:
+    # before resolution, so a refusal is about the address and never about what exists
+    if config.REQUIRE_EXPLICIT_TARGET and not is_new_session and not has_session:
+        raise BridgeError(_unaddressed_refusal(target_agent, session_id))
+
+    if sender_agent == target_agent and not allows_same_agent and not has_session:
         raise BridgeError(
             f'refusing to relay a message from {target_agent} back into {target_agent}. '
             f'Use `{PEER_TOOL.get(sender_agent, "the peer tool")}` to reach the other agent, '
