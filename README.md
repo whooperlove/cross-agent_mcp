@@ -563,6 +563,7 @@ Every delivered message carries a header with the sender, conversation ID, and h
 | `CROSS_AGENT_ACTIVE_WINDOW_MIN` | `240` | Maximum elapsed time (minutes) for a session to still count as active |
 | `CROSS_AGENT_MAX_HOPS` | `4` | Maximum number of relays per conversation |
 | `CROSS_AGENT_TIMEOUT` | `600` | Budget (seconds) for the peer's turn itself. Doesn't make the caller wait |
+| `CROSS_AGENT_PANEL_PATIENCE` | `3600` | On the panel path, how long (seconds) a delivery keeps waiting out a busy session, and, separately, how long it then waits for the peer's turn to end. Each wait gets the larger of this value and the job timeout. Doesn't make the caller wait |
 | `CROSS_AGENT_DELIVERY_TTL` | `604800` | How long finished delivery records are kept (seconds, default 7 days) |
 | `CROSS_AGENT_SCOPE` | `cwd` | Default discovery scope (`cwd` / `tree` / `any`) |
 | `CROSS_AGENT_UI_HOOK` | `auto` | Codex panel injection (`auto` / `off` / `require`) |
@@ -746,8 +747,16 @@ it finished as, and when an approval prompt appeared and was answered.
     concurrent input — Claude waits for the current turn to finish before injecting, Codex
     queues it. But there's a limit, and past it the shim answers with
     `busy with another turn` / `already in flight`. That's the shim's own deadline, not ours,
-    so instead of closing the delivery as failed, it's **retried after an interval** (within
-    the job timeout). Any other error is treated as an outright failure.
+    so instead of closing the delivery as failed, it's **retried after an interval** — for
+    as long as the job timeout, or `CROSS_AGENT_PANEL_PATIENCE` on the panel path if that is
+    longer. Any other error is treated as an outright failure.
+  - **The recipient isn't told a message is waiting for it.** While the recipient is mid-turn,
+    nothing appears in its session and the bridge keeps retrying the delivery; `bridge_status`
+    lists deliveries by the server carrying them, not by the session they are for. If a retry
+    succeeds after the turn ends, within the retry window above, the message arrives. If the
+    window closes first, the request fails: the bridge then attempts a `DELIVERY FAILED`
+    notice in the sender's panel, and the failure stays readable with
+    `bridge_status(delivery_id=...)`. The failed request is not replayed.
   - **Even after giving up on the transport, the peer keeps working.** On the panel path, the
     peer is a session we neither spawned nor can stop, so a socket timing out doesn't mean the
     turn is over. So when a delivery times out, it isn't closed as a failure — instead,
