@@ -1900,6 +1900,102 @@ def test_a_busy_peer_is_retried_rather_than_failed() -> None:
         outbox.BUSY_RETRY_SECONDS = original
 
 
+def test_a_peer_busy_past_the_window_is_closed_as_not_delivered() -> None:
+    """A peer that stayed busy took nothing, so the sender must hear "not delivered".
+
+    It used to close as an ordinary failure: the transcript was watched for a further fifteen
+    minutes for an answer to a message the peer never saw, and the notice then said "your
+    message reached" the peer and warned against resending.
+    """
+    original = (outbox.BUSY_RETRY_SECONDS, outbox.RECOVERY_POLL_SECONDS,
+                outbox.RECOVERY_WINDOW_SECONDS, config.PANEL_PATIENCE_SECONDS)
+    outbox.BUSY_RETRY_SECONDS = 0.02
+    outbox.RECOVERY_POLL_SECONDS, outbox.RECOVERY_WINDOW_SECONDS = 0.02, 5
+    config.PANEL_PATIENCE_SECONDS = 0.2
+    try:
+        box = outbox.Outbox()
+        polls = {'count': 0}
+        looks = {'count': 0}
+        reroutes = []
+        notices = []
+
+        def always_busy(job):
+            polls['count'] += 1
+            raise outbox.PeerBusyError('the panel session is busy with another turn')
+
+        box.deliver = always_busy
+        box.recover = lambda job: (looks.update(count=looks['count'] + 1) or None)
+        box.reroute = lambda job: reroutes.append(job.delivery_id)
+        box.build_notice = lambda job: (notices.append(bridge._build_notice_envelope(job, 3))
+                                        or None)
+
+        job = _job(box, 'sid-busy-window', wants_reply=True)
+        job.ui_shim = {'socket': '/panel'}
+        job.timeout = 0.2
+        started = time.time()
+        delivery_id = box.submit(job)
+        _drain(box)
+        elapsed = time.time() - started
+
+        closed = box.find(delivery_id)
+        check('the busy peer was polled until the window closed', polls['count'] > 1,
+              str(polls))
+        check('a request the peer never took closes as failed and undelivered',
+              closed.state == outbox.STATE_FAILED and closed.is_undelivered is True,
+              f'{closed.state} undelivered={closed.is_undelivered}')
+        check('the reason still says the peer was busy', 'PeerBusyError' in (closed.error or ''),
+              str(closed.error))
+        check('no transcript is watched for an answer that cannot come', looks['count'] == 0,
+              str(looks))
+        check('so the sender is not kept waiting past the window', elapsed < 2.0,
+              f'{elapsed:.2f}s')
+        check('the sender is told, and that it never landed',
+              len(notices) == 1 and 'NOT delivered' in notices[0]
+              and 'reached' not in notices[0].split('\n\n')[1], str(notices))
+
+        # a reply that met the same wall is closed the same way, and still not re-aimed:
+        # only NotDeliveredError earns the reroute retries, and this change leaves that alone
+        reply_job = _job(box, 'sid-busy-reply')
+        reply_job.ui_shim = {'socket': '/panel'}
+        reply_job.timeout = 0.2
+        reply_id = box.submit(reply_job)
+        _drain(box)
+        closed_reply = box.find(reply_id)
+        check('a reply that stayed unreachable is closed as undelivered too',
+              closed_reply.state == outbox.STATE_FAILED and closed_reply.is_undelivered is True,
+              f'{closed_reply.state} undelivered={closed_reply.is_undelivered}')
+        check('and is not re-aimed and retried', reroutes == [], str(reroutes))
+
+        # the busy lock another process holds is the other way of hearing "not now"
+        session_id = 'sid-locked-' + uuid_hex()
+        holder = threading.Event()
+
+        def hold_the_lock():
+            with registry.busy_lock(config.AGENT_CODEX, session_id, 'conv_other'):
+                holder.set()
+                time.sleep(1.0)
+
+        keeper = threading.Thread(target=hold_the_lock, daemon=True)
+        keeper.start()
+        holder.wait(2)
+        try:
+            box.deliver = lambda job: {'session_id': job.target_session_id, 'reply': '',
+                                       'is_new_session': False}
+            locked_job = _job(box, session_id, wants_reply=True)
+            locked_job.timeout = 0.2  # CLI path: the window is the job timeout
+            locked_id = box.submit(locked_job)
+            _drain(box)
+            locked = box.find(locked_id)
+            check('a session held past the window is closed as undelivered too',
+                  locked.state == outbox.STATE_FAILED and locked.is_undelivered is True,
+                  f'{locked.state} undelivered={locked.is_undelivered} {locked.error}')
+        finally:
+            keeper.join(timeout=3)
+    finally:
+        (outbox.BUSY_RETRY_SECONDS, outbox.RECOVERY_POLL_SECONDS,
+         outbox.RECOVERY_WINDOW_SECONDS, config.PANEL_PATIENCE_SECONDS) = original
+
+
 def test_a_shim_busy_answer_is_told_apart_from_a_real_failure() -> None:
     busy = {'ok': False, 'error': 'the panel session is busy with another turn'}
     inflight = {'ok': False, 'error': 'another bridged message is already in flight'}
@@ -6181,6 +6277,7 @@ def run_all() -> None:
     test_a_finished_delivery_outlives_the_process_that_carried_it()
     test_an_answer_is_recovered_from_the_peer_transcript()
     test_a_busy_peer_is_retried_rather_than_failed()
+    test_a_peer_busy_past_the_window_is_closed_as_not_delivered()
     test_a_shim_busy_answer_is_told_apart_from_a_real_failure()
     test_a_panel_delivery_keeps_watching_after_the_transport_gives_up()
     test_a_cli_delivery_does_not_wait_for_a_turn_that_was_killed()

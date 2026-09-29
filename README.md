@@ -754,9 +754,11 @@ it finished as, and when an approval prompt appeared and was answered.
     nothing appears in its session and the bridge keeps retrying the delivery; `bridge_status`
     lists deliveries by the server carrying them, not by the session they are for. If a retry
     succeeds after the turn ends, within the retry window above, the message arrives. If the
-    window closes first, the request fails: the bridge then attempts a `DELIVERY FAILED`
-    notice in the sender's panel, and the failure stays readable with
-    `bridge_status(delivery_id=...)`. The failed request is not replayed.
+    window closes first, the request fails as **not delivered** (`is_undelivered`) — the
+    recipient never received it, so there is no transcript to watch for an answer — and the
+    bridge attempts a `DELIVERY FAILED` notice in the sender's panel saying so. Sending again
+    is safe. The failure stays readable with `bridge_status(delivery_id=...)`. The failed
+    request is not replayed.
   - **Even after giving up on the transport, the peer keeps working.** On the panel path, the
     peer is a session we neither spawned nor can stop, so a socket timing out doesn't mean the
     turn is over. So when a delivery times out, it isn't closed as a failure — instead,

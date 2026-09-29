@@ -669,7 +669,11 @@ class Outbox:
             job.is_reply_confirmed_by_transcript = bool(
                 result.get('is_reply_confirmed_by_transcript'))
             job.state = STATE_DELIVERED
-        except NotDeliveredError as e:
+        except (NotDeliveredError, PeerBusyError, registry.SessionBusyError) as e:
+            # A session that stayed busy through the whole retry window took nothing either:
+            # the shim's busy answer says `accepted: false`, and the busy lock is claimed before
+            # the hand-over. Closed as not delivered, there is no transcript to watch for an
+            # answer that cannot come, and the notice says a resend is safe.
             job.state = STATE_FAILED
             job.is_undelivered = True
             job.error = f'{type(e).__name__}: {e}'
