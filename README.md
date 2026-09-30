@@ -4,12 +4,13 @@
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-**Let your Claude Code session and your Codex thread talk to each other, live, without either one losing its memory.**
+**Let your Claude Code session, your Codex thread and your Grok Build session talk to each other, live, without any of them losing its memory.**
 
-cross-agent MCP is a relay MCP server for two coding agents you already have running — an active
-**Claude Code** session and an active **Codex** thread, in a plain terminal or in VS Code, it
-doesn't matter which. Either one can hand a message to the other through `send_to_codex` /
-`send_to_claude`, and the bridge finds each product's **currently active session** from the
+cross-agent MCP is a relay MCP server for the coding agents you already have running — an active
+**Claude Code** session, an active **Codex** thread and an active **Grok Build** session, in VS Code
+or in a plain terminal, it doesn't matter which. Any one of them can hand a message to
+another through `send_to_codex` / `send_to_claude` / `send_to_grok`, and the bridge finds each
+product's **currently active session** from the
 transcript it leaves on disk and **resumes it** — instead of spawning a disposable new agent —
 so both sides keep their full existing context. VS Code isn't required for any of this; it only
 unlocks one extra feature, covered in [section 3](#3-registration): seeing the exchange render
@@ -25,8 +26,8 @@ useful for:
   and returns immediately. Whenever the peer's answer is ready, it arrives back as a new message
   in your own session — provided that session is open in a panel. If it isn't, the answer waits
   on the delivery record for `bridge_status` instead, and the receipt says so up front.
-- **Watch it happen, not just read a log.** With the two panel shims from
-  [section 3](#3-registration) installed, both directions render in VS Code's real chat panel
+- **Watch it happen, not just read a log.** With the panel shims from
+  [section 3](#3-registration) installed, every direction renders in VS Code's real chat panel
   like any other message, instead of just appending a line to a transcript file.
 - **Nothing is lost to a timeout.** Because nothing blocks, a peer turn that takes ten minutes is
   fine — the reply lands whenever it lands.
@@ -61,32 +62,37 @@ the human.
 - [License](#license)
 
 ```
-               Terminal or VS Code
-                         │
-     ┌────────────┬──────┴─────┬────────────┐
-     │            │            │            │
-  Claude       Claude        Codex        Codex
- session A    session B    thread C     thread D
-     │            │            │            │
-     └─────────── cross-agent MCP ──────────┘
-                         │
-                 session registry
-          (~/.cross-agent/registry.json)
+                       VS Code or Terminal
+                                │
+     ┌───────────┬──────────┬───┴──────┬───────────┬──────────┐
+     │           │          │          │           │          │
+  Claude      Claude      Codex      Codex       Grok       Grok
+ session A   session B   thread C   thread D   session E  session F
+     │           │          │          │           │          │
+     └───────────────── cross-agent MCP ────────────────────┘
+                                │
+                        session registry
+                 (~/.cross-agent/registry.json)
 ```
 
-Any of these can reach any other through the same hub — Claude ↔ Codex across products, or
-Claude ↔ Claude / Codex ↔ Codex within the same product (see the same-agent row in the table
-below, and [section 6](#6-preventing-infinite-calls) for how that's gated).
+Any of these can reach any other through the same hub — across products (Claude ↔ Codex ↔
+Grok), or Claude ↔ Claude / Codex ↔ Codex / Grok ↔ Grok within the same product (see the
+same-agent rows in the table below, and [section 6](#6-preventing-infinite-calls) for how
+that's gated).
 
 | Direction | Tool | With panel shim | Without it (fallback) |
 |---|---|---|---|
 | Claude → Codex | `send_to_codex` | Inject `turn/start` into the panel's app-server | `codex exec resume <thread-id> --json` |
 | Codex → Claude | `send_to_claude` | Inject a stream-json user message into the panel process | `claude -p --resume <session-id> --output-format json` |
+| Claude → Grok, Codex → Grok | `send_to_grok` | Inject an ACP `session/prompt` into the panel's `grok agent stdio` | `grok --single=<message> --resume <session-id> --output-format streaming-json` |
+| Grok → Claude | `send_to_claude` | Inject a stream-json user message into the panel process | `claude -p --resume <session-id> --output-format json` |
+| Grok → Codex | `send_to_codex` | Inject `turn/start` into the panel's app-server | `codex exec resume <thread-id> --json` |
 | Claude → Claude¹ | `send_to_claude` | Inject a stream-json user message into the panel process | `claude -p --resume <session-id> --output-format json` |
 | Codex → Codex¹ | `send_to_codex` | Inject `turn/start` into the panel's app-server | `codex exec resume <thread-id> --json` |
+| Grok → Grok¹ | `send_to_grok` | Inject an ACP `session/prompt` into the panel's `grok agent stdio` | `grok --single=<message> --resume <session-id> --output-format streaming-json` |
 
-¹ Same-agent rows need an explicit target — `allow_same_agent=true` or a `session_id` for Claude,
-a `session_id` for Codex — see [section 6](#6-preventing-infinite-calls).
+¹ Same-agent rows need an explicit target — `allow_same_agent=true` or a `session_id` for
+Claude and Grok, a `session_id` for Codex — see [section 6](#6-preventing-infinite-calls).
 
 With the shim attached, the exchange **renders directly in the real VS Code panel** (see section 3).
 
@@ -106,6 +112,8 @@ returns immediately                answer generated
 Since the reply needs somewhere to land, the sender must **know its own session precisely.** This isn't inferred — because the shim sits between the extension and the agent, the MCP server is a descendant of its own shim, and **the shim whose pid appears in its own ancestor chain is exactly the conversation hosting it.** That's a certainty, not a guess.
 
 A pin must not substitute for this. A pin records "where to **send**," not "who **I am**." When it once worked that way, a stale pin got used as the reply address and replies landed in the wrong session.
+
+Grok Build hands it over directly: it exports `GROK_SESSION_ID` to every MCP server it starts, and starts one **per session** — even when several sessions share one `grok agent stdio` process (checked by opening two in one process: two servers, each with its own id). So a Grok caller's return address is exact without any inference. The variable is inherited by everything Grok runs, which is why it counts **only for a Grok caller**: a `claude` started from one of Grok's shell commands is not that session.
 
 Codex needs one more level of precision. All the Codex threads in one window **share** a single app-server and a single MCP server, so the process tree can only tell you "this window," not which thread within it (back when the most-recently-active thread was picked instead, four replies landed in threads that had never asked anything). Instead, Codex attaches `x-codex-turn-metadata` (thread id, turn id) to every MCP call, so the bridge uses **the id the calling thread declares about itself** as the reply address. When this value is present it takes priority over inference. Claude Code runs a separate process per conversation, so the process tree alone is enough there.
 
@@ -141,8 +149,14 @@ Sending **to** a dormant session is unchanged: it still resumes over the CLI, an
 ## 1. Requirements
 
 - macOS / Linux, Python 3.10+
-- `claude` CLI (Claude Code 2.x), `codex` CLI (0.146+)
-- Both CLIs logged in
+- `claude` CLI (Claude Code 2.x), `codex` CLI (0.146+), and for Grok Build the `grok` CLI
+  (developed against 1.0.44)
+- Every CLI you use logged in (`grok login`, or `XAI_API_KEY` — see
+  [What a spawned agent CLI inherits](#what-a-spawned-agent-cli-inherits))
+- For Grok in a VS Code chat panel (optional; everything else works from a terminal): the
+  [Grok Build GUI](https://marketplace.visualstudio.com/items?itemName=SahilRakhaiya.grok-build-gui) extension
+  (`SahilRakhaiya.grok-build-gui`, developed against 1.0.4). **It is the only Grok extension this
+  has been verified with** — see [IDE panel integration](#ide-panel-integration-bidirectional)
 
 ## 2. Installation
 
@@ -155,7 +169,7 @@ chmod +x run-server.sh
 
 ## 3. Registration
 
-Register both at the **user (global) level.**
+Register it in each agent at the **user (global) level.**
 
 ### Claude Code
 
@@ -193,6 +207,29 @@ default_tools_approval_mode = "approve"   # so the UI doesn't show an approval p
 
 `default_tools_approval_mode` has no corresponding flag on `codex mcp add`, so it's added directly to config.toml. Valid values are `auto` / `prompt` / `writes` / `approve`; use `approve` to stop the approval prompt from popping up every time (`auto` kept asking). This does **not** fix the cancellation problem with headless `codex exec` (see section 9). Clicking **"Always allow"** once on the UI prompt has the same effect.
 
+### Grok Build
+
+Grok imports the MCP servers already registered for Claude Code (`~/.claude.json`), so once the
+Claude registration above exists, a Grok session started afterwards already has `cross-agent`. To
+register it for Grok on its own:
+
+```bash
+grok mcp add cross-agent \
+  -- ~/project/cross-agent_mcp/run-server.sh
+```
+
+This adds the following to `~/.grok/config.toml`; a server named the same in both places is one
+server, and `config.toml` wins.
+
+```toml
+[mcp_servers.cross-agent]
+command = "~/project/cross-agent_mcp/run-server.sh"
+```
+
+Grok reaches an MCP tool through its own `search_tool` / `use_tool`, so the model finds
+`send_to_grok` and the others by searching, and asks for approval on the first use in an
+interactive session.
+
 > [!NOTE]
 > Right after registering, you need to **reload the VS Code window** or start a new session for the tool to be picked up.
 > MCP servers connect only at session start.
@@ -226,6 +263,23 @@ codex mcp add cross-agent \
 > run without a sandbox. Use this only for trusted local work.
 > To revert, drop both `-e`/`--env` arguments and re-register; that restores the defaults
 > (`read-only` / the agent's default permission mode).
+
+Grok has the same switch, and it is **not** part of the two above:
+`CROSS_AGENT_GROK_PERMISSION_MODE` is passed to `grok` as `--permission-mode` (`acceptEdits`,
+`bypassPermissions`, …).
+
+```bash
+grok mcp add cross-agent \
+  -e CROSS_AGENT_GROK_PERMISSION_MODE=acceptEdits \
+  -- ~/project/cross-agent_mcp/run-server.sh
+```
+
+Unset, a headless Grok turn **cancels the first tool call that needs an approval** — nobody is
+there to give it — and the delivery fails with an error that says so, instead of handing back
+half a sentence ("let me run that") as the answer. Read-only tool calls run without asking in
+every mode, so questions, reviews and reads need nothing set. `acceptEdits` lets it write files;
+`bypassPermissions` lets it run anything, and carries the same warning as the two variables
+above. It applies to new and resumed sessions alike.
 
 They affect only the sandbox and permission mode of an agent the bridge **starts**. The bridge's
 own tool calls have a separate approval setting (`default_tools_approval_mode` above for Codex,
@@ -273,16 +327,17 @@ Claude Code session messages another this way, the **recipient** applies a permi
 
 ### IDE panel integration (bidirectional)
 
-Everything above works the same from a plain terminal — this section is optional, and only
-matters if you also use the VS Code extensions' chat panels.
+This section is optional, and only matters if you use the VS Code extensions' chat panels —
+everything above works the same from a plain terminal.
 
 The CLI resume path (`codex exec resume` / `claude -p --resume`) appends a turn to the session history, so context is preserved, but it **doesn't show up in the VS Code panel.** The panel's session lives only inside the child process the extension spawned and connected to directly over stdio, and there's no way in from outside.
 
-Inserting the two shims into the middle of that pipe solves it.
+Inserting the shims into the middle of that pipe solves it.
 
 ```
 VS Code extension ──stdio──▶ codex-shim.sh  ──stdio──▶ real codex app-server
 VS Code extension ──stdio──▶ claude-shim.sh ──stdio──▶ real claude (stream-json)
+VS Code extension ──stdio──▶ grok-shim.sh   ──stdio──▶ real grok agent stdio (ACP)
                                   ▲
                                   │ unix socket
                           cross-agent MCP  ──▶ inject message ──▶ rendered in panel
@@ -292,30 +347,58 @@ Add these to VS Code user settings and **reload the window.**
 
 ```json
 "chatgpt.cliExecutable": "~/project/cross-agent_mcp/codex-shim.sh",
-"claudeCode.claudeProcessWrapper": "~/project/cross-agent_mcp/claude-shim.sh"
+"claudeCode.claudeProcessWrapper": "~/project/cross-agent_mcp/claude-shim.sh",
+"grok.cliPath": "~/project/cross-agent_mcp/grok-shim.sh"
 ```
 
-| | Codex | Claude Code |
-|---|---|---|
-| Setting key | `chatgpt.cliExecutable` (**replaces** the binary) | `claudeCode.claudeProcessWrapper` (`<wrapper> <real-path> <args>`) |
-| Call intercepted | plain `app-server` | `--input-format stream-json` sessions |
-| Injection method | JSON-RPC `turn/start` (id in the `xagent-` namespace) | stream-json `{"type":"user",...}` |
-| Session id source | `thread/started` · request params | argv `--resume=` · `system/init` |
-| Human input observed | `turn/start` · `turn/steer` sent by the extension | `{"type":"user"}` sent by the extension |
-| Shown in panel | user message + response | user message + response |
-| Setting status | marked "DEVELOPMENT ONLY" | an official setting |
+| | Codex | Claude Code | Grok Build |
+|---|---|---|---|
+| Setting key | `chatgpt.cliExecutable` (**replaces** the binary) | `claudeCode.claudeProcessWrapper` (`<wrapper> <real-path> <args>`) | `grok.cliPath` (**replaces** the binary; the extension runs `<cliPath> agent [--reasoning-effort <level>] stdio`) |
+| Call intercepted | plain `app-server` | `--input-format stream-json` sessions | `agent … stdio` (ACP) |
+| Injection method | JSON-RPC `turn/start` (id in the `xagent-` namespace) | stream-json `{"type":"user",...}` | JSON-RPC `session/prompt` (id in the `xagent-` namespace) |
+| Session id source | `thread/started` · request params | argv `--resume=` · `system/init` | `session/new` response · `session/load` params |
+| Human input observed | `turn/start` · `turn/steer` sent by the extension | `{"type":"user"}` sent by the extension | `session/prompt` sent by the extension |
+| Shown in panel | user message + response | user message + response | the message as a quoted block at the head of the response, then the response (see below) |
+| Setting status | marked "DEVELOPMENT ONLY" | an official setting | a setting of the [Grok Build GUI](https://marketplace.visualstudio.com/items?itemName=SahilRakhaiya.grok-build-gui) extension |
 
 Shared rules:
 
 - Passes every byte straight through, and intercepts **only panel-session calls**
-  (`--version`, `login`, `app-server daemon`, `claude -p`, etc. exec straight to the real binary)
-- Auto-discovers the real binary inside the extension directory
-  (can be overridden with `CROSS_AGENT_REAL_CODEX` / `CROSS_AGENT_REAL_CLAUDE`)
+  (`--version`, `login`, `app-server daemon`, `claude -p`, `grok update`, `grok agent serve`,
+  etc. exec straight to the real binary)
+- Auto-discovers the real binary inside the extension directory (Grok: its own install,
+  `~/.grok/bin/grok`) — can be overridden with `CROSS_AGENT_REAL_CODEX` /
+  `CROSS_AGENT_REAL_CLAUDE` / `CROSS_AGENT_REAL_GROK`
 - On any failure, it execs the real binary as-is (fail-open)
 - The shim records its own pid ancestor list in `~/.cross-agent/panels/<agent>-<pid>.json`.
   The bridge picks the **shim that shares an ancestor with itself**, so even with multiple
   windows open it targets exactly "this IDE instance"
 - The Claude shim waits for the current turn to finish before injecting, if the user is mid-conversation
+- The Grok shim does the same per session, and keeps count of the human's prompts still unanswered: Grok
+  queues a prompt typed ahead, so the session is busy until the last one is answered, not the first
+- The Grok shim answers for every session its process hosts. The extension starts one `grok agent
+  stdio` per conversation tab, but a process can carry several sessions, and each is reported and
+  addressed by its own id. A session the extension opened and nobody has prompted yet counts as empty
+  — a message written into it *is* the new conversation — while one that has history is never used for
+  a new conversation, because the conversation list belongs to the extension and a session made
+  behind its back would be one the panel never heard of
+- **What the Grok panel shows.** The extension draws the messages it sends itself and discards the
+  agent's echo of a prompt unless it is replaying a history, so a user bubble cannot be made from
+  outside. The shim instead writes the relayed message as a quoted block at the head of the reply,
+  and Grok's answer follows it. It also holds back the `Thinking` blocks of a bridged turn — the
+  extension opens one for each and closes it only when *its own* prompt is answered. The panel's
+  own busy state and Stop button follow only prompts it sent, so they do not light up for a bridged
+  turn; a human who types meanwhile is queued by Grok, and the shim reports the session busy until
+  that turn ends too
+- **Only one Grok extension has been verified: [Grok Build GUI](https://marketplace.visualstudio.com/items?itemName=SahilRakhaiya.grok-build-gui)**
+  (`SahilRakhaiya.grok-build-gui`, 1.0.4). Everything the shim does about the panel — what it
+  hides, what it shows, which messages the extension throws away — was read from that extension's
+  code and checked against a stand-in for it, so it is that extension's behaviour and nobody
+  else's. A different Grok front end that launches `grok agent stdio` from a path you can
+  configure could be pointed at `grok-shim.sh` the same way, but that is untested and its panel
+  may draw the same messages differently. One that talks to Grok another way (a socket to
+  `grok agent serve`, say) is not intercepted, and its sessions are reached over the CLI. The
+  CLI path, session discovery and the `send_to_grok` tool do not depend on any extension
 - The Codex shim **excludes sub-agent threads** from targeting. Threads created by a
   multi-agent run reject direct input at the app-server level (`direct app-server input is
   not allowed for multi-agent v2 sub-agents`), and are identified via `parentThreadId` ·
@@ -341,6 +424,13 @@ The order of 3 and 4 matters. It used to be that "if the panel has no conversati
 **You can specify by name — but only an exact match.** People refer to conversations by name, not uuid, so you can put the conversation name directly into `session_id`.
 
 - **The name a human assigned is the source of truth.** It's the name shown at the top of the panel, recorded in the transcript as `{"type":"custom-title","customTitle":"…"}`. Renaming appends another one, so the **last value** is used. For Codex threads, `~/.codex/session_index.jsonl` supplies the name.
+- **Grok Build** keeps two kinds of name. The tab name a human types in the
+  [Grok Build GUI](https://marketplace.visualstudio.com/items?itemName=SahilRakhaiya.grok-build-gui) extension lives
+  in the extension's own state, not in Grok's files, so the bridge reads it, read-only, from the
+  editor's `state.vscdb` (macOS and Linux locations for Code by default; `CROSS_AGENT_GROK_NAMES_DB`
+  points somewhere else). A title set with `/rename` in Grok itself is in the session's
+  `summary.json`. If the database cannot be read, names simply stop resolving and the session is
+  reached by its id.
 - A conversation with no assigned name falls back to a title generated from the first message. That's a **description, not a name**, so it can't be found by a word inside it.
 - **No partial matching.** It used to allow it, and `koppa_studio` once matched a path quoted in a months-old session's first message, headlessly reviving a session nobody was watching — while the session actually *named* `koppa_studio` went unfound.
 - If no name matches, it **reports similar titles and fails** rather than creating a new conversation.
@@ -370,6 +460,7 @@ Even when the panel is only showing a conversation list, there's a live process 
 
 - Codex: creates a thread with `thread/start`. The app-server broadcasts a `thread/started` notification, so the extension picks up the thread and renders it
 - Claude: just writes a user message to the panel process that's running without a session. The CLI starts a new conversation and the session id is captured from `system/init`
+- Grok: writes the prompt into a session the extension opened and nobody has prompted yet. A shim cannot open a session of its own (see above), so when every session it hosts already has history, a request for a new conversation goes to the CLI instead: `grok --single=<message> --session-id <new uuid>`
 
 When the receipt's `will_create_session` is `true`, this is the conversation that will be opened. Codex also sets a title of the form **"sender: start of the message"** via `thread/name/set`; otherwise it would just sit in the list as "New chat" with no way to tell which conversation it is.
 
@@ -458,9 +549,10 @@ Prints who's running it, both CLI paths, the currently resolved active session, 
 |---|---|
 | `send_to_codex(message, ...)` | Sends a message to the active Codex thread. **Asynchronous — the response isn't carried back** |
 | `send_to_claude(message, ...)` | Sends a message to the active Claude session. **Asynchronous — the response isn't carried back** |
-| `list_agent_sessions(agent, scope, cwd, limit)` | List of sessions the bridge can find (newest first, including active status) |
+| `send_to_grok(message, ...)` | Sends a message to the active Grok Build session. **Asynchronous — the response isn't carried back** |
+| `list_agent_sessions(agent, scope, cwd, limit)` | List of sessions the bridge can find (newest first, including active status). `agent` is `claude`, `codex`, `grok`, `both` (Claude and Codex) or `all` (the default) |
 | `bridge_status(cwd, scope, delivery_id)` | Diagnostics: who's running, the resolved session, settings, lock state, and **deliveries in flight**. Given a `delivery_id`, it re-reads that one delivery's peer transcript (`peer_transcript`) and panel state (`peer_panel`: whether a turn is running, **whether it's stuck on an approval prompt**) and reports both |
-| `pin_agent_session(agent, session_id, cwd)` | Pins a specific session (by id or conversation name). While pinned, no new conversation is opened. Leave it empty to unpin |
+| `pin_agent_session(agent, session_id, cwd)` | `agent` is `claude`, `codex` or `grok`. Pins a specific session (by id or conversation name). While pinned, no new conversation is opened. Leave it empty to unpin |
 
 Common `send_to_*` parameters:
 
@@ -475,9 +567,9 @@ Common `send_to_*` parameters:
 | `conversation_id` | auto-generated | Continues an existing bridge conversation, sharing its hop budget |
 | `raw` | `false` | Delivers the raw text with no bridge header |
 
-`send_to_claude` additionally takes `allow_same_agent` (default `false`) — a Claude session
-messaging another Claude session is refused unless this is set, or an explicit `session_id` is
-given. `send_to_codex` has no such flag; reaching another Codex thread requires an explicit
+`send_to_claude` and `send_to_grok` additionally take `allow_same_agent` (default `false`) — a
+session messaging another session of its own agent is refused unless this is set, or an explicit
+`session_id` is given. `send_to_codex` has no such flag; reaching another Codex thread requires an explicit
 `session_id` (see [section 6](#6-preventing-infinite-calls)).
 
 The return value of `send_to_*` is a **receipt**, not an answer.
@@ -513,6 +605,9 @@ a call with neither is refused before any of this runs, even when a pin exists (
      - Codex:  ~/.codex/sessions/**/rollout-*.jsonl
                session_meta.thread_source == 'user' (sub-agent threads excluded)
                if multiple rollouts share a session_id, the newest one
+     - Grok:   ~/.grok/sessions/<percent-encoded cwd>/<session-id>/summary.json (+ updates.jsonl)
+               session_kind != 'subagent' (a subagent's conversation is filed in the same store)
+               the folder is named for the directory, so a scope is decided without opening sessions
      - Only counted as "active" if its last record falls within the active window (default 240 min)
      - Sort priority: ① directory match (exact > subdirectory > parent) ② most recently recorded
        Parent directories are only candidates under scope='tree' — since the home directory
@@ -521,6 +616,7 @@ a call with neither is refused before any of this runs, even when a pin exists (
 4. If no session satisfies the above → create a new session
      - Claude: claude -p --session-id <new uuid> ...
      - Codex:  codex exec --json -C <cwd> ... (id recovered from thread.started)
+     - Grok:   grok --single=<message> --session-id <new uuid> ...
      - The created session gets pinned in the registry, becoming the resume target from the next call on
 ```
 
@@ -533,14 +629,17 @@ It's blocked in three layers.
 1. **Hop budget** — at most `MAX_HOPS` (default 4) per conversation. `conversation_id` propagates to child processes as an environment variable, so an A→B→A→B chain automatically shares the same budget. Rejected once exceeded.
 2. **Busy lock** — prevents two turns from overlapping in the same session. Agent CLIs allow only one writer per transcript, so this isn't courtesy, it's mandatory. It's acquired atomically in `~/.cross-agent/locks/` with `O_EXCL`, so there's no race between "check" and "acquire." It's released only while its own token is still present, and locks held by dead processes are reclaimed automatically. **Since the move to async, this lock is a reason to wait in line, not a reason to reject** — the worker waits for the lock to free up and then delivers. The sender's own session is no longer locked at all, since nobody's waiting on it, so a relay coming back around can't create a deadlock.
 3. **Self-call guard** — by default, an agent refuses to relay into another session of its *own*
-   kind: Claude cannot reach another Claude session, and Codex cannot reach another Codex thread.
+   kind: Claude cannot reach another Claude session, Codex cannot reach another Codex thread, and
+   Grok cannot reach another Grok session.
    The caller is identified from the parent process chain, not a self-reported label. This exists
-   because the two peer tools (`send_to_codex` / `send_to_claude`) are meant to cross from one
-   product to the other — routing Claude into Claude by mistake should fail loudly instead of
-   silently starting a same-agent relay.
+   because the peer tools (`send_to_codex` / `send_to_claude` / `send_to_grok`) are meant to cross
+   from one product to another — routing Claude into Claude by mistake should fail loudly instead of
+   silently starting a same-agent relay. The refusal names the tools that lead elsewhere.
    - **Claude → Claude** is allowed either by passing `allow_same_agent=true` on `send_to_claude`
      (auto-discovers another active Claude session, excluding the caller's own), or by naming an
      explicit `session_id` (which alone is also enough to pass the guard, with or without the flag).
+   - **Grok → Grok** works the same way: `allow_same_agent=true` on `send_to_grok`, or an explicit
+     `session_id`.
    - **Codex → Codex** has no `allow_same_agent` flag — `send_to_codex` doesn't expose one — so the
      only way to reach another Codex thread is to name it explicitly with `session_id`.
    - Either way, **auto-discovery never picks the caller's own current session** as the target, so
@@ -566,14 +665,18 @@ Every delivered message carries a header with the sender, conversation ID, and h
 | `CROSS_AGENT_PANEL_PATIENCE` | `3600` | On the panel path, how long (seconds) a delivery keeps waiting out a busy session, and, separately, how long it then waits for the peer's turn to end. Each wait gets the larger of this value and the job timeout. Doesn't make the caller wait |
 | `CROSS_AGENT_DELIVERY_TTL` | `604800` | How long finished delivery records are kept (seconds, default 7 days) |
 | `CROSS_AGENT_SCOPE` | `cwd` | Default discovery scope (`cwd` / `tree` / `any`) |
-| `CROSS_AGENT_UI_HOOK` | `auto` | Codex panel injection (`auto` / `off` / `require`) |
+| `CROSS_AGENT_UI_HOOK` | `auto` | Panel injection (`auto` / `off` / `require`) |
 | `CROSS_AGENT_REQUIRE_EXPLICIT_TARGET` | (unset) | Refuse a send that names neither `session_id` nor `new_session=true`; a pin doesn't count. `0` / `false` / `no` / `off` leave it off, any other value turns it on |
 | `CROSS_AGENT_REAL_CODEX` | (auto-discovered) | The real codex binary for the shim to wrap |
 | `CROSS_AGENT_REAL_CLAUDE` | (auto-discovered) | The real claude binary for the shim to wrap |
+| `CROSS_AGENT_REAL_GROK` | (auto-discovered) | The real grok binary for the shim to wrap |
 | `CROSS_AGENT_CODEX_SANDBOX` | `read-only` | Sandbox for **newly created** Codex sessions (`read-only` / `workspace-write` / `danger-full-access`) |
 | `CROSS_AGENT_CLAUDE_PERMISSION_MODE` | (unset) | `--permission-mode` passed on Claude calls (`acceptEdits` / `bypassPermissions` / `plan`, etc.) |
-| `CROSS_AGENT_CODEX_MODEL` / `CROSS_AGENT_CLAUDE_MODEL` | (unset) | Force a specific model |
-| `CROSS_AGENT_CLAUDE_BIN` / `CROSS_AGENT_CODEX_BIN` | `claude` / `codex` | CLI path |
+| `CROSS_AGENT_GROK_PERMISSION_MODE` | (unset) | `--permission-mode` passed on Grok calls (`acceptEdits` / `bypassPermissions` / `dontAsk` / `plan`, etc.). Unset, a headless Grok turn cancels a tool call that needs approval |
+| `CROSS_AGENT_CODEX_MODEL` / `CROSS_AGENT_CLAUDE_MODEL` / `CROSS_AGENT_GROK_MODEL` | (unset) | Force a specific model |
+| `CROSS_AGENT_CLAUDE_BIN` / `CROSS_AGENT_CODEX_BIN` / `CROSS_AGENT_GROK_BIN` | `claude` / `codex` / `grok` | CLI path. `grok` falls back to `~/.grok/bin/grok` when the PATH does not have it — an editor started from the Dock does not read a shell profile |
+| `CROSS_AGENT_GROK_NAMES_DB` | (the editor's `state.vscdb`) | Where the Grok VS Code extension's conversation names are read from, `:`-separated if several |
+| `GROK_HOME` | `~/.grok` | Where Grok's own session store lives (Grok reads it too, so the two agree) |
 | `CROSS_AGENT_CODEX_SCAN_LIMIT` | `2000` | Safety cap on Codex rollout scanning (applies only to scope=`any`) |
 | `CROSS_AGENT_SELF` | (auto-detected) | Force which agent is treated as the caller |
 | `CROSS_AGENT_CHILD_ENV` | (unset) | Extra variable names, comma-separated, to pass to a spawned agent CLI (see below) |
@@ -592,8 +695,8 @@ installation made before that was enforced the first time it runs. Two things fo
 `CROSS_AGENT_HOME`:
 
 - **It has to be a directory of the bridge's own.** If it resolves to `/`, to your home
-  directory, or to — or inside — either agent's own directory (`~/.claude`, `~/.codex`, or
-  wherever `CLAUDE_CONFIG_DIR` / `CODEX_HOME` point), it is refused rather than used:
+  directory, or to — or inside — any agent's own directory (`~/.claude`, `~/.codex`, `~/.grok`, or
+  wherever `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `GROK_HOME` point), it is refused rather than used:
   the bridge would be changing the permissions of files that aren't its own, and a symlink
   pointing there is refused as firmly as the path itself. A directory that merely *contains* a
   store is fine; the repair walk steps around the store rather than refusing the whole tree.
@@ -602,8 +705,8 @@ installation made before that was enforced the first time it runs. Two things fo
   directories and message summaries somewhere it has just failed to make private.
 ### What a spawned agent CLI inherits
 
-When the bridge relays over the CLI rather than the panel, it starts a `claude` or `codex`
-process. That process does **not** get this server's environment. An editor passes its own
+When the bridge relays over the CLI rather than the panel, it starts a `claude`, `codex` or
+`grok` process. That process does **not** get this server's environment. An editor passes its own
 environment to every MCP server it launches, and by then a desktop session has usually
 collected API keys, cloud credentials and whatever a shell profile exports — forwarding all
 of it would hand it to the peer agent and to every command the peer then runs.
@@ -621,14 +724,15 @@ The child is built up from a named baseline instead (`config.CHILD_ENV_BASELINE`
   CLI a proxy it cannot authenticate to, and the failure would look like a broken proxy
   rather than a bridge decision. Name it in `CROSS_AGENT_CHILD_ENV` to pass it
 - `__CF_USER_TEXT_ENCODING` — macOS Core Foundation
-- `CLAUDE_CONFIG_DIR`, `CODEX_HOME` — the session stores the bridge itself resolves against
+- `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME` — the session stores the bridge itself resolves against
 - the bridge's own settings from the table above, so a spawned agent runs a bridge
   configured like this one (`CROSS_AGENT_SELF` is deliberately **not** inherited: a child
   must work out its own identity, not adopt its parent's)
 
-Both CLIs authenticate through files under `HOME` in the normal editor setup, so this is
-enough. If yours authenticates through an environment variable — an API key, a gateway token,
-a credential helper's variable — name it:
+Every CLI authenticates through files under `HOME` in the normal editor setup (Grok: `grok
+login` writes `~/.grok/auth.json`), so this is enough. If yours authenticates through an
+environment variable instead — `XAI_API_KEY` for Grok, an API key or a gateway token for the
+others, a credential helper's variable — name it:
 
 ```bash
 claude mcp add cross-agent -s user -e CROSS_AGENT_CHILD_ENV=ANTHROPIC_API_KEY -- <script>
@@ -655,6 +759,7 @@ PYTHONPATH=src .venv/bin/python tests/unit_guards.py
 # Shim pass-through, injection, and panel rendering checks (no VS Code config needed)
 PYTHONPATH=src .venv/bin/python tests/shim_roundtrip.py          # 1 Codex turn
 PYTHONPATH=src .venv/bin/python tests/claude_shim_roundtrip.py   # 2 Claude turns
+PYTHONPATH=src .venv/bin/python tests/grok_shim_roundtrip.py     # 2 Grok turns (state in a throwaway dir)
 
 # Protocol handshake + discovery + all 3 guards (consumes no agent turns)
 PYTHONPATH=src .venv/bin/python tests/smoke_mcp.py
@@ -665,7 +770,7 @@ PYTHONPATH=src .venv/bin/python tests/live_roundtrip.py
 
 Logs go to `~/.cross-agent/logs/bridge.log`. The panel shim runs inside the extension's stdio
 and has no terminal, so it writes separately to `~/.cross-agent/logs/shim-claude.log` /
-`shim-codex.log` — this is where you'll find when an injected turn was accepted, which turn id
+`shim-codex.log` / `shim-grok.log` — this is where you'll find when an injected turn was accepted, which turn id
 it finished as, and when an approval prompt appeared and was answered.
 
 ## 9. Known limitations
@@ -690,10 +795,34 @@ it finished as, and when an approval prompt appeared and was answered.
   they govern sandbox filesystem/network permissions and are unrelated to this issue.
   In short, **headless Codex→Claude is currently an upstream limitation**, and it doesn't
   affect interactive use.
+- **Grok's headless approval** — a Grok turn the bridge starts over the CLI has nobody to approve
+  a tool call, so the first one that needs approval is **cancelled** and the delivery fails with
+  an error saying so (`stopReason: cancelled`). Unlike Codex above, this is configurable: set
+  `CROSS_AGENT_GROK_PERMISSION_MODE` (see "Unattended use"). Tool calls that only read run in
+  every mode; an MCP tool call does not, and is cancelled the same way. Grok reads permission
+  rules from `~/.claude/settings.json` too, so the `mcp__cross-agent` rule from "Turning off the
+  approval prompt (Claude Code)" is what lets a headless Grok turn call the bridge's own tools
+  (checked: with it a default-mode turn called `bridge_status`; a server with no such rule was
+  cancelled). A panel session is not affected: the human is there to approve.
+- **Grok loads project files only from a folder it trusts.** The user-level `~/.claude/CLAUDE.md`
+  is read whatever the folder, but a project's own `CLAUDE.md` / `AGENTS.md`, its skills, hooks and
+  MCP servers are loaded only after the folder has been trusted (`grok --trust` once inside it, or
+  the prompt in the TUI) — for a turn the bridge starts as much as for a session you open. The
+  bridge never trusts a folder on your behalf.
+- **A Grok answer is what it said after its last tool call.** Grok narrates between tool calls,
+  and the plain `--output-format json` glues all of it together; the bridge reads `streaming-json`
+  and the transcript's chunks and cuts at the last tool call. A turn that never spoke after its
+  tools returns everything it said. A Grok transcript writes every streamed chunk as a line, so
+  the bridge reads the last 8 MB of it rather than 2 MB when it looks for an answer.
+- **Not verified: resuming a Grok session that a live panel process holds.** With the shim the
+  panel path is used and the question does not arise. Without it (`CROSS_AGENT_UI_HOOK=off`, or the
+  setting not made), the bridge resumes the session with a second `grok` process while the
+  extension's own is still holding it. Grok keeps lock files in a session folder, which suggests
+  the writes are serialized, but this was tested only against a session no live process held.
 - **When the UI reflects changes** — without the shim attached, the bridge only appends a
   turn to the session transcript, so the VS Code chat window doesn't update live (it shows up
-  the next time that session is reopened). Setting up both shims from section 3 renders both
-  directions in the panel.
+  the next time that session is reopened). Setting up the shims from section 3 renders every
+  direction in the panel.
 - **Chain-state propagation through the shim** — panel injection doesn't spawn a new child
   process, so environment variables like `CROSS_AGENT_CONVERSATION_ID` aren't passed to the
   peer. The envelope header carries the conversation id instead, so the peer can still
@@ -738,14 +867,14 @@ it finished as, and when an approval prompt appeared and was answered.
       (default 7 days) has also passed from there — deleting it right at expiry would make the
       app go back to "I don't know" if it asks the next day. A finished record still follows
       `finished_at` + TTL as before.
-  - **The answer is recovered from the peer's transcript.** Both agents write every turn to
+  - **The answer is recovered from the peer's transcript.** Every agent writes each turn to
     JSONL, so even if the transport broke or the process died before the answer could be
     received, the answer itself is still on disk. If a delivery ends without an answer, the
     peer session's last assistant message is read back (`is_reply_recovered`). Since this
     isn't a resend, the peer is never made to redo the same work.
-  - **If the peer is busy, it waits — it doesn't reject.** Both agents already handle
+  - **If the peer is busy, it waits — it doesn't reject.** The agents already handle
     concurrent input — Claude waits for the current turn to finish before injecting, Codex
-    queues it. But there's a limit, and past it the shim answers with
+    and Grok queue it. But there's a limit, and past it the shim answers with
     `busy with another turn` / `already in flight`. That's the shim's own deadline, not ours,
     so instead of closing the delivery as failed, it's **retried after an interval** — for
     as long as the job timeout, or `CROSS_AGENT_PANEL_PATIENCE` on the panel path if that is

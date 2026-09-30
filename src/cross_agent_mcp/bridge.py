@@ -2,8 +2,9 @@
 
   Claude Code : claude -p --resume <session-id> --output-format json "<message>"
   Codex       : codex exec resume <thread-id> --json "<message>"
+  Grok Build  : grok -p "<message>" --resume <session-id> --output-format streaming-json
 
-Both commands re-enter an existing transcript, so the peer answers with its whole
+Each command re-enters an existing transcript, so the peer answers with its whole
 conversation context intact instead of starting from a blank agent.
 
 Handing the message over is not the same as waiting for the answer. `send_message` only
@@ -72,11 +73,27 @@ PANEL_AWAIT_CHUNK_SECONDS = 30
 AGENT_LABEL: Dict[str, str] = {
     config.AGENT_CLAUDE: 'Claude Code',
     config.AGENT_CODEX: 'Codex',
+    config.AGENT_GROK: 'Grok',
 }
-PEER_TOOL: Dict[str, str] = {
-    config.AGENT_CLAUDE: 'send_to_codex',
-    config.AGENT_CODEX: 'send_to_claude',
-}
+
+# Agents that can start a session under an id the bridge picks, so the receipt can name the
+# session before the peer has answered. Codex issues its own ids.
+PREASSIGNS_SESSION_ID = (config.AGENT_CLAUDE, config.AGENT_GROK)
+
+# Agents whose editor panel holds exactly one conversation, so a panel can host a new one only
+# while it is idle. Codex's panel can open a thread whenever it is asked to.
+SINGLE_CONVERSATION_PANELS = (config.AGENT_CLAUDE, config.AGENT_GROK)
+
+
+def reach_tool(agent: str) -> str:
+    """The tool that sends a message to `agent`. `the cross-agent tool` for one it cannot name."""
+    return f'send_to_{agent}' if agent in config.AGENTS else 'the cross-agent tool'
+
+
+def _tools_reaching_others(agent: str) -> str:
+    """Every tool that leads somewhere other than `agent`, for a refusal to point at."""
+    others = [reach_tool(other) for other in config.AGENTS if other != agent]
+    return ' or '.join(f'`{tool}`' for tool in others)
 
 
 class BridgeError(Exception):
@@ -123,7 +140,7 @@ def _build_envelope(sender: str, target: str, conversation_id: str, hop: int, re
                     message: str, reply_to: Optional[str] = None,
                     request_id: Optional[str] = None) -> str:
     sender_label = AGENT_LABEL.get(sender, sender)
-    reply_tool = PEER_TOOL.get(target, 'the cross-agent tool')
+    reply_tool = reach_tool(sender)
 
     if remaining > 0 and reply_to:
         follow_up = (f'- For a NEW request back to {sender_label}, call `{reply_tool}` with '
@@ -172,7 +189,7 @@ def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: i
     a socket that merely ran out of patience, which are different things to do next.
     """
     sender_label = AGENT_LABEL.get(sender, sender)
-    reply_tool = PEER_TOOL.get(target, 'the cross-agent tool')
+    reply_tool = reach_tool(sender)
 
     if remaining > 0 and reply_to:
         follow_up = (f'- Only if you have a NEW request, call `{reply_tool}` with '
@@ -221,7 +238,7 @@ def _build_notice_envelope(job: outbox.Job, remaining: int) -> str:
     going twice, so the reader is pointed at the transcript instead.
     """
     target_label = AGENT_LABEL.get(job.target_agent, job.target_agent)
-    reply_tool = PEER_TOOL.get(job.sender_agent, 'the cross-agent tool')
+    reply_tool = reach_tool(job.target_agent)
     session = job.resolved_session_id or job.target_session_id or '(none)'
 
     if job.is_undelivered:
@@ -318,6 +335,7 @@ def _running_as(env: Dict[str, str], agent: str, session_id: Optional[str]) -> D
 AUTH_ENV_HINTS = (
     'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
     'CLAUDE_CODE_OAUTH_TOKEN', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY',
+    'XAI_API_KEY',
 )
 
 
@@ -636,12 +654,13 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
     # A panel is handed no session id only when it was chosen to host a new conversation -
     # because one was asked for, or because nothing existed to resume. One that was asked for
     # must be new or the delivery fails. One that was only the last resort need not be: a
-    # Claude panel holds a single conversation, and if the human has started one there since
-    # the panel was chosen, that is the conversation the user is working in - the one
+    # Claude or Grok panel holds a single conversation, and if the human has started one there
+    # since the panel was chosen, that is the conversation the user is working in - the one
     # resolution would pick now - so the message waits for the panel to be free and goes in.
     # A Codex panel can always open a thread, and unless told to, it hands the message to its
     # newest one, which resolution may have passed over on purpose.
-    create_new = is_new_session or (session_id is None and target_agent != config.AGENT_CLAUDE)
+    create_new = is_new_session or (
+        session_id is None and target_agent not in SINGLE_CONVERSATION_PANELS)
     # Recorded before the message goes anywhere: "a new conversation" means one that did not
     # exist a moment ago, and that is only checkable against the sessions that did.
     existing = _live_session_ids(target_agent) if create_new else set()
@@ -816,7 +835,89 @@ def _call_codex(message: str, session_id: Optional[str], cwd: str, env: Dict[str
     }
 
 
-CALLERS = {config.AGENT_CLAUDE: _call_claude, config.AGENT_CODEX: _call_codex}
+def _call_grok(message: str, session_id: Optional[str], cwd: str, env: Dict[str, str],
+               timeout: int, ui_shim: Optional[Dict[str, Any]] = None,
+               title: Optional[str] = None, **panel: Any) -> Dict[str, Any]:
+    """Resume (or create) a Grok Build session and return its final message.
+
+    Read from `streaming-json` rather than `json`. The plain JSON `text` is everything the
+    model said in the turn glued together, narration between tool calls included, with nothing
+    to show where one sentence ends and the next begins; the stream marks the tool calls, so
+    the answer can be cut where the last one ended.
+    """
+    if ui_shim:
+        return _call_via_panel(message, session_id, ui_shim, timeout, cwd, title, **panel)
+
+    is_new = bool(panel.get('is_new_session')) or session_id is None
+    target_id = session_id or str(uuid.uuid4())
+
+    # `--single=` rather than `-p <message>`: a message that begins with a dash would be read
+    # as an option. `--verbatim` keeps Grok from treating the text as anything but the message.
+    command = [config.GROK_BIN, f'--single={message}', '--verbatim',
+               '--output-format', 'streaming-json', '--cwd', cwd]
+    command += ['--session-id', target_id] if is_new else ['--resume', target_id]
+    if config.GROK_PERMISSION_MODE:
+        command += ['--permission-mode', config.GROK_PERMISSION_MODE]
+    if config.GROK_MODEL:
+        command += ['--model', config.GROK_MODEL]
+
+    completed = _run_cli(command, cwd, _running_as(env, config.AGENT_GROK, target_id), timeout)
+
+    said = ''
+    after_tools = ''
+    end: Optional[Dict[str, Any]] = None
+    errors: List[str] = []
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith('{'):
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(event, dict):
+            continue
+
+        kind = event.get('type')
+        if kind == 'text' and isinstance(event.get('data'), str):
+            said += event['data']
+            after_tools += event['data']
+        elif kind in ('tool_call', 'tool_call_update'):
+            after_tools = ''
+        elif kind == 'end':
+            end = event
+        elif kind == 'error':
+            errors.append(json.dumps(event, ensure_ascii=False)[:400])
+
+    # the last thing said after its tools, else all of it - a turn that only ever spoke
+    # before them still has said something
+    reply = (after_tools or said).strip()
+
+    if end is None or (not reply and end.get('stopReason') != 'cancelled'):
+        detail = '; '.join(errors) or (completed.stderr or completed.stdout or '').strip()[-800:]
+        raise BridgeError(f'grok CLI returned no answer (exit={completed.returncode}): '
+                          f'{detail}{_auth_hint(env)}')
+
+    if end.get('stopReason') == 'cancelled':
+        # What it said before stopping is narration, not an answer, and returning it as one is
+        # how "let me run that" gets read as a result.
+        raise BridgeError(
+            'the grok turn was cancelled before it finished. A headless turn cancels a tool '
+            'call that needs approval, because nobody is there to give it; set '
+            'CROSS_AGENT_GROK_PERMISSION_MODE (acceptEdits, bypassPermissions) to let the '
+            f'bridge\'s Grok turns act. It had said: {said.strip()[:300] or "(nothing)"}')
+
+    return {
+        'session_id': str(end.get('sessionId') or target_id),
+        'reply': reply,
+        'is_new_session': is_new,
+        'usage': end.get('usage'),
+        'cost_usd': end.get('total_cost_usd'),
+    }
+
+
+CALLERS = {config.AGENT_CLAUDE: _call_claude, config.AGENT_CODEX: _call_codex,
+           config.AGENT_GROK: _call_grok}
 
 
 # ------------------------------------------------------------------ dispatch
@@ -824,6 +925,7 @@ CALLERS = {config.AGENT_CLAUDE: _call_claude, config.AGENT_CODEX: _call_codex}
 PANEL_SETTING = {
     config.AGENT_CODEX: 'chatgpt.cliExecutable -> codex-shim.sh',
     config.AGENT_CLAUDE: 'claudeCode.claudeProcessWrapper -> claude-shim.sh',
+    config.AGENT_GROK: 'grok.cliPath -> grok-shim.sh',
 }
 
 
@@ -1179,7 +1281,7 @@ def _build_notice_job(job: outbox.Job) -> Optional[outbox.Job]:
 def _recover_reply(job: outbox.Job) -> Optional[str]:
     """Read the peer's answer out of its own transcript when the transport did not bring it.
 
-    Both agents write every turn to a JSONL transcript, so a delivery that reached the peer
+    Every agent writes each turn to a JSONL transcript, so a delivery that reached the peer
     has its answer on disk even when the process carrying it died first. Recovery costs one
     file read and cannot ask the peer to redo the work, which re-sending would.
     """
@@ -1367,6 +1469,20 @@ def _declared_session(sender_agent: str) -> Optional[str]:
     return None
 
 
+def _host_declared_session(sender_agent: str) -> Optional[str]:
+    """The session the host agent says this server was started for, when the host says so.
+
+    Grok exports `GROK_SESSION_ID` to every MCP server it starts, and starts them per session,
+    so - unlike a Claude or Codex process tree - the id is exact without anything being
+    guessed. Only a Grok caller counts: the variable rides down into everything Grok runs, and
+    a `claude` started from one of its shell commands is not that session.
+    """
+    if sender_agent != config.AGENT_GROK:
+        return None
+    value = os.environ.get(config.ENV_GROK_SESSION) or ''
+    return value.lower() if discovery.is_session_id(value) else None
+
+
 def _own_session_id(sender_agent: str) -> Optional[str]:
     """The caller's own session - the return address the peer's answer is delivered to.
 
@@ -1378,7 +1494,7 @@ def _own_session_id(sender_agent: str) -> Optional[str]:
     if sender_agent not in CALLERS:
         return None
 
-    declared = _declared_session(sender_agent)
+    declared = _declared_session(sender_agent) or _host_declared_session(sender_agent)
     if declared:
         return declared
 
@@ -1519,7 +1635,7 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     if sender_agent == target_agent and not allows_same_agent and not has_session:
         raise BridgeError(
             f'refusing to relay a message from {target_agent} back into {target_agent}. '
-            f'Use `{PEER_TOOL.get(sender_agent, "the peer tool")}` to reach the other agent, '
+            f'Use {_tools_reaching_others(sender_agent)} to reach a different agent, '
             'or pass an explicit session_id together with allows_same_agent=true.')
 
     busy = _busy_from_env()
@@ -1542,9 +1658,9 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     # receipt say which session the answer will come from - the caller can address it by id
     # from the next message on, instead of waiting to see what appears.
     is_new_over_cli = is_new_session and not (target or {}).get('ui_shim')
-    if is_new_over_cli and target_agent == config.AGENT_CLAUDE:
+    if is_new_over_cli and target_agent in PREASSIGNS_SESSION_ID:
         target_id = str(uuid.uuid4())
-        logger.info(f'send_message [new cli session]: claude {target_id}')
+        logger.info(f'send_message [new cli session]: {target_agent} {target_id}')
 
     record = registry.bump_conversation(conversation_id, sender_agent, target_agent)
     hop = int(record.get('hops', 1))

@@ -23,13 +23,16 @@ STATE_ROOT = tempfile.mkdtemp(prefix='cross-agent-unit-')
 os.environ['CROSS_AGENT_HOME'] = STATE_ROOT + '/state'
 os.environ['CLAUDE_CONFIG_DIR'] = STATE_ROOT + '/claude'
 os.environ['CODEX_HOME'] = STATE_ROOT + '/codex'
+os.environ['GROK_HOME'] = STATE_ROOT + '/grok'
+# the names the editor keeps for Grok conversations are the user's own
+os.environ['CROSS_AGENT_GROK_NAMES_DB'] = STATE_ROOT + '/no-such-state.vscdb'
 
 # The bridge hands these to the turns it starts, and a suite run from inside such a turn - a
 # peer reviewing a branch through the bridge, say - inherits that conversation. The hop
 # counter comes with it, so `send_message` raises "reached the hop limit" and the run ends
 # partway through rather than reporting anything. The suite is not part of anyone's exchange.
 for _inherited in ('CROSS_AGENT_CONVERSATION_ID', 'CROSS_AGENT_HOP', 'CROSS_AGENT_SENDER',
-                   'CROSS_AGENT_BUSY', 'CROSS_AGENT_SELF_SESSION'):
+                   'CROSS_AGENT_BUSY', 'CROSS_AGENT_SELF_SESSION', 'GROK_SESSION_ID'):
     os.environ.pop(_inherited, None)
 # a strict bridge hands that setting on too, and most checks here send without a session_id
 os.environ.pop('CROSS_AGENT_REQUIRE_EXPLICIT_TARGET', None)
@@ -91,6 +94,7 @@ def test_the_suite_writes_nowhere_near_the_real_bridge() -> None:
         'bridge state': (config.HOME_DIR, STATE_ROOT + '/state/'),
         'claude store': (config.CLAUDE_HOME_DIR, STATE_ROOT + '/claude/'),
         'codex store': (config.CODEX_HOME_DIR, STATE_ROOT + '/codex/'),
+        'grok store': (config.GROK_HOME_DIR, STATE_ROOT + '/grok/'),
     }
     inherited = [name for name in (config.ENV_CONVERSATION_ID, config.ENV_HOP,
                                    config.ENV_SENDER, config.ENV_BUSY,
@@ -6228,6 +6232,853 @@ def test_a_last_resort_claude_panel_the_human_took_up_waits_and_joins() -> None:
         (uihook.send, uihook.await_turn) = originals
 
 
+# ------------------------------------------------------------------ Grok Build
+
+def test_a_grok_process_is_recognised_as_the_caller() -> None:
+    from cross_agent_mcp import caller
+    check('the grok binary is Grok',
+          caller.classify_process_name('/Users/dexter/.grok/bin/grok') == config.AGENT_GROK)
+    check('so is the file the install links it to',
+          caller.classify_process_name('/x/.grok/downloads/grok-macos-aarch64') == config.AGENT_GROK)
+    check('the other agents are still themselves',
+          caller.classify_process_name('/usr/local/bin/codex') == config.AGENT_CODEX
+          and caller.classify_process_name('/x/native-binary/claude') == config.AGENT_CLAUDE)
+    check('and an unrelated process is nobody',
+          caller.classify_process_name('/Applications/Visual Studio Code.app/Code') is None)
+
+
+def test_every_agent_is_named_by_the_tool_that_reaches_it() -> None:
+    check('the bridge lists three agents', set(config.AGENTS) == {'claude', 'codex', 'grok'},
+          str(config.AGENTS))
+    check('each is reached by send_to_<agent>',
+          [bridge.reach_tool(a) for a in config.AGENTS]
+          == ['send_to_claude', 'send_to_codex', 'send_to_grok'])
+    check('and something that is not an agent is not given a tool name',
+          bridge.reach_tool('unknown') == 'the cross-agent tool')
+
+    to_claude = bridge._build_envelope('grok', 'claude', 'conv_x', 1, 3, 'please review',
+                                       'sender-sid', request_id='req_1_aaaaaa')
+    check('a request from Grok tells Claude to answer Grok through send_to_grok',
+          'send_to_grok' in to_claude and 'from: Grok (peer AI agent' in to_claude,
+          to_claude[:400])
+    to_grok = bridge._build_envelope('claude', 'grok', 'conv_x', 1, 3, 'please review',
+                                     'sender-sid', request_id='req_1_aaaaaa')
+    check('and one from Claude to Grok points the other way',
+          'send_to_claude' in to_grok and 'send_to_grok' not in to_grok, to_grok[:400])
+
+    reply = bridge._build_reply_envelope('grok', 'codex', 'conv_x', 1, 3, 'done', 'grok-sid')
+    check('an answer from Grok invites a follow-up through send_to_grok',
+          'send_to_grok' in reply, reply[:500])
+
+    job = outbox.Job(target_agent='grok', target_session_id='g1', payload='p', run_cwd='/w',
+                     pin_cwd='/w', env={}, timeout=5, ui_shim=None, title='t',
+                     conversation_id='conv_x', hop=1, sender_agent='claude',
+                     sender_session_id='c1', wants_reply=True, summary='s',
+                     delivery_id='req_1_aaaaaa', kind=outbox.KIND_REQUEST)
+    job.error = 'no answer'
+    notice = bridge._build_notice_envelope(job, 2)
+    check('a failure notice tells the sender how to reach Grok again',
+          'send_to_grok' in notice and 'Grok' in notice, notice[:600])
+
+    check('a refused self-send names the tools that lead elsewhere, all of them',
+          bridge._tools_reaching_others('grok') == '`send_to_claude` or `send_to_codex`'
+          and bridge._tools_reaching_others('claude') == '`send_to_codex` or `send_to_grok`',
+          bridge._tools_reaching_others('grok'))
+
+
+def test_grok_state_is_protected_and_reaches_a_child() -> None:
+    check('a bridge state root inside Grok\'s home is refused',
+          config.is_protected_path(config.GROK_HOME_DIR)
+          and config.is_protected_path(config.GROK_SESSIONS_DIR + 'x/y'))
+    check('and Grok\'s home reaches the CLI the bridge starts, so both read one store',
+          'GROK_HOME' in config.CHILD_ENV_BASELINE)
+    for name in ('CROSS_AGENT_GROK_BIN', 'CROSS_AGENT_GROK_PERMISSION_MODE',
+                 'CROSS_AGENT_GROK_MODEL', 'CROSS_AGENT_REAL_GROK'):
+        check(f'{name} reaches a child, so a hop runs the bridge it was configured with',
+              name in config.CHILD_ENV_BRIDGE)
+
+    saved = os.environ.get('XAI_API_KEY')
+    os.environ['XAI_API_KEY'] = 'xai-secret'
+    try:
+        check('an xAI key is not handed to a peer, and the error says how to pass it',
+              'XAI_API_KEY' not in config.child_env()
+              and 'XAI_API_KEY' in bridge._auth_hint(config.child_env()))
+    finally:
+        if saved is None:
+            del os.environ['XAI_API_KEY']
+        else:
+            os.environ['XAI_API_KEY'] = saved
+
+
+def test_grok_is_found_where_its_installer_puts_it() -> None:
+    import shutil as shutil_module
+    originals = (shutil_module.which, config.GROK_HOME_DIR)
+    with tempfile.TemporaryDirectory(prefix='grok-bin-') as home:
+        os.makedirs(home + '/bin')
+        installed = home + '/bin/grok'
+        open(installed, 'w').write('#!/bin/sh\n')
+        os.chmod(installed, 0o755)
+        config.GROK_HOME_DIR = home + '/'
+        try:
+            shutil_module.which = lambda name: None
+            check('a PATH without grok falls back to the installer\'s directory',
+                  config._default_grok_bin() == installed, config._default_grok_bin())
+            shutil_module.which = lambda name: '/usr/local/bin/grok'
+            check('a PATH that has it is used as it always was',
+                  config._default_grok_bin() == 'grok')
+        finally:
+            shutil_module.which, config.GROK_HOME_DIR = originals
+
+
+def _grok_line(kind: str, at_ms: int, **update) -> str:
+    """One line of a session's updates.jsonl, shaped as Grok writes it."""
+    method = ('_x.ai/session/update' if kind in ('turn_completed', 'hook_execution', 'retry_state')
+              else 'session/update')
+    return json.dumps({
+        'timestamp': at_ms // 1000, 'method': method,
+        'params': {'sessionId': 's', 'update': {'sessionUpdate': kind, **update},
+                   '_meta': {'agentTimestampMs': at_ms}}})
+
+
+def _grok_say(text: str, at_ms: int) -> str:
+    return _grok_line('agent_message_chunk', at_ms, content={'type': 'text', 'text': text})
+
+
+def _grok_ask(text: str, at_ms: int) -> str:
+    return _grok_line('user_message_chunk', at_ms, content={'type': 'text', 'text': text})
+
+
+def test_a_grok_transcript_is_read_turn_by_turn() -> None:
+    base = 1_790_000_000_000
+    lines = [
+        _grok_ask('first question', base),
+        _grok_say('Let me look. ', base + 10),
+        _grok_line('tool_call', base + 20, toolCallId='t1', title='run_terminal_command'),
+        _grok_line('tool_call_update', base + 30, toolCallId='t1'),
+        _grok_say('The answer ', base + 40),
+        _grok_say('is 42.', base + 50),
+        _grok_line('turn_completed', base + 60, stop_reason='end_turn'),
+        _grok_line('hook_execution', base + 70, event_name='stop', runs=[]),
+        _grok_ask('second question', base + 1000),
+        _grok_say('Only narration, then a tool call. ', base + 1010),
+        _grok_line('tool_call', base + 1020, toolCallId='t2', title='run_terminal_command'),
+        _grok_line('turn_completed', base + 1030, stop_reason='end_turn'),
+        _grok_ask('third question, still being answered', base + 2000),
+        _grok_say('Working on', base + 2010),
+    ]
+    turns, is_working = discovery._grok_turns(lines)
+    check('a turn is what Grok said after its last tool call, not the narration before it',
+          turns[1]['text'] == 'The answer is 42.', str(turns))
+    check('a turn that never spoke after its tools falls back to all it said',
+          turns[0]['text'] == 'Only narration, then a tool call.', str(turns))
+    check('turns come newest first', len(turns) == 2 and turns[0]['written_at'] > turns[1]['written_at'])
+    check('the instant is the millisecond stamp, in seconds',
+          turns[1]['written_at'] == (base + 60) / 1000.0, str(turns[1]['written_at']))
+    check('a turn with no end yet is reported as still open, and is not an answer',
+          is_working is True and all('Working' not in t['text'] for t in turns))
+
+    # a tail that begins in the middle of a turn keeps that turn once its end is in view
+    mid_turn = [_grok_say('tail of an answer', base), _grok_line('turn_completed', base + 5)]
+    turns, is_working = discovery._grok_turns(mid_turn)
+    check('a tail starting inside a turn still yields the turn that ends in it',
+          [t['text'] for t in turns] == ['tail of an answer'] and is_working is False, str(turns))
+
+    # a prompt that arrives while one is open means the earlier turn never finished
+    abandoned = [_grok_ask('a', base), _grok_say('fragment', base + 1),
+                 _grok_ask('b', base + 2), _grok_say('real answer', base + 3),
+                 _grok_line('turn_completed', base + 4)]
+    turns, _ = discovery._grok_turns(abandoned)
+    check('a fragment of a turn that was superseded is not mistaken for an answer',
+          [t['text'] for t in turns] == ['real answer'], str(turns))
+
+    # whole seconds only: the end of that second, so an answer is never dated before its request
+    second_only = [json.dumps({'timestamp': 1_790_000_000, 'method': 'session/update',
+                               'params': {'sessionId': 's', 'update': {
+                                   'sessionUpdate': 'agent_message_chunk',
+                                   'content': {'type': 'text', 'text': 'x'}}}}),
+                   json.dumps({'timestamp': 1_790_000_000, 'method': '_x.ai/session/update',
+                               'params': {'sessionId': 's', 'update': {
+                                   'sessionUpdate': 'turn_completed'}}})]
+    turns, _ = discovery._grok_turns(second_only)
+    check('a stamp without milliseconds is read as the end of its second',
+          turns[0]['written_at'] == 1_790_000_000.999, str(turns))
+    check('garbage in the tail is skipped', discovery._grok_turns(['not json', '{}', '[]'])
+          == ([], False))
+
+
+def _write_grok_session(store: str, cwd: str, session_id: str, mtime: float, title: str = '',
+                        kind: str = 'headless', updates: list = None,
+                        is_manual: bool = False, folder: str = None) -> str:
+    """A session directory shaped as Grok keeps it: a folder per working directory."""
+    import urllib.parse
+    directory = f'{store}/{urllib.parse.quote(cwd, safe="")}/{folder or session_id}'
+    os.makedirs(directory, exist_ok=True)
+    summary = {'info': {'id': session_id, 'cwd': cwd}, 'session_kind': kind,
+               'generated_title': title, 'title_is_manual': is_manual}
+    with open(directory + '/summary.json', 'w', encoding='utf-8') as f:
+        json.dump(summary, f)
+    with open(directory + '/updates.jsonl', 'w', encoding='utf-8') as f:
+        f.write('\n'.join(updates or []) + ('\n' if updates else ''))
+    for name in ('summary.json', 'updates.jsonl'):
+        os.utime(f'{directory}/{name}', (mtime, mtime))
+    return directory
+
+
+class _GrokStore:
+    """A throwaway ~/.grok/sessions the discovery code is pointed at for one test."""
+
+    def __init__(self) -> None:
+        self.directory = tempfile.TemporaryDirectory(prefix='grok-store-')
+        self.path = self.directory.name
+
+    def __enter__(self) -> str:
+        self.original = (config.GROK_SESSIONS_DIR, config.GROK_NAMES_DBS)
+        config.GROK_SESSIONS_DIR = self.path + '/'
+        config.GROK_NAMES_DBS = ()
+        return self.path
+
+    def __exit__(self, *exc) -> None:
+        config.GROK_SESSIONS_DIR, config.GROK_NAMES_DBS = self.original
+        self.directory.cleanup()
+
+
+def test_grok_sessions_are_listed_by_directory_and_never_include_a_subagent() -> None:
+    now = time.time()
+    mine = '01a0f1b0-1d1f-7201-a5a1-45874bdb3ef4'
+    child = '01a0f1b0-1d1f-7201-a5a1-45874bdb3ef5'
+    other = '01a0f1b0-1d1f-7201-a5a1-45874bdb3ef6'
+    above = '01a0f1b0-1d1f-7201-a5a1-45874bdb3ef7'
+    with _GrokStore() as store:
+        _write_grok_session(store, '/w/project', mine, now - 60, 'the work')
+        _write_grok_session(store, '/w/project', child, now - 10, 'a subagent', kind='subagent')
+        _write_grok_session(store, '/w/other', other, now - 5, 'elsewhere')
+        _write_grok_session(store, '/w', above, now - 30, 'the parent directory')
+
+        found = discovery.list_sessions('grok', discovery.SCOPE_CWD, '/w/project')
+        check('a directory scope lists the sessions filed for that directory',
+              [s['session_id'] for s in found] == [mine], str([s['session_id'] for s in found]))
+        check('a subagent\'s conversation is not one to deliver into, however fresh',
+              discovery.find_session('grok', child) is None)
+        check('an unrelated directory is left out, and any-scope includes it',
+              other not in [s['session_id'] for s in found]
+              and other in [s['session_id'] for s in
+                            discovery.list_sessions('grok', discovery.SCOPE_ANY, '/w/project')])
+        check('a tree scope also finds the directory above',
+              {s['session_id'] for s in discovery.list_sessions(
+                  'grok', discovery.SCOPE_TREE, '/w/project')} == {mine, above})
+
+        info = discovery.find_session('grok', mine.upper())
+        check('an id is found whatever its case, and reported in the store\'s own',
+              info is not None and info['session_id'] == mine and info['agent'] == 'grok'
+              and info['cwd'] == '/w/project' and info['path'].endswith('/updates.jsonl'),
+              str(info))
+        check('a name that is not shaped like an id finds nothing as an id',
+              discovery.find_session('grok', '../*') is None
+              and discovery.find_session('grok', '*') is None)
+
+        active = discovery.find_active_session('grok', discovery.SCOPE_CWD, '/w/project')
+        check('the newest session in the directory is the active one',
+              active is not None and active['session_id'] == mine, str(active))
+
+    with _GrokStore() as store:
+        # a folder whose name and record disagree answers for a conversation nobody asked about
+        _write_grok_session(store, '/w/project', mine, now, 'liar', folder=other)
+        check('a folder that is not named for the session it holds is not believed',
+              discovery.find_session('grok', mine) is None
+              and discovery.find_session('grok', other) is None
+              and discovery.list_sessions('grok', discovery.SCOPE_ANY, '/w') == [])
+
+    with _GrokStore() as store:
+        # a path too long to encode as a folder name is recorded in `.cwd` inside it
+        import urllib.parse
+        _write_grok_session(store, '/w/project', mine, now, 'long path')
+        source = f'{store}/{urllib.parse.quote("/w/project", safe="")}'
+        hashed = store + '/deep-slug-1a2b3c'
+        os.rename(source, hashed)
+        open(hashed + '/.cwd', 'w').write('/w/project')
+        check('a folder named by slug and hash is placed by the `.cwd` file inside it',
+              [s['session_id'] for s in discovery.list_sessions(
+                  'grok', discovery.SCOPE_CWD, '/w/project')] == [mine])
+
+
+def _write_grok_names_db(path: str, names: dict, raw_value: str = None) -> None:
+    import sqlite3
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute('CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value BLOB)')
+        value = raw_value if raw_value is not None else json.dumps({
+            'grok.cliUpdateExtVersion': '1.0.4',
+            'grok.sessionMeta': {sid: {'customName': name} for sid, name in names.items()}})
+        connection.execute('INSERT OR REPLACE INTO ItemTable VALUES (?, ?)',
+                           (discovery.GROK_EXTENSION_STATE_KEY, value))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_a_grok_conversation_answers_to_the_name_the_editor_gave_it() -> None:
+    now = time.time()
+    tested = '01a0f1b0-1d1f-7201-a5a1-45874bdb3ef4'
+    plain = '01a0f1ab-a793-7101-b08e-b4ebf2662863'
+    with _GrokStore() as store, tempfile.TemporaryDirectory(prefix='grok-names-') as names_dir:
+        _write_grok_session(store, '/w/project', tested, now - 5, 'Generated title one')
+        _write_grok_session(store, '/w/project', plain, now - 50, 'Generated title two')
+        database = names_dir + '/state.vscdb'
+        _write_grok_names_db(database, {tested: 'grok-mcp-test'})
+        config.GROK_NAMES_DBS = (database,)
+
+        info = discovery.find_session('grok', tested)
+        check('a name the human gave the tab is the title, over the generated one',
+              info is not None and info['title'] == 'grok-mcp-test' and info['is_named'] is True,
+              str(info and (info['title'], info['is_named'])))
+        check('a conversation without one keeps the generated title, and is not "named"',
+              discovery.find_session('grok', plain)['title'] == 'Generated title two'
+              and discovery.find_session('grok', plain)['is_named'] is False)
+
+        found = discovery.find_session_by_name('grok', 'GROK-MCP-test')
+        check('the name finds the conversation, whatever its case',
+              found is not None and found['session_id'] == tested, str(found))
+        resolved = bridge._requested_session_id('grok', 'grok-mcp-test', '/w/project')
+        check('and the bridge resolves it to the session id, the panel\'s way in',
+              resolved == (tested, 'grok-mcp-test'), str(resolved))
+
+        # two tabs under one name is the ambiguity every agent refuses
+        _write_grok_names_db(database, {tested: 'twin', plain: 'twin'})
+        try:
+            discovery.find_session_by_name('grok', 'twin')
+            check('a name two conversations answer to is refused', False, 'nothing raised')
+        except discovery.AmbiguousSessionName:
+            check('a name two conversations answer to is refused', True)
+
+        # the database is somebody else's: whatever is wrong with it costs the names only
+        for label, value in (('unparseable', 'not json'), ('the wrong shape', '[1, 2]'),
+                             ('no names in it', '{"grok.sessionMeta": 5}')):
+            _write_grok_names_db(database, {}, raw_value=value)
+            check(f'a store that is {label} does not break discovery',
+                  discovery.find_session('grok', tested)['title'] == 'Generated title one')
+        config.GROK_NAMES_DBS = (names_dir + '/missing.vscdb', names_dir)
+        check('a missing file, or a directory where a file should be, does not either',
+              discovery.find_session('grok', tested)['title'] == 'Generated title one')
+
+        # grok's own /rename marks the title as manual
+        _write_grok_session(store, '/w/project', plain, now - 50, 'Renamed by hand',
+                            is_manual=True)
+        config.GROK_NAMES_DBS = ()
+        check('a title set with /rename counts as named',
+              discovery.find_session('grok', plain)['is_named'] is True)
+
+
+def test_a_grok_answer_is_read_from_its_transcript_by_the_token_it_echoed() -> None:
+    now = time.time()
+    session = '01a0f1b0-1d1f-7201-a5a1-45874bdb3ef4'
+    token = 'req_1790000000000_a1b2c3'
+    base = int((now - 30) * 1000)
+    with _GrokStore() as store:
+        _write_grok_session(store, '/w/project', session, now, 'talk', updates=[
+            _grok_ask('older question', base - 100_000),
+            _grok_say('older answer', base - 99_000),
+            _grok_line('turn_completed', base - 98_000),
+            _grok_ask('=== CROSS-AGENT BRIDGE MESSAGE === ' + token, base),
+            _grok_say('Looking into it. ', base + 1_000),
+            _grok_line('tool_call', base + 2_000, toolCallId='t'),
+            _grok_say(f'It is done.\n{token}', base + 3_000),
+            _grok_line('turn_completed', base + 4_000)])
+
+        progress = discovery.peer_progress('grok', session, after=now - 60, token=token)
+        check('the turn that echoes the request id is its answer',
+              progress['answer'] == f'It is done.\n{token}', str(progress))
+        check('and the peer is not reported as still working', progress['is_working'] is False)
+        check('the answer is dated from the transcript',
+              abs(progress['answered_at'] - (base + 4_000) / 1000.0) < 0.01)
+
+        other = discovery.peer_progress('grok', session, after=now - 60,
+                                        token='req_1790000000001_ffffff')
+        check('a turn that echoes a different id is shown as context and never as the answer',
+              other['answer'] is None and other['unmatched_turn'] is not None, str(other))
+        check('and the reader used by delivery recovery agrees',
+              bridge._transcript_answer('grok', session, now - 60, token)
+              == f'It is done.\n{token}')
+
+
+def _grok_cli(events: list, code: int = 0, stderr: str = ''):
+    """A stand-in for `bridge._run_cli` that answers as `grok --output-format streaming-json`."""
+    seen = {}
+
+    def fake_run(command, cwd, env, timeout):
+        seen['command'], seen['cwd'], seen['env'] = command, cwd, env
+        out = '\n'.join(json.dumps(e) if isinstance(e, dict) else e for e in events)
+        return __import__('subprocess').CompletedProcess(command, code, out, stderr)
+    return fake_run, seen
+
+
+def _grok_end(session_id: str, stop: str = 'end_turn', **extra) -> dict:
+    return {'type': 'end', 'stopReason': stop, 'sessionId': session_id,
+            'usage': {'input_tokens': 5}, 'total_cost_usd': 0.02, **extra}
+
+
+def test_grok_is_started_and_resumed_over_the_cli() -> None:
+    sid = 'a4f1c2d0-1111-4000-8000-000000000001'
+    originals = (bridge._run_cli, config.GROK_PERMISSION_MODE, config.GROK_MODEL,
+                 config.GROK_BIN)
+    config.GROK_BIN = 'grok'
+    config.GROK_PERMISSION_MODE = None
+    config.GROK_MODEL = None
+    try:
+        fake, seen = _grok_cli([{'type': 'text', 'data': 'PO'}, {'type': 'text', 'data': 'NG'},
+                                _grok_end(sid)])
+        bridge._run_cli = fake
+        result = bridge._call_grok('hello', sid, '/w', {}, 600, None, None, is_new_session=True)
+        command = seen['command']
+        check('an allocated id creates a session rather than resuming one',
+              command[command.index('--session-id') + 1] == sid and '--resume' not in command,
+              str(command))
+        check('the message is one argument, so a leading dash is not an option',
+              command[1] == '--single=hello' and '--verbatim' in command, str(command))
+        check('the output is the stream, in the directory the session lives in',
+              command[command.index('--output-format') + 1] == 'streaming-json'
+              and command[command.index('--cwd') + 1] == '/w' and seen['cwd'] == '/w')
+        check('the answer is the text put together, from the session it names',
+              result['reply'] == 'PONG' and result['session_id'] == sid
+              and result['is_new_session'] is True and result['cost_usd'] == 0.02
+              and result['usage'] == {'input_tokens': 5}, str(result))
+        check('no permission mode or model is passed unless one is configured',
+              '--permission-mode' not in command and '--model' not in command, str(command))
+        check('the child knows which session it is running as',
+              seen['env'].get(config.ENV_SELF_SESSION) == f'grok:{sid}', str(seen['env']))
+
+        bridge._call_grok('-rf is not an option', sid, '/w', {}, 600)
+        command = seen['command']
+        check('without the flag the same id resumes it',
+              command[command.index('--resume') + 1] == sid and '--session-id' not in command)
+        check('and a message that starts with a dash stays a message',
+              command[1] == '--single=-rf is not an option', str(command))
+
+        config.GROK_PERMISSION_MODE, config.GROK_MODEL = 'acceptEdits', 'grok-4.7'
+        bridge._call_grok('hello', sid, '/w', {}, 600)
+        command = seen['command']
+        check('a configured permission mode and model are passed through',
+              command[command.index('--permission-mode') + 1] == 'acceptEdits'
+              and command[command.index('--model') + 1] == 'grok-4.7', str(command))
+
+        # no id at all: the bridge gives it one
+        result = bridge._call_grok('hello', None, '/w', {}, 600)
+        check('a session started with no id is given one, and says so',
+              result['is_new_session'] is True
+              and '--session-id' in seen['command'], str(seen['command']))
+    finally:
+        (bridge._run_cli, config.GROK_PERMISSION_MODE, config.GROK_MODEL,
+         config.GROK_BIN) = originals
+
+
+def test_a_grok_answer_is_what_it_said_after_its_last_tool() -> None:
+    sid = 'a4f1c2d0-1111-4000-8000-000000000002'
+    original = bridge._run_cli
+    try:
+        bridge._run_cli, _ = _grok_cli([
+            {'type': 'thought', 'data': 'hmm'},
+            {'type': 'text', 'data': "I'll run the tests. "},
+            {'type': 'tool_call', 'toolCallId': 't'},
+            {'type': 'tool_call_update', 'toolCallId': 't'},
+            {'type': 'text', 'data': 'All '}, {'type': 'text', 'data': 'green.'},
+            _grok_end(sid)])
+        result = bridge._call_grok('run them', sid, '/w', {}, 600)
+        check('the narration before a tool call is not part of the answer',
+              result['reply'] == 'All green.', str(result))
+
+        bridge._run_cli, _ = _grok_cli([
+            {'type': 'text', 'data': 'Doing it.'}, {'type': 'tool_call', 'toolCallId': 't'},
+            _grok_end(sid)])
+        check('a turn that spoke only before its tools still returns what it said',
+              bridge._call_grok('do it', sid, '/w', {}, 600)['reply'] == 'Doing it.')
+
+        bridge._run_cli, _ = _grok_cli(['warning: something', '', '[1, 2]',
+                                        {'type': 'text', 'data': 'ok'}, _grok_end(sid)])
+        check('lines that are not events are skipped',
+              bridge._call_grok('x', sid, '/w', {}, 600)['reply'] == 'ok')
+    finally:
+        bridge._run_cli = original
+
+
+def test_a_grok_turn_that_did_not_finish_is_not_reported_as_an_answer() -> None:
+    sid = 'a4f1c2d0-1111-4000-8000-000000000003'
+    original = bridge._run_cli
+    try:
+        bridge._run_cli, _ = _grok_cli([
+            {'type': 'text', 'data': 'Let me write that file.'},
+            {'type': 'tool_call', 'toolCallId': 't'}, _grok_end(sid, 'cancelled')])
+        try:
+            bridge._call_grok('write it', sid, '/w', {}, 600)
+            check('a cancelled turn is a failure, not an answer', False, 'nothing raised')
+        except bridge.BridgeError as e:
+            check('a cancelled turn is a failure, not an answer', True)
+            check('and says why it happens and what to set',
+                  'needs approval' in str(e) and 'CROSS_AGENT_GROK_PERMISSION_MODE' in str(e),
+                  str(e))
+            check('and what it had said, so the caller can see how far it got',
+                  'Let me write that file.' in str(e), str(e))
+
+        bridge._run_cli, _ = _grok_cli([], code=1, stderr='session abc not found')
+        try:
+            bridge._call_grok('hello', sid, '/w', {}, 600)
+            check('a CLI that produced nothing is a failure', False, 'nothing raised')
+        except bridge.BridgeError as e:
+            check('a CLI that produced nothing is a failure, with what it printed',
+                  'no answer' in str(e) and 'session abc not found' in str(e), str(e))
+
+        bridge._run_cli, _ = _grok_cli([{'type': 'error', 'message': 'not logged in'}])
+        try:
+            bridge._call_grok('hello', sid, '/w', {}, 600)
+            check('an error event with no end is a failure', False, 'nothing raised')
+        except bridge.BridgeError as e:
+            check('an error event with no end is a failure, quoted',
+                  'not logged in' in str(e), str(e))
+
+        bridge._run_cli, _ = _grok_cli([_grok_end(sid, 'end_turn')])
+        try:
+            bridge._call_grok('hello', sid, '/w', {}, 600)
+            check('a finished turn that said nothing is not an answer', False, 'nothing raised')
+        except bridge.BridgeError:
+            check('a finished turn that said nothing is not an answer', True)
+    finally:
+        bridge._run_cli = original
+
+
+def test_a_grok_caller_is_the_session_its_host_says_it_is() -> None:
+    sid = '01A0F1B0-1D1F-7201-A5A1-45874BDB3EF4'
+    saved = os.environ.get(config.ENV_GROK_SESSION)
+    originals = (uihook_module().is_enabled, discovery.find_active_session)
+    uihook_module().is_enabled = lambda: False
+    discovery.find_active_session = lambda *a, **k: None
+    try:
+        os.environ[config.ENV_GROK_SESSION] = sid
+        check('the id Grok exports to its MCP servers is the Grok caller\'s own session',
+              bridge._own_session_id('grok') == sid.lower(), str(bridge._own_session_id('grok')))
+        check('it is nobody else\'s: a Claude started from a Grok shell inherits it',
+              bridge._own_session_id('claude') is None and bridge._own_session_id('codex') is None)
+
+        os.environ[config.ENV_GROK_SESSION] = '../../etc/passwd'
+        check('something that is not an id is not believed',
+              bridge._own_session_id('grok') is None)
+        os.environ.pop(config.ENV_GROK_SESSION)
+        check('and without it nothing is claimed', bridge._own_session_id('grok') is None)
+    finally:
+        uihook_module().is_enabled, discovery.find_active_session = originals
+        if saved is None:
+            os.environ.pop(config.ENV_GROK_SESSION, None)
+        else:
+            os.environ[config.ENV_GROK_SESSION] = saved
+
+
+def uihook_module():
+    from cross_agent_mcp import uihook
+    return uihook
+
+
+def _grok_panel_shim(with_session: str = None, has_conversation: bool = True):
+    """A Grok ACP shim with no process behind it, whose writes to the agent are recorded."""
+    from cross_agent_mcp.grok_shim import GrokAcpShim, GrokSession
+    shim = GrokAcpShim.__new__(GrokAcpShim)
+    shim.agent = config.AGENT_GROK
+    shim.cwd = '/w'
+    shim.sessions = {}
+    shim.pending_new = {}
+    shim.pending_prompts = {}
+    shim.pending_approvals = {}
+    shim.turns = {}
+    shim.state_lock = threading.Lock()
+    shim.stdin_lock = threading.Lock()
+    shim.stdout_lock = threading.Lock()
+    shim.argv = ['agent', 'stdio']
+    shim.real_binary = '/usr/bin/grok'
+    shim.log = _quiet_log()
+    shim.writes = []
+    shim.panel_lines = []
+    shim.write_to_child = lambda payload: shim.writes.append(json.loads(payload))
+    shim._write_to_client = lambda data: shim.panel_lines.append(json.loads(data))
+    if with_session:
+        shim.sessions[with_session] = GrokSession(with_session, '/w', has_conversation)
+    return shim
+
+
+GROK_SID = '01a0f1b0-1d1f-7201-a5a1-45874bdb3ef4'
+
+
+def _agent_says(shim, text: str, session_id: str = GROK_SID) -> None:
+    shim._observe_from_agent({'method': 'session/update', 'params': {
+        'sessionId': session_id, 'update': {'sessionUpdate': 'agent_message_chunk',
+                                            'content': {'type': 'text', 'text': text}}}})
+
+
+def _agent_uses_a_tool(shim, session_id: str = GROK_SID) -> None:
+    shim._observe_from_agent({'method': 'session/update', 'params': {
+        'sessionId': session_id, 'update': {'sessionUpdate': 'tool_call'}}})
+
+
+def test_the_grok_shim_only_sits_in_front_of_a_panel_session() -> None:
+    from cross_agent_mcp import grok_shim
+    check('the ACP session the extension drives is the one intercepted',
+          grok_shim.is_panel_invocation(['agent', 'stdio'])
+          and grok_shim.is_panel_invocation(['agent', '--reasoning-effort', 'low', 'stdio']))
+    check('everything else is passed through untouched',
+          not grok_shim.is_panel_invocation(['--version'])
+          and not grok_shim.is_panel_invocation(['update'])
+          and not grok_shim.is_panel_invocation(['agent', 'serve', '--bind', '127.0.0.1:1'])
+          and not grok_shim.is_panel_invocation(['agent', 'leader'])
+          and not grok_shim.is_panel_invocation(['agent', 'headless', 'stdio'])
+          and not grok_shim.is_panel_invocation([]))
+
+
+def test_the_grok_shim_learns_its_sessions_from_the_traffic() -> None:
+    shim = _grok_panel_shim()
+    shim._observe_from_client({'jsonrpc': '2.0', 'id': 2, 'method': 'session/new',
+                               'params': {'cwd': '/w/a', 'mcpServers': []}})
+    check('a session is not known until the agent has named it', shim.status()['sessions'] == [])
+    shim._observe_from_agent({'jsonrpc': '2.0', 'id': 2, 'result': {'sessionId': 'sid-a'}})
+    status = shim.status()
+    check('a new session is reported, in its directory, with no conversation yet',
+          [(s['session_id'], s['cwd'], s['has_conversation']) for s in status['sessions']]
+          == [('sid-a', '/w/a', False)], str(status['sessions']))
+    check('and one that is still empty is one the bridge may put a conversation in',
+          status['can_create_session'] is True)
+
+    shim._observe_from_client({'jsonrpc': '2.0', 'id': 3, 'method': 'session/load',
+                               'params': {'sessionId': 'sid-b', 'cwd': '/w/b'}})
+    check('a session the extension loaded already has a conversation',
+          [s['has_conversation'] for s in shim.status()['sessions'] if s['session_id'] == 'sid-b']
+          == [True])
+
+    shim._observe_from_client({'jsonrpc': '2.0', 'id': 4, 'method': 'session/prompt',
+                               'params': {'sessionId': 'sid-a', 'prompt': []}})
+    entry = next(s for s in shim.status()['sessions'] if s['session_id'] == 'sid-a')
+    check('the human\'s prompt makes the session busy, and dates their last activity',
+          entry['is_turn_active'] is True and entry['has_conversation'] is True
+          and entry['last_user_activity'] > 0, str(entry))
+    check('a session with a conversation in every tab is not offered for a new one',
+          shim.status()['can_create_session'] is False)
+
+    shim._observe_from_agent({'jsonrpc': '2.0', 'id': 4, 'result': {'stopReason': 'end_turn'}})
+    check('the answer to that prompt frees it again',
+          next(s for s in shim.status()['sessions']
+               if s['session_id'] == 'sid-a')['is_turn_active'] is False)
+
+    # typed ahead: the session is busy until the last prompt is answered
+    for request_id in (5, 6):
+        shim._observe_from_client({'jsonrpc': '2.0', 'id': request_id, 'method': 'session/prompt',
+                                   'params': {'sessionId': 'sid-a', 'prompt': []}})
+    shim._observe_from_agent({'jsonrpc': '2.0', 'id': 5, 'result': {'stopReason': 'end_turn'}})
+    check('a prompt typed ahead keeps the session busy after the first is answered',
+          shim.sessions['sid-a'].is_turn_active is True)
+    shim._observe_from_agent({'jsonrpc': '2.0', 'id': 6, 'result': {'stopReason': 'end_turn'}})
+    check('and it is free when the last is', shim.sessions['sid-a'].is_turn_active is False)
+
+    check('a message the shim cannot parse changes nothing',
+          shim._observe_from_agent({'method': 'session/update', 'params': 'not a dict'}) is True)
+
+
+def test_a_grok_panel_takes_a_bridged_message_and_gives_back_its_answer() -> None:
+    from cross_agent_mcp import uihook
+    shim = _grok_panel_shim(GROK_SID)
+    originals = (uihook.send, uihook.await_turn)
+    uihook.send = _deliver_through(shim)
+    try:
+        def await_turn(ui_shim, injection_id, timeout):
+            _agent_says(shim, 'Checking the diff. ')
+            _agent_uses_a_tool(shim)
+            _agent_says(shim, 'Looks ')
+            _agent_says(shim, 'correct.')
+            shim._observe_from_agent({'jsonrpc': '2.0', 'id': shim.writes[0]['id'],
+                                      'result': {'stopReason': 'end_turn'}})
+            return shim.await_turn(injection_id, timeout)
+
+        uihook.await_turn = await_turn
+        result = bridge._call_via_panel('review this', GROK_SID, {'socket': '/s'}, 600, '/w',
+                                        target_agent='grok')
+        request = shim.writes[0]
+        check('the message goes in as a prompt for that session, in a namespace of its own',
+              request['method'] == 'session/prompt'
+              and request['params']['sessionId'] == GROK_SID
+              and request['params']['prompt'] == [{'type': 'text', 'text': 'review this'}]
+              and str(request['id']).startswith('xagent-'), str(request))
+        shown = shim.panel_lines[0]['params']['update'] if shim.panel_lines else {}
+        check('the panel is shown what was asked, as the agent speaking: it discards the echo '
+              'of a user message, so a user bubble cannot be made from here',
+              shown.get('sessionUpdate') == 'agent_message_chunk'
+              and 'review this' in shown['content']['text']
+              and 'relayed by the cross-agent bridge' in shown['content']['text'],
+              str(shim.panel_lines))
+        check('the reply is what Grok said after its last tool call',
+              result['reply'] == 'Looks correct.' and result['session_id'] == GROK_SID,
+              str(result))
+        check('and the session is free afterwards',
+              shim.sessions[GROK_SID].is_turn_active is False
+              and shim.sessions[GROK_SID].injection is None)
+    finally:
+        (uihook.send, uihook.await_turn) = originals
+
+
+def test_a_bridged_turn_shows_in_the_panel_without_leaving_a_thinking_block_open() -> None:
+    shim = _grok_panel_shim(GROK_SID)
+    thought = {'method': 'session/update', 'params': {'sessionId': GROK_SID, 'update': {
+        'sessionUpdate': 'agent_thought_chunk', 'content': {'type': 'text', 'text': 'hmm'}}}}
+    check('while nothing is bridged, Grok\'s thoughts reach the panel as ever',
+          shim._observe_from_agent(thought) is True)
+
+    shim.inject('hi', GROK_SID, 5, accept_timeout=1)
+    check('a bridged turn\'s thoughts are held back: the panel would never close the block',
+          shim._observe_from_agent(thought) is False)
+    check('what Grok says, and the tools it uses, are not',
+          shim._observe_from_agent({'method': 'session/update', 'params': {
+              'sessionId': GROK_SID, 'update': {'sessionUpdate': 'agent_message_chunk',
+                                                'content': {'type': 'text', 'text': 'x'}}}}) is True
+          and shim._observe_from_agent({'method': 'session/update', 'params': {
+              'sessionId': GROK_SID, 'update': {'sessionUpdate': 'tool_call'}}}) is True)
+
+    shim._observe_from_client({'jsonrpc': '2.0', 'id': 12, 'method': 'session/prompt',
+                               'params': {'sessionId': GROK_SID, 'prompt': []}})
+    check('once the human has a turn of their own running, nothing is held back',
+          shim._observe_from_agent(thought) is True)
+
+    quoted = _grok_panel_shim(GROK_SID)
+    quoted.inject('see ```code``` and ````more````', GROK_SID, 5, accept_timeout=1)
+    text = quoted.panel_lines[0]['params']['update']['content']['text']
+    check('a message that contains a fence is quoted in a longer one',
+          '\n`````\nsee ```code``` and ````more````\n`````\n' in text, text)
+
+
+def test_the_answer_to_a_bridged_prompt_never_reaches_the_extension() -> None:
+    shim = _grok_panel_shim(GROK_SID)
+    result = shim.inject('hi', GROK_SID, 5, accept_timeout=2)
+    injected_id = shim.writes[0]['id']
+    check('the message is accepted and its turn is left running',
+          result.get('pending') is True and result.get('accepted') is True, str(result))
+    check('the shim asks for nothing the extension knows about',
+          isinstance(injected_id, str) and injected_id.startswith('xagent-'))
+
+    forwarded = shim._observe_from_agent({'jsonrpc': '2.0', 'id': injected_id,
+                                          'result': {'stopReason': 'end_turn'}})
+    check('the response to it is the shim\'s, and is not forwarded', forwarded is False)
+    check('while another request\'s response is', shim._observe_from_agent(
+        {'jsonrpc': '2.0', 'id': 7, 'result': {}}) is True)
+
+
+def test_a_grok_turn_that_was_stopped_is_reported_as_stopped() -> None:
+    shim = _grok_panel_shim(GROK_SID)
+    shim.inject('hi', GROK_SID, 5, accept_timeout=2)
+    _agent_says(shim, 'Starting to')
+    shim._observe_from_agent({'jsonrpc': '2.0', 'id': shim.writes[0]['id'],
+                              'result': {'stopReason': 'cancelled'}})
+    result = shim.await_turn(next(iter(shim.turns)), 1)
+    check('a turn the human stopped is an error, not the words it got as far as',
+          result.get('ok') is False and 'cancelled' in str(result.get('error')), str(result))
+
+    shim = _grok_panel_shim(GROK_SID)
+    shim.inject('hi', GROK_SID, 5, accept_timeout=2)
+    shim._observe_from_agent({'jsonrpc': '2.0', 'id': shim.writes[0]['id'],
+                              'error': {'code': -32000, 'message': 'model unavailable'}})
+    result = shim.await_turn(next(iter(shim.turns)), 1)
+    check('an error from the agent is carried back as one',
+          result.get('ok') is False and 'model unavailable' in str(result.get('error')),
+          str(result))
+
+
+def test_a_grok_panel_refuses_what_it_cannot_do_without_writing_anything() -> None:
+    shim = _grok_panel_shim(GROK_SID)
+    refusal = shim.inject('hi', 'some-other-session', 5, accept_timeout=2)
+    check('a session this panel does not drive is refused, naming the ones it does',
+          refusal.get('accepted') is False and GROK_SID in str(refusal.get('error')),
+          str(refusal))
+
+    refusal = shim.inject('fresh reviewer', None, 5, accept_timeout=2, create_new=True)
+    check('a conversation that already has history cannot be used for a new one, and the '
+          'refusal names it',
+          refusal.get('accepted') is False and GROK_SID in str(refusal.get('error'))
+          and 'cannot open a new conversation' in str(refusal.get('error')), str(refusal))
+    check('nothing was written to either', shim.writes == [] and shim.panel_lines == [])
+
+    empty = _grok_panel_shim(GROK_SID, has_conversation=False)
+    result = empty.inject('fresh reviewer', None, 5, accept_timeout=2, create_new=True)
+    check('an empty session is the one a new conversation goes into',
+          result.get('accepted') is True and result.get('wasCreated') is True, str(result))
+
+    nothing = _grok_panel_shim()
+    refusal = nothing.inject('hi', None, 5, accept_timeout=2)
+    check('a panel that has opened no session has nowhere to put a message',
+          refusal.get('accepted') is False, str(refusal))
+
+    busy = _grok_panel_shim(GROK_SID)
+    busy._observe_from_client({'jsonrpc': '2.0', 'id': 9, 'method': 'session/prompt',
+                               'params': {'sessionId': GROK_SID, 'prompt': []}})
+    busy._wait_for_idle = lambda session_id, deadline: False
+    refusal = busy.inject('hi', GROK_SID, 5, accept_timeout=1)
+    check('a session in the middle of the human\'s turn is busy, and nothing is written',
+          'busy with another turn' in str(refusal.get('error')) and busy.writes == [],
+          str(refusal))
+    check('which the bridge retries rather than reports as a failure',
+          any(signal in refusal['error'] for signal in bridge.PEER_BUSY_SIGNALS))
+
+    twice = _grok_panel_shim(GROK_SID)
+    twice.inject('one', GROK_SID, 5, accept_timeout=1)
+    second = twice.inject('two', GROK_SID, 5, accept_timeout=1)
+    check('a second bridged message waits its turn instead of sharing one',
+          second.get('accepted') is False and len(twice.writes) == 1, str(second))
+
+
+def test_a_grok_human_typing_during_a_bridged_turn_keeps_the_session_busy() -> None:
+    shim = _grok_panel_shim(GROK_SID)
+    shim.inject('bridged', GROK_SID, 5, accept_timeout=1)
+    injected_id = shim.writes[0]['id']
+    shim._observe_from_client({'jsonrpc': '2.0', 'id': 11, 'method': 'session/prompt',
+                               'params': {'sessionId': GROK_SID, 'prompt': []}})
+    shim._observe_from_agent({'jsonrpc': '2.0', 'id': injected_id, 'result': {}})
+    check('the bridged turn ending does not free a session the human has queued a prompt in',
+          shim.sessions[GROK_SID].is_turn_active is True)
+    shim._observe_from_agent({'jsonrpc': '2.0', 'id': 11, 'result': {}})
+    check('it is free once theirs is answered too', shim.sessions[GROK_SID].is_turn_active is False)
+
+
+def test_a_grok_panel_says_when_a_turn_is_waiting_for_a_click() -> None:
+    shim = _grok_panel_shim(GROK_SID)
+    shim.inject('run the tests', GROK_SID, 5, accept_timeout=1)
+    shim._observe_from_agent({'jsonrpc': '2.0', 'id': 40, 'method': 'session/request_permission',
+                              'params': {'sessionId': GROK_SID,
+                                         'toolCall': {'title': 'run_terminal_command'}}})
+    approval = shim.status()['sessions'][0]['awaiting_approval']
+    check('a permission prompt the agent has put to the human is reported, with what it is for',
+          approval is not None and approval['tool'] == 'run_terminal_command', str(approval))
+    shim._observe_from_client({'jsonrpc': '2.0', 'id': 40, 'result': {
+        'outcome': {'outcome': 'selected', 'optionId': 'allow'}}})
+    check('and cleared when the human answers it',
+          shim.status()['sessions'][0]['awaiting_approval'] is None)
+
+
+def test_grok_is_treated_as_a_panel_of_one_conversation() -> None:
+    """A Grok panel drives the session it was started for, as a Claude one does: with nothing
+    named it must not be sent to open a new conversation and left to hand the message to
+    whichever one happens to be newest."""
+    from cross_agent_mcp import uihook
+    seen = {}
+
+    def send(text, ui_shim, session_id, timeout, cwd=None, title=None, accept_timeout=None,
+             create_new=False):
+        seen['create_new'] = create_new
+        return {'ok': True, 'reply': 'r', 'sessionId': 'sid-1', 'accepted': True,
+                'wasCreated': create_new}
+
+    originals = (uihook.send, bridge._live_session_ids)
+    uihook.send = send
+    bridge._live_session_ids = lambda agent: set()
+    try:
+        bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w', target_agent='grok')
+        check('no session named: a Grok panel is not asked to open a new conversation',
+              seen['create_new'] is False, str(seen))
+        bridge._call_via_panel('hi', None, {'socket': '/s'}, 600, '/w', target_agent='codex')
+        check('while a Codex panel still is, as before', seen['create_new'] is True, str(seen))
+    finally:
+        (uihook.send, bridge._live_session_ids) = originals
+    check('a session the bridge chooses the id of is one Claude and Grok have',
+          set(bridge.PREASSIGNS_SESSION_ID) == {'claude', 'grok'})
+
+
 def test_a_cli_turn_that_ran_quickly_is_not_reported_as_undelivered() -> None:
     """A CLI delivery is never `accepted` - only a panel says so - so a turn that finished inside
     the early-failure window looked exactly like one that failed inside it. Grok answers in
@@ -6413,6 +7264,28 @@ def run_all() -> None:
     test_a_conversation_started_while_the_message_waited_is_not_joined()
     test_a_panel_chosen_because_nothing_existed_is_told_to_open_one()
     test_a_last_resort_claude_panel_the_human_took_up_waits_and_joins()
+    test_a_grok_process_is_recognised_as_the_caller()
+    test_every_agent_is_named_by_the_tool_that_reaches_it()
+    test_grok_state_is_protected_and_reaches_a_child()
+    test_grok_is_found_where_its_installer_puts_it()
+    test_a_grok_transcript_is_read_turn_by_turn()
+    test_grok_sessions_are_listed_by_directory_and_never_include_a_subagent()
+    test_a_grok_conversation_answers_to_the_name_the_editor_gave_it()
+    test_a_grok_answer_is_read_from_its_transcript_by_the_token_it_echoed()
+    test_grok_is_started_and_resumed_over_the_cli()
+    test_a_grok_answer_is_what_it_said_after_its_last_tool()
+    test_a_grok_turn_that_did_not_finish_is_not_reported_as_an_answer()
+    test_a_grok_caller_is_the_session_its_host_says_it_is()
+    test_the_grok_shim_only_sits_in_front_of_a_panel_session()
+    test_the_grok_shim_learns_its_sessions_from_the_traffic()
+    test_a_grok_panel_takes_a_bridged_message_and_gives_back_its_answer()
+    test_a_bridged_turn_shows_in_the_panel_without_leaving_a_thinking_block_open()
+    test_the_answer_to_a_bridged_prompt_never_reaches_the_extension()
+    test_a_grok_turn_that_was_stopped_is_reported_as_stopped()
+    test_a_grok_panel_refuses_what_it_cannot_do_without_writing_anything()
+    test_a_grok_human_typing_during_a_bridged_turn_keeps_the_session_busy()
+    test_a_grok_panel_says_when_a_turn_is_waiting_for_a_click()
+    test_grok_is_treated_as_a_panel_of_one_conversation()
     test_a_cli_turn_that_ran_quickly_is_not_reported_as_undelivered()
 
 if __name__ == '__main__':

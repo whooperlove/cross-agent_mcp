@@ -7,6 +7,7 @@ without touching the code.
 
 import contextlib
 import os
+import shutil
 import stat
 import urllib.parse
 from typing import IO, Optional
@@ -60,10 +61,38 @@ CLAUDE_PROJECTS_DIR: str = CLAUDE_HOME_DIR + 'projects/'
 CODEX_HOME_DIR: str = os.path.expanduser(get_env_str('CODEX_HOME', '~/.codex')) + '/'
 CODEX_SESSIONS_DIR: str = CODEX_HOME_DIR + 'sessions/'
 CODEX_SESSION_INDEX_PATH: str = CODEX_HOME_DIR + 'session_index.jsonl'
+GROK_HOME_DIR: str = os.path.expanduser(get_env_str('GROK_HOME', '~/.grok')) + '/'
+GROK_SESSIONS_DIR: str = GROK_HOME_DIR + 'sessions/'
+
+# Where the Grok VS Code extension keeps the names a human gives its conversations. Grok's own
+# summary.json never sees them - the extension stores them in the editor's key-value database -
+# so this is the only place "grok-mcp-test" exists. Read-only and optional: a missing or
+# unreadable file only means names do not resolve, and sessions are still reached by id.
+# CROSS_AGENT_GROK_NAMES_DB replaces the default locations; several are separated by `:`.
+_GROK_NAMES_DB_OVERRIDE: Optional[str] = get_env_optional('CROSS_AGENT_GROK_NAMES_DB')
+GROK_NAMES_DBS: tuple = tuple(os.path.expanduser(path) for path in (
+    _GROK_NAMES_DB_OVERRIDE.split(os.pathsep) if _GROK_NAMES_DB_OVERRIDE else
+    ('~/Library/Application Support/Code/User/globalStorage/state.vscdb',
+     '~/.config/Code/User/globalStorage/state.vscdb')))
+
+
+def _default_grok_bin() -> str:
+    """`grok` when the PATH has it, else where its installer puts it.
+
+    An editor started from the Dock does not read a shell profile, and Grok's installer only
+    adds `~/.grok/bin` to one - so the bridge would report "CLI not found" for a binary that
+    sits in the directory it already knows as Grok's home.
+    """
+    installed = GROK_HOME_DIR + 'bin/grok'
+    if shutil.which('grok') is None and os.access(installed, os.X_OK):
+        return installed
+    return 'grok'
+
 
 # CLI entry points
 CLAUDE_BIN: str = get_env_str('CROSS_AGENT_CLAUDE_BIN', 'claude')
 CODEX_BIN: str = get_env_str('CROSS_AGENT_CODEX_BIN', 'codex')
+GROK_BIN: str = get_env_str('CROSS_AGENT_GROK_BIN', _default_grok_bin())
 
 # a session whose transcript has not been touched for longer than this is not "active"
 ACTIVE_WINDOW_MINUTES: int = get_env_int('CROSS_AGENT_ACTIVE_WINDOW_MIN', 240)
@@ -100,6 +129,10 @@ CODEX_SANDBOX: str = get_env_str('CROSS_AGENT_CODEX_SANDBOX', 'read-only')
 CODEX_MODEL: Optional[str] = get_env_optional('CROSS_AGENT_CODEX_MODEL')
 CLAUDE_PERMISSION_MODE: Optional[str] = get_env_optional('CROSS_AGENT_CLAUDE_PERMISSION_MODE')
 CLAUDE_MODEL: Optional[str] = get_env_optional('CROSS_AGENT_CLAUDE_MODEL')
+# Grok's `--permission-mode` covers the same ground as Claude's: with none set, a headless turn
+# cancels the first tool call that would need an approval nobody is there to give.
+GROK_PERMISSION_MODE: Optional[str] = get_env_optional('CROSS_AGENT_GROK_PERMISSION_MODE')
+GROK_MODEL: Optional[str] = get_env_optional('CROSS_AGENT_GROK_MODEL')
 
 # safety valve on how many rollout files a Codex scan opens; only the first line of each is
 # read, and the scan stops early once enough matching sessions are found
@@ -114,9 +147,13 @@ ENV_SENDER: str = 'CROSS_AGENT_SENDER'
 # that session when it started the turn, so the server inside can say who it is exactly
 # instead of guessing from whatever was last active in its directory.
 ENV_SELF_SESSION: str = 'CROSS_AGENT_SELF_SESSION'
+# Grok's own name for it: set on every MCP server it starts, one server per session.
+ENV_GROK_SESSION: str = 'GROK_SESSION_ID'
 
 AGENT_CLAUDE: str = 'claude'
 AGENT_CODEX: str = 'codex'
+AGENT_GROK: str = 'grok'
+AGENTS: tuple = (AGENT_CLAUDE, AGENT_CODEX, AGENT_GROK)
 
 
 # Everything the bridge writes is owner-only. The state tree names the sessions being
@@ -141,7 +178,8 @@ _is_repaired: bool = False
 #               past rather than into.
 _PROTECTED_EXACTLY = {os.path.realpath(p) for p in ('/', os.path.expanduser('~'))}
 _PROTECTED_TREES = {os.path.realpath(p) for p in (
-    CLAUDE_HOME_DIR, CLAUDE_PROJECTS_DIR, CODEX_HOME_DIR, CODEX_SESSIONS_DIR)}
+    CLAUDE_HOME_DIR, CLAUDE_PROJECTS_DIR, CODEX_HOME_DIR, CODEX_SESSIONS_DIR,
+    GROK_HOME_DIR, GROK_SESSIONS_DIR)}
 _PROTECTED_ROOTS = _PROTECTED_EXACTLY | _PROTECTED_TREES
 
 
@@ -296,9 +334,9 @@ CHILD_ENV_BASELINE: tuple = (
     # macOS: the Security framework reads the login keychain through HOME, and Core Foundation
     # warns on every process start without this one
     '__CF_USER_TEXT_ENCODING',
-    # which session store each CLI reads - the bridge resolves sessions in these same two, so
+    # which session store each CLI reads - the bridge resolves sessions in these same three, so
     # a child pointed at a different one would resume a session nobody here can see
-    'CLAUDE_CONFIG_DIR', 'CODEX_HOME',
+    'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GROK_HOME',
 )
 
 # The bridge's own settings, so an agent it spawned runs a bridge configured exactly like
@@ -308,13 +346,14 @@ CHILD_ENV_BASELINE: tuple = (
 # these is a path, a number, a mode or a binary name, and none is a credential.
 CHILD_ENV_BRIDGE: tuple = (
     'CROSS_AGENT_HOME', 'CROSS_AGENT_DEBUG', 'CROSS_AGENT_DELIVERY_TTL',
-    'CROSS_AGENT_CLAUDE_BIN', 'CROSS_AGENT_CODEX_BIN',
-    'CROSS_AGENT_REAL_CLAUDE', 'CROSS_AGENT_REAL_CODEX',
+    'CROSS_AGENT_CLAUDE_BIN', 'CROSS_AGENT_CODEX_BIN', 'CROSS_AGENT_GROK_BIN',
+    'CROSS_AGENT_REAL_CLAUDE', 'CROSS_AGENT_REAL_CODEX', 'CROSS_AGENT_REAL_GROK',
     'CROSS_AGENT_ACTIVE_WINDOW_MIN', 'CROSS_AGENT_MAX_HOPS', 'CROSS_AGENT_TIMEOUT',
     'CROSS_AGENT_PANEL_PATIENCE', 'CROSS_AGENT_SCOPE', 'CROSS_AGENT_UI_HOOK',
     'CROSS_AGENT_REQUIRE_EXPLICIT_TARGET',
     'CROSS_AGENT_CODEX_SANDBOX', 'CROSS_AGENT_CODEX_MODEL', 'CROSS_AGENT_CODEX_SCAN_LIMIT',
     'CROSS_AGENT_CLAUDE_PERMISSION_MODE', 'CROSS_AGENT_CLAUDE_MODEL',
+    'CROSS_AGENT_GROK_PERMISSION_MODE', 'CROSS_AGENT_GROK_MODEL', 'CROSS_AGENT_GROK_NAMES_DB',
     # so the opt-in survives another hop, rather than a grandchild losing it silently
     'CROSS_AGENT_CHILD_ENV',
     # CROSS_AGENT_SELF is deliberately absent: it forces which agent the caller is taken to

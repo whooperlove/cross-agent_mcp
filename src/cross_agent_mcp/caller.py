@@ -1,7 +1,7 @@
 """Detect which agent launched this MCP server.
 
 A stdio MCP server is spawned as a child process of its client, so walking the parent
-chain tells us whether we are running under Claude Code or under Codex. That is what
+chain tells us whether we are running under Claude Code, Codex or Grok Build. That is what
 lets the bridge refuse a self-directed send (`send_to_claude` called from Claude).
 """
 
@@ -54,6 +54,8 @@ def classify_process_name(name: str) -> Optional[str]:
         return config.AGENT_CODEX
     if 'claude' in base:
         return config.AGENT_CLAUDE
+    if 'grok' in base:
+        return config.AGENT_GROK
     return None
 
 

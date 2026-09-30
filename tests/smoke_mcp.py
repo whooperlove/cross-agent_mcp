@@ -21,12 +21,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) +
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# set before the import: config reads all three at import time
+# set before the import: config reads all four at import time
 STATE_DIR = tempfile.mkdtemp(prefix='cross-agent-smoke-')
 os.environ['CROSS_AGENT_HOME'] = STATE_DIR + '/bridge'
 os.environ['CLAUDE_CONFIG_DIR'] = STATE_DIR + '/claude'
 os.environ['CODEX_HOME'] = STATE_DIR + '/codex'
-for _empty in ('/claude/projects', '/codex/sessions'):
+os.environ['GROK_HOME'] = STATE_DIR + '/grok'
+# the editor's name store is the user's own; the run must not read it either
+os.environ['CROSS_AGENT_GROK_NAMES_DB'] = STATE_DIR + '/no-such-state.vscdb'
+for _empty in ('/claude/projects', '/codex/sessions', '/grok/sessions'):
     os.makedirs(STATE_DIR + _empty, exist_ok=True)
 
 from cross_agent_mcp import config, registry  # noqa: E402
@@ -143,8 +146,8 @@ async def main() -> int:
             names = [t.name for t in tools.tools]
             print(f'[ok] tools/list -> {names}')
 
-            expected = {'send_to_codex', 'send_to_claude', 'list_agent_sessions',
-                        'bridge_status', 'pin_agent_session'}
+            expected = {'send_to_codex', 'send_to_claude', 'send_to_grok',
+                        'list_agent_sessions', 'bridge_status', 'pin_agent_session'}
             missing = expected - set(names)
             if missing:
                 print(f'[FAIL] missing tools: {missing}')
@@ -158,9 +161,9 @@ async def main() -> int:
                 print(f'       resolved {agent}: {label}')
 
             listing = json.loads(_text_of(await session.call_tool(
-                'list_agent_sessions', {'agent': 'both', 'scope': 'cwd'})))
+                'list_agent_sessions', {'agent': 'all', 'scope': 'cwd'})))
             print(f'[ok] list_agent_sessions -> claude={len(listing["claude"])} '
-                  f'codex={len(listing["codex"])}')
+                  f'codex={len(listing["codex"])} grok={len(listing["grok"])}')
 
             # the hop check runs before the target is resolved, so nothing is ever addressed
             conversation_id = 'conv_smoke_hop_guard'
@@ -188,7 +191,7 @@ async def main() -> int:
             # is covered without any turn by unit_guards.test_a_busy_session_is_waited_out.
 
     # both identities: under ambient detection exactly one of these was a real send
-    for agent in ('claude', 'codex'):
+    for agent in ('claude', 'codex', 'grok'):
         if await _refuses_its_own_agent(agent):
             return 1
 
@@ -199,8 +202,8 @@ async def main() -> int:
         async with ClientSession(read, write) as session:
             await session.initialize()
             listing = json.loads(_text_of(await session.call_tool(
-                'list_agent_sessions', {'agent': 'both', 'scope': 'any'})))
-    if listing['claude'] or listing['codex']:
+                'list_agent_sessions', {'agent': 'all', 'scope': 'any'})))
+    if listing['claude'] or listing['codex'] or listing['grok']:
         print(f'[FAIL] the isolated stores were not empty: {listing}')
         return 1
     print('[ok] ambient identity sees no real session to reach for')
@@ -217,11 +220,12 @@ async def main() -> int:
     for label, path, wanted in (
             ('bridge', config.HOME_DIR, STATE_DIR + '/bridge'),
             ('claude', config.CLAUDE_PROJECTS_DIR, STATE_DIR + '/claude/projects'),
-            ('codex', config.CODEX_SESSIONS_DIR, STATE_DIR + '/codex/sessions')):
+            ('codex', config.CODEX_SESSIONS_DIR, STATE_DIR + '/codex/sessions'),
+            ('grok', config.GROK_SESSIONS_DIR, STATE_DIR + '/grok/sessions')):
         if os.path.realpath(path) != os.path.realpath(wanted):
             print(f'[FAIL] the {label} store was not the isolated one: {path}')
             return 1
-    print(f'[ok] bridge, claude and codex state were all the ones under {STATE_DIR}')
+    print(f'[ok] bridge, claude, codex and grok state were all the ones under {STATE_DIR}')
 
     print('\nALL CHECKS PASSED')
     return 0

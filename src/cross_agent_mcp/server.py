@@ -1,7 +1,8 @@
-"""MCP server exposing the Claude Code ↔ Codex bridge.
+"""MCP server exposing the Claude Code ↔ Codex ↔ Grok Build bridge.
 
-Register the same server on both sides: Claude then reaches the live Codex thread with
-`send_to_codex`, and Codex reaches the live Claude session with `send_to_claude`.
+Register the same server on every side: Claude then reaches the live Codex thread with
+`send_to_codex`, Codex reaches the live Claude session with `send_to_claude`, and either of
+them reaches a Grok Build session with `send_to_grok`.
 """
 
 import asyncio
@@ -22,9 +23,10 @@ from . import bridge, caller, config, discovery, outbox, panel, registry, uihook
 logger = logging.getLogger('cross_agent_mcp')
 
 SERVER_INSTRUCTIONS = (
-    'Bridge between the two coding agents running in this editor. '
+    'Bridge between the coding agents running in this editor. '
     '`send_to_codex` resumes the live Codex thread; `send_to_claude` resumes the live '
-    'Claude Code session. Both keep the peer\'s existing conversation context. '
+    'Claude Code session; `send_to_grok` resumes a Grok Build session. Each keeps the '
+    'peer\'s existing conversation context. '
     'When no active peer session exists, a fresh one is created automatically. '
     'Sending is asynchronous: the tool returns as soon as the message is queued and never '
     'carries the peer\'s answer. If this session is open in an editor panel when the peer '
@@ -33,7 +35,7 @@ SERVER_INSTRUCTIONS = (
     'receipt says which is likely (return_panel_available_now). Either way: send it, say you '
     'sent it, and carry on - never wait for it or guess what it will say. `bridge_status` '
     'shows deliveries still in flight. '
-    'Calls are capped by a hop budget so the two agents cannot ping-pong forever.'
+    'Calls are capped by a hop budget so the agents cannot ping-pong forever.'
 )
 if config.REQUIRE_EXPLICIT_TARGET:
     SERVER_INSTRUCTIONS += (
@@ -229,29 +231,82 @@ async def send_to_claude(
 
 
 @server.tool(
-    name='list_agent_sessions',
-    title='List discoverable Claude and Codex sessions',
+    name='send_to_grok',
+    title='Send a message to a Grok Build session',
     description=(
-        'Show the Claude Code sessions and Codex threads the bridge can reach, newest first, '
-        'together with how long ago each was touched and whether it counts as active.'
+        'Send a message to the Grok Build session the user is currently working in. The Grok '
+        'session keeps its full conversation context. If no active Grok session exists for '
+        'this working directory, a new one is created and reused for later calls. Use this to '
+        'ask Grok for a review, a second opinion, a verification pass, or to hand it a task. '
+        'ASYNCHRONOUS: this returns as soon as the message is queued and NEVER contains '
+        'Grok\'s answer. Grok answers on its own schedule - minutes is normal. If this '
+        'session is open in an editor panel when it does, the answer is delivered here as a '
+        'separate message; if it is not, the answer is not delivered at all and you read it '
+        'with bridge_status(delivery_id=...) - the receipt says which is likely (return_panel_available_now). '
+        'So: send, tell the user it was sent, and continue. Do not wait for the answer, do '
+        'not poll for it, and never write what you think Grok will say.'
+    ),
+)
+async def send_to_grok(
+    message: str,
+    session_id: Optional[str] = None,
+    new_session: bool = False,
+    scope: Optional[str] = None,
+    cwd: Optional[str] = None,
+    timeout: Optional[int] = None,
+    conversation_id: Optional[str] = None,
+    raw: bool = False,
+    allow_same_agent: bool = False,
+    ctx: Optional[Context] = None,
+) -> Dict[str, Any]:
+    """Args:
+    message: What to ask Grok. Be self-contained; Grok cannot see this conversation.
+    session_id: Target a specific Grok session - its id, or the conversation name shown in
+        the editor. Fails loudly rather than creating a new session when nothing matches.
+        Required under CROSS_AGENT_REQUIRE_EXPLICIT_TARGET unless new_session is set.
+    new_session: Force a brand new Grok session even when an active one exists.
+    scope: 'cwd' (default) = same directory or below, 'tree' = also parent directories,
+        'any' = every recorded session.
+    cwd: Working directory used for discovery and for a newly created session.
+    timeout: Budget for the Grok turn itself, applied by the background worker. It does not
+        make this call wait, so a small value only aborts work that would have finished -
+        anything below the configured default is raised to it and the result says so.
+    conversation_id: Continue an existing bridge conversation (shares the hop budget).
+    raw: Send the message verbatim, without the bridge envelope.
+    allow_same_agent: Allow a Grok session to message another Grok session.
+    """
+    return await _send(
+        config.AGENT_GROK, ctx, message=message, session_id=session_id,
+        is_new_session=new_session, scope=scope, cwd=cwd, timeout=timeout,
+        conversation_id=conversation_id, is_raw=raw, allows_same_agent=allow_same_agent,
+    )
+
+
+@server.tool(
+    name='list_agent_sessions',
+    title='List discoverable Claude, Codex and Grok sessions',
+    description=(
+        'Show the Claude Code sessions, Codex threads and Grok Build sessions the bridge can '
+        'reach, newest first, together with how long ago each was touched and whether it '
+        'counts as active.'
     ),
 )
 async def list_agent_sessions(
-    agent: str = 'both',
+    agent: str = 'all',
     scope: Optional[str] = None,
     cwd: Optional[str] = None,
     limit: int = 10,
 ) -> Dict[str, Any]:
     """Args:
-    agent: 'claude', 'codex' or 'both'.
+    agent: 'claude', 'codex', 'grok', 'both' (Claude and Codex) or 'all' (all three).
     scope: 'cwd' (default), 'tree' or 'any'.
     cwd: Working directory to scope the lookup to.
     limit: Maximum number of sessions per agent.
     """
     scope = scope or config.DEFAULT_SCOPE
     target_cwd = os.path.realpath(os.path.expanduser(cwd)) if cwd else os.getcwd()
-    agents: List[str] = ([config.AGENT_CLAUDE, config.AGENT_CODEX]
-                         if agent == 'both' else [agent])
+    agents: List[str] = ([config.AGENT_CLAUDE, config.AGENT_CODEX] if agent == 'both'
+                         else list(config.AGENTS) if agent == 'all' else [agent])
 
     result: Dict[str, Any] = {
         'ok': True,
@@ -309,7 +364,7 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
 
     identity = await _run_blocking(caller.detect_caller)
     resolved: Dict[str, Any] = {}
-    for name in (config.AGENT_CLAUDE, config.AGENT_CODEX):
+    for name in config.AGENTS:
         try:
             resolved[name] = await _run_blocking(
                 discovery.find_active_session, name, scope, target_cwd, None)
@@ -329,7 +384,7 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
         }
 
     panels: Dict[str, Any] = {}
-    for name in (config.AGENT_CLAUDE, config.AGENT_CODEX):
+    for name in config.AGENTS:
         sessions = (await _run_blocking(uihook.find_live_sessions, name)
                     if uihook.is_enabled() else [])
         foreign = (await _run_blocking(uihook.find_foreign_sessions, name)
@@ -370,8 +425,10 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
             'require_explicit_target': config.REQUIRE_EXPLICIT_TARGET,
             'codex_sandbox_for_new_sessions': config.CODEX_SANDBOX,
             'claude_permission_mode': config.CLAUDE_PERMISSION_MODE,
+            'grok_permission_mode': config.GROK_PERMISSION_MODE,
             'claude_bin': config.CLAUDE_BIN,
             'codex_bin': config.CODEX_BIN,
+            'grok_bin': config.GROK_BIN,
             'home_dir': config.HOME_DIR,
         },
         'inherited_chain': {
@@ -418,12 +475,12 @@ async def pin_agent_session(
     cwd: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Args:
-    agent: 'claude' or 'codex'.
+    agent: 'claude', 'codex' or 'grok'.
     session_id: Session/thread id - or the conversation name - to pin. Empty removes the pin.
     cwd: Working directory the pin applies to.
     """
-    if agent not in (config.AGENT_CLAUDE, config.AGENT_CODEX):
-        return {'ok': False, 'error': f"agent must be 'claude' or 'codex', got: {agent}"}
+    if agent not in config.AGENTS:
+        return {'ok': False, 'error': f"agent must be 'claude', 'codex' or 'grok', got: {agent}"}
 
     target_cwd = os.path.realpath(os.path.expanduser(cwd)) if cwd else os.getcwd()
 
@@ -461,13 +518,15 @@ def run_check() -> int:
     print(f'  running under  : {identity["agent"]}')
     print(f'  claude bin     : {shutil.which(config.CLAUDE_BIN) or "NOT FOUND: " + config.CLAUDE_BIN}')
     print(f'  codex bin      : {shutil.which(config.CODEX_BIN) or "NOT FOUND: " + config.CODEX_BIN}')
+    print(f'  grok bin       : {shutil.which(config.GROK_BIN) or "NOT FOUND: " + config.GROK_BIN}')
     print(f'  scope          : {scope} (active window {config.ACTIVE_WINDOW_MINUTES} min)')
     print(f'  max hops       : {config.MAX_HOPS}, timeout {config.SEND_TIMEOUT_SECONDS}s')
     print(f'  new codex sandbox      : {config.CODEX_SANDBOX}')
     print(f'  claude permission mode : {config.CLAUDE_PERMISSION_MODE or "(agent default)"}')
+    print(f'  grok permission mode   : {config.GROK_PERMISSION_MODE or "(agent default)"}')
     print(f'  state dir      : {config.HOME_DIR}')
 
-    for agent in (config.AGENT_CLAUDE, config.AGENT_CODEX):
+    for agent in config.AGENTS:
         resolved = discovery.find_active_session(agent, scope, cwd)
         if resolved:
             print(f'\n  active {agent}: {resolved["session_id"]}')

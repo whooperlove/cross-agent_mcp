@@ -1,10 +1,11 @@
-"""Discover the currently active Claude Code sessions and Codex threads.
+"""Discover the currently active Claude Code, Codex and Grok Build sessions.
 
-Both products persist every session as a JSONL transcript, so "which session is the
+Every product persists each session as a JSONL transcript, so "which session is the
 user talking to right now" reduces to "which transcript was written to most recently".
 
   Claude Code : ~/.claude/projects/<slugified-cwd>/<session-uuid>.jsonl
   Codex       : ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl
+  Grok Build  : ~/.grok/sessions/<percent-encoded-cwd>/<session-uuid>/{summary,updates}.json[l]
 """
 
 import datetime
@@ -12,8 +13,11 @@ import glob
 import json
 import logging
 import os
+import pathlib
 import re
+import sqlite3
 import time
+import urllib.parse
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from . import config, registry
@@ -358,6 +362,143 @@ def list_codex_sessions(scope: str, cwd: str, limit: int = 20,
     return sorted(by_session.values(), key=_sort_key)[:limit]
 
 
+# -------------------------------------------------------------------- Grok
+
+# the key the Grok VS Code extension keeps its state under in the editor's database
+GROK_EXTENSION_STATE_KEY = 'sahilrakhaiya.grok-build-gui'
+
+
+def _load_grok_custom_names() -> Dict[str, str]:
+    """Names a human gave Grok conversations in the editor, by session id.
+
+    Grok's own summary.json holds a generated title and, after `/rename`, that one - but the
+    editor extension names a conversation in its own state, and that is the name on the tab the
+    human is looking at. Read straight from the editor's database, read-only, and given up on
+    quietly: this is a convenience over the session id, and a store that moved or a key that
+    was renamed must cost the names and nothing else.
+    """
+    names: Dict[str, str] = {}
+    for path in config.GROK_NAMES_DBS:
+        if not os.path.isfile(path):
+            continue
+        try:
+            connection = sqlite3.connect(pathlib.Path(path).as_uri() + '?mode=ro', uri=True,
+                                         timeout=1)
+            try:
+                row = connection.execute('SELECT value FROM ItemTable WHERE key = ?',
+                                         (GROK_EXTENSION_STATE_KEY,)).fetchone()
+            finally:
+                connection.close()
+            meta = (json.loads(row[0]) or {}).get('grok.sessionMeta') if row else None
+        except Exception as e:
+            logger.debug(f'_load_grok_custom_names [exception]: {path} {e}')
+            continue
+        if not isinstance(meta, dict):
+            continue
+        for session_id, entry in meta.items():
+            name = entry.get('customName') if isinstance(entry, dict) else None
+            if isinstance(name, str) and name.strip():
+                names.setdefault(str(session_id).lower(), name.strip())
+    return names
+
+
+def _grok_group_cwd(group_dir: str) -> Optional[str]:
+    """The directory a folder of Grok sessions was recorded for, from the folder itself.
+
+    The name is the working directory percent-encoded. Past 255 bytes Grok cannot name a folder
+    that way, so it names it by a slug and a hash and writes the real path to `.cwd` inside.
+    """
+    try:
+        with open(os.path.join(group_dir, '.cwd'), 'r', encoding='utf-8') as f:
+            recorded = f.read().strip()
+        if recorded:
+            return recorded
+    except OSError:
+        pass
+    decoded = urllib.parse.unquote(os.path.basename(group_dir))
+    return decoded if decoded.startswith('/') else None
+
+
+def _parse_grok_session(summary_path: str,
+                        custom_names: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    try:
+        with open(summary_path, 'r', encoding='utf-8', errors='replace') as f:
+            summary = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(summary, dict):
+        return None
+
+    # A subagent's conversation is filed in the same store as the user's. It is the parent's to
+    # resume, never something to deliver into.
+    if summary.get('session_kind') == 'subagent':
+        return None
+
+    block = summary.get('info') if isinstance(summary.get('info'), dict) else {}
+    session_id = block.get('id')
+    session_dir = os.path.dirname(summary_path)
+    # The record inside says whose it is, and a folder whose name and record disagree answers for
+    # a conversation nobody asked about - the same rule as a Codex rollout.
+    if not is_session_id(session_id) or os.path.basename(session_dir) != str(session_id).lower():
+        return None
+
+    transcript = os.path.join(session_dir, 'updates.jsonl')
+    custom = custom_names.get(str(session_id).lower(), '')
+    generated = str(summary.get('generated_title') or summary.get('session_summary') or '')
+    info: Dict[str, Any] = {
+        'agent': config.AGENT_GROK,
+        'session_id': str(session_id).lower(),
+        'cwd': block.get('cwd'),
+        'path': transcript,
+        'origin': summary.get('session_kind'),
+        # the tab's name outranks the generated one, for the reason a Claude custom title does
+        'title': custom or generated,
+        'is_named': bool(custom) or bool(summary.get('title_is_manual')),
+    }
+    info.update(_describe_age(max(_safe_mtime(transcript), _safe_mtime(summary_path))))
+    return info
+
+
+def list_grok_sessions(scope: str, cwd: str, limit: int = 20,
+                       since_mtime: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Grok sessions, newest first.
+
+    A folder of sessions is named for its working directory, so a scope narrower than `any` is
+    decided per folder without opening any of its sessions; the record inside each one then
+    confirms it.
+    """
+    candidates: List[Tuple[float, str]] = []
+    for group in glob.glob(config.GROK_SESSIONS_DIR + '*'):
+        if not os.path.isdir(group):
+            continue
+        if scope != SCOPE_ANY and not _is_in_scope(
+                _cwd_relation(_grok_group_cwd(group), cwd), scope):
+            continue
+        for summary_path in glob.glob(group + '/*/summary.json'):
+            transcript = os.path.join(os.path.dirname(summary_path), 'updates.jsonl')
+            candidates.append((max(_safe_mtime(summary_path), _safe_mtime(transcript)),
+                               summary_path))
+    candidates.sort(reverse=True)
+
+    custom_names = _load_grok_custom_names()
+    sessions: List[Dict[str, Any]] = []
+    for mtime, summary_path in candidates:
+        if len(sessions) >= limit or (since_mtime is not None and mtime < since_mtime):
+            break
+
+        info = _parse_grok_session(summary_path, custom_names)
+        if not info:
+            continue
+
+        relation = _cwd_relation(info.get('cwd'), cwd)
+        if not _is_in_scope(relation, scope):
+            continue
+        info['cwd_relation'] = relation
+        sessions.append(info)
+
+    return sorted(sessions, key=_sort_key)
+
+
 # ------------------------------------------------------------------ shared
 
 def list_sessions(agent: str, scope: str, cwd: str, limit: int = 20,
@@ -369,10 +510,12 @@ def list_sessions(agent: str, scope: str, cwd: str, limit: int = 20,
         return list_claude_sessions(scope, cwd, limit)
     if agent == config.AGENT_CODEX:
         return list_codex_sessions(scope, cwd, limit, since_mtime, stats=stats)
+    if agent == config.AGENT_GROK:
+        return list_grok_sessions(scope, cwd, limit, since_mtime)
     raise ValueError(f'unknown agent: {agent}')
 
 
-# Both agents name a session with a uuid, in the file name and everywhere else the id appears.
+# Every agent names a session with a uuid, in the file name and everywhere else the id appears.
 # The id is spliced into a glob below, so what counts as one is decided by its shape rather than
 # by whether a lookup happens to succeed: a `*` would otherwise match some other session's file
 # and be answered with that session, reported to the caller as the one they named.
@@ -401,17 +544,27 @@ def is_inside(path: str, root: str) -> bool:
 
 
 def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
-    """Look up one session by id. Both stores encode the id in the file name.
+    """Look up one session by id. Every store encodes the id in a file or folder name.
 
     Only something shaped like an id is looked up. Anything else - a conversation name, a
     wildcard, a path - is not an id and finds nothing here; naming a session is
     `find_session_by_name`'s job.
     """
-    if agent not in (config.AGENT_CLAUDE, config.AGENT_CODEX):
+    if agent not in config.AGENTS:
         raise ValueError(f'unknown agent: {agent}')
     if not is_session_id(session_id):
         return None
     session_id = session_id.lower()
+
+    if agent == config.AGENT_GROK:
+        custom_names = _load_grok_custom_names()
+        for path in glob.glob(config.GROK_SESSIONS_DIR + f'*/{session_id}/summary.json'):
+            if not is_inside(path, config.GROK_SESSIONS_DIR):
+                continue
+            info = _parse_grok_session(path, custom_names)
+            if info:
+                return info
+        return None
 
     if agent == config.AGENT_CLAUDE:
         for path in glob.glob(config.CLAUDE_PROJECTS_DIR + f'*/{session_id}.jsonl'):
@@ -807,6 +960,78 @@ def _codex_turns(lines: List[str]) -> Tuple[List[Dict[str, Any]], bool]:
     return turns, is_working
 
 
+# Grok writes every streamed chunk of a turn as its own line, so a long answer is thousands of
+# lines and a tail sized for the other two holds little more than the turn just finished.
+GROK_TAIL_BYTES = 8_000_000
+
+GROK_TOOL_UPDATES = ('tool_call', 'tool_call_update')
+
+
+def _grok_turns(lines: List[str]) -> Tuple[List[Dict[str, Any]], bool]:
+    """Completed turns in a Grok updates.jsonl tail, newest first, and whether one is still open.
+
+    The file is the ACP update stream: the prompt arrives as `user_message_chunk`, the model
+    speaks in `agent_message_chunk`s, and `turn_completed` says the turn is over. The chunks
+    between two tool calls are narration - "I'll run the tests" - and the answer is what is
+    said after the last tool call, so the text is cut there, as `_claude_turns` does with a
+    stop_reason of tool_use. A turn that never spoke after its tools falls back to everything
+    it said, because nothing is better than a fragment but something is better than nothing.
+
+    Read forwards, because a chunk means nothing until the turn it belongs to is known; the
+    tail may begin inside a turn, and that turn is kept when its end is in view.
+    """
+    turns: List[Dict[str, Any]] = []
+    turn: Optional[Dict[str, Any]] = None
+
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        params = entry.get('params') if isinstance(entry, dict) else None
+        update = params.get('update') if isinstance(params, dict) else None
+        if not isinstance(update, dict):
+            continue
+
+        kind = update.get('sessionUpdate')
+        if kind == 'user_message_chunk':
+            # a new prompt while one was open: the earlier turn never finished, and its
+            # fragments are not an answer to anything
+            turn = {'said': '', 'after_tools': ''}
+        elif kind == 'agent_message_chunk':
+            content = update.get('content')
+            piece = content.get('text') if isinstance(content, dict) else None
+            if isinstance(piece, str):
+                turn = turn or {'said': '', 'after_tools': ''}
+                turn['said'] += piece
+                turn['after_tools'] += piece
+        elif kind in GROK_TOOL_UPDATES:
+            turn = turn or {'said': '', 'after_tools': ''}
+            turn['after_tools'] = ''
+        elif kind == 'turn_completed' and turn is not None:
+            turns.append({'text': (turn['after_tools'] or turn['said']).strip(),
+                          'written_at': _grok_entry_epoch(entry)})
+            turn = None
+
+    turns.reverse()
+    return turns, turn is not None
+
+
+def _grok_entry_epoch(entry: Dict[str, Any]) -> Optional[float]:
+    """When Grok wrote an update: milliseconds where it says so, else the whole second.
+
+    A whole second is the end of that second, not its start - read as its start, an answer
+    written a moment after a request could sort before it, and be taken for one that was
+    already there.
+    """
+    meta = (entry.get('params') or {}).get('_meta')
+    millis = meta.get('agentTimestampMs') if isinstance(meta, dict) else None
+    if isinstance(millis, (int, float)):
+        return millis / 1000.0
+    seconds = entry.get('timestamp')
+    return float(seconds) + 0.999 if isinstance(seconds, (int, float)) else None
+
+
 def _pick_answer(turns: List[Dict[str, Any]], after: Optional[float], token: Optional[str],
                  label: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """The turn that answers the request, and the one that merely came after it.
@@ -875,9 +1100,12 @@ def peer_progress(agent: str, session_id: str, after: Optional[float] = None,
     if not session:
         return None
 
-    lines = _tail_lines(session['path'])
-    turns, is_working = (_claude_turns(lines) if agent == config.AGENT_CLAUDE
-                         else _codex_turns(lines))
+    if agent == config.AGENT_GROK:
+        turns, is_working = _grok_turns(_tail_lines(session['path'], GROK_TAIL_BYTES))
+    else:
+        lines = _tail_lines(session['path'])
+        turns, is_working = (_claude_turns(lines) if agent == config.AGENT_CLAUDE
+                             else _codex_turns(lines))
     answer, unmatched = _pick_answer(turns, after, token, f'{agent} {session_id}')
     return {
         'answer': answer['text'] if answer else None,
