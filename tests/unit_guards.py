@@ -6228,6 +6228,39 @@ def test_a_last_resort_claude_panel_the_human_took_up_waits_and_joins() -> None:
         (uihook.send, uihook.await_turn) = originals
 
 
+def test_a_cli_turn_that_ran_quickly_is_not_reported_as_undelivered() -> None:
+    """A CLI delivery is never `accepted` - only a panel says so - so a turn that finished inside
+    the early-failure window looked exactly like one that failed inside it. Grok answers in
+    seconds, and the receipt told the caller its message had not been delivered, and to send it
+    again, while the answer was already on its way."""
+    now = time.time()
+
+    def job(state):
+        made = outbox.Job(target_agent='grok', target_session_id='g1', payload='p', run_cwd='/w',
+                          pin_cwd='/w', env={}, timeout=5, ui_shim=None, title='t',
+                          conversation_id='conv_x', hop=1, sender_agent='claude',
+                          sender_session_id='c1', wants_reply=True, summary='s',
+                          delivery_id='req_1_aaaaaa', kind=outbox.KIND_REQUEST)
+        made.state = state
+        made.started_at = now
+        made.finished_at = now + 2
+        made.report_failures_until = now + 8
+        return made
+
+    check('a turn that was answered within the window is not a failure to report',
+          job(outbox.STATE_DELIVERED).is_failure_reportable_synchronously() is False)
+    check('one that failed within it still is, so the caller hears of it directly',
+          job(outbox.STATE_FAILED).is_failure_reportable_synchronously() is True)
+    late = job(outbox.STATE_FAILED)
+    late.finished_at = now + 20
+    check('and one that failed after the caller stopped listening is left to the notice',
+          late.is_failure_reportable_synchronously() is False)
+    accepted = job(outbox.STATE_FAILED)
+    accepted.accepted_at = now + 1
+    check('nor is one the peer had already taken',
+          accepted.is_failure_reportable_synchronously() is False)
+
+
 def run_all() -> None:
     test_the_suite_writes_nowhere_near_the_real_bridge()
     test_busy_lock_is_exclusive()
@@ -6380,6 +6413,7 @@ def run_all() -> None:
     test_a_conversation_started_while_the_message_waited_is_not_joined()
     test_a_panel_chosen_because_nothing_existed_is_told_to_open_one()
     test_a_last_resort_claude_panel_the_human_took_up_waits_and_joins()
+    test_a_cli_turn_that_ran_quickly_is_not_reported_as_undelivered()
 
 if __name__ == '__main__':
     # The delivery directory used to be redirected here on its own, because finished jobs left

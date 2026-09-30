@@ -480,8 +480,15 @@ class Job:
             persist(self)
 
     def is_failure_reportable_synchronously(self) -> bool:
-        """Whether the send_message caller, not a notice, is the one to hear about a failure."""
-        return (self.finished_at is not None and self.accepted_at is None
+        """Whether the send_message caller, not a notice, is the one to hear about a failure.
+
+        Failed, and failed early. Not merely finished early: a CLI delivery is never `accepted`
+        - only a panel says so - so a turn that simply ran quickly finished inside the window
+        with no acceptance too, and was handed back as "NOT delivered" though the peer had
+        answered it.
+        """
+        return (self.state == STATE_FAILED and self.finished_at is not None
+                and self.accepted_at is None
                 and self.finished_at < self.report_failures_until)
 
     def describe(self) -> Dict[str, Any]:
