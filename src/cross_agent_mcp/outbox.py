@@ -24,7 +24,7 @@ import re
 import threading
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from . import config, registry
 
@@ -87,13 +87,15 @@ DELIVERY_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
 # behind. Past this age it belongs to no write still in progress.
 STALE_TEMP_SECONDS = 3600
 
-# Margin on top of the longest a delivery can legitimately take. Past that an in-flight record is
-# not believed however its server's pid looks - pids are reused.
+# Margin on the renewed delivery lease. Past that an in-flight record is not believed however
+# its server's pid looks - pids are reused.
 IN_FLIGHT_GRACE_SECONDS = 300
+LEASE_RENEW_SECONDS = 30
 
 KIND_REQUEST = 'request'
 KIND_REPLY = 'reply'
 KIND_NOTICE = 'failure-notice'
+KIND_PROGRESS = 'progress-notice'
 
 
 def new_request_id() -> str:
@@ -454,14 +456,20 @@ class Job:
         # Until this instant the caller of send_message is still on the line and will be handed
         # a failure directly. After it, a failure is announced into the sender's session.
         self.report_failures_until = 0.0
-        # past this instant no server can still be carrying the delivery; set when it is queued
-        # and moved when a worker starts it (Outbox._longest_run)
+        # delivery lease expiry, renewed while a worker runs it (Outbox._longest_run)
         self.expires_at: Optional[float] = None
         # serialises this delivery's record writes, see persist()
         self.record_guard = threading.Lock()
         self.is_record_final = False
         # the server carrying this delivery stopped the peer's turn as it exited
         self.is_stopped_with_carrier = False
+        # The bridge actually stopped the CLI after a period with no output or transcript
+        # activity. An open turn left in its transcript is no longer evidence of live work.
+        self.is_killed_by_timeout = False
+        self.is_lock_lost = False
+        self.is_stopped_after_lock_loss = False
+        self.progress_note: Optional[str] = None
+        self.progress_delivery_id: Optional[str] = None
 
     def key(self) -> str:
         """Deliveries sharing this key are serialised."""
@@ -536,6 +544,11 @@ class Job:
             # true when the peer's turn was stopped because the server carrying it exited: it
             # may have done part of the work, and it will not answer
             'is_stopped_with_carrier': self.is_stopped_with_carrier or None,
+            'is_killed_by_timeout': self.is_killed_by_timeout or None,
+            'is_lock_lost': self.is_lock_lost or None,
+            'is_stopped_after_lock_loss': self.is_stopped_after_lock_loss or None,
+            'progress_note': self.progress_note,
+            'progress_delivery_id': self.progress_delivery_id,
             'error': self.error,
         }
 
@@ -732,7 +745,8 @@ class Outbox:
         request gets no such retry: its failure is reported to the caller, who knows better
         than a blind retry whether it should go out again.
         """
-        attempts = 1 if job.wants_reply else UNDELIVERED_RETRY_ATTEMPTS
+        attempts = (1 if job.wants_reply or job.kind == KIND_PROGRESS
+                    else UNDELIVERED_RETRY_ATTEMPTS)
         for attempt in range(1, attempts + 1):
             job.attempts = attempt
             if attempt > 1:
@@ -752,22 +766,20 @@ class Outbox:
         raise RuntimeError('unreachable')
 
     def _patience(self, job: Job) -> float:
-        """How long a delivery may take before we stop holding on to it.
+        """The busy-wait budget, and the panel's first progress-notice threshold.
 
-        On the panel path the peer's turn runs as long as it runs, whatever we do, so the only
-        question is how long we keep listening; the configured patience answers it. On the CLI
-        path the turn is our subprocess and the budget is enforced by killing it.
+        Once accepted, a panel turn is watched until it ends. The CLI timeout limits idle
+        time, so neither value is a wall-clock limit on an active turn.
         """
         if job.ui_shim is not None:
             return max(job.timeout, config.PANEL_PATIENCE_SECONDS)
         return job.timeout
 
     def _longest_run(self, job: Job) -> float:
-        """The longest one delivery can legitimately take once a worker starts it.
+        """Lease duration for a delivery record, renewed while its worker is running.
 
-        Per attempt: waiting out a busy session, then the turn, each up to the patience. Then the
-        transcript watch after a transport failure, and a margin. Past it no server is still
-        carrying the delivery, which is what keeps a record honest when its server's pid is reused.
+        Also covers a bounded busy wait and transport recovery. Active turns can outlive this
+        lease, so the heartbeat moves expires_at rather than letting them appear orphaned.
         """
         attempts = 1 if job.wants_reply else UNDELIVERED_RETRY_ATTEMPTS
         return (attempts * (2 * self._patience(job) + UNDELIVERED_RETRY_SECONDS)
@@ -787,12 +799,22 @@ class Outbox:
         deadline = time.time() + patience
         while True:
             try:
+                if job.kind == KIND_PROGRESS and job.parent_delivery_id:
+                    parent = self.find(job.parent_delivery_id)
+                    if parent is not None and parent.reply:
+                        raise NotDeliveredError('the progress notice was superseded by the '
+                                                'final answer')
                 if not job.target_session_id:
-                    return self.deliver(job)
+                    with self._keep_alive(job, patience + 60):
+                        return self.deliver(job)
                 with registry.busy_lock(job.target_agent, job.target_session_id,
-                                        job.conversation_id, ttl_seconds=patience + 60):
-                    return self.deliver(job)
+                                        job.conversation_id, ttl_seconds=patience + 60) as token:
+                    with self._keep_alive(job, patience + 60, token):
+                        return self.deliver(job)
             except (registry.SessionBusyError, PeerBusyError) as e:
+                if job.kind == KIND_PROGRESS:
+                    # INFO is opportunistic; waiting for it must never hold up the final reply.
+                    raise
                 # Two ways of hearing the same thing: another delivery holds the session, or
                 # the peer itself is mid-turn. Neither says the message cannot be delivered,
                 # only that now is not the moment.
@@ -802,6 +824,45 @@ class Outbox:
                             f'{job.target_session_id or "NEW"} not ready ({type(e).__name__}), '
                             f'retrying in {BUSY_RETRY_SECONDS}s')
                 time.sleep(BUSY_RETRY_SECONDS)
+
+    @contextlib.contextmanager
+    def _keep_alive(self, job: Job, ttl_seconds: float,
+                    token: Optional[str] = None) -> Iterator[None]:
+        """Renew the record and the exact lock we own until this delivery returns."""
+        stopped = threading.Event()
+
+        def renew() -> None:
+            while not stopped.wait(min(LEASE_RENEW_SECONDS, ttl_seconds / 3)):
+                try:
+                    if token and job.target_session_id:
+                        if not registry.renew_busy_lock(job.target_agent, job.target_session_id,
+                                                        token, ttl_seconds):
+                            job.is_lock_lost = True
+                            persist(job)
+                            logger.error(f'_keep_alive [lock lost]: {job.delivery_id}; '
+                                         'the transport must stop using this session')
+                            return
+                    job.expires_at = time.time() + self._longest_run(job)
+                    persist(job)
+                    # A queued request can sit behind an accepted turn for hours now. Keep
+                    # its record believable too, without starting it or changing its state.
+                    with self._guard:
+                        queued = list(self._queues.get(job.key(), []))
+                    expires_at = job.expires_at
+                    for waiting in queued:
+                        expires_at += self._longest_run(waiting)
+                        waiting.expires_at = expires_at
+                        persist(waiting)
+                except Exception as e:
+                    logger.error(f'_keep_alive [exception]: {job.delivery_id} {e}')
+
+        keeper = threading.Thread(target=renew, daemon=True)
+        keeper.start()
+        try:
+            yield
+        finally:
+            stopped.set()
+            keeper.join()
 
     def _recover_with_patience(self, job: Job) -> Optional[str]:
         """Look once, then keep looking while the peer could still be writing.

@@ -378,7 +378,7 @@ def _release_lock_file_held(path: str, token: str) -> None:
 
 @contextlib.contextmanager
 def busy_lock(agent: str, session_id: str, conversation_id: str,
-              ttl_seconds: Optional[float] = None) -> Iterator[None]:
+              ttl_seconds: Optional[float] = None) -> Iterator[str]:
     """Claim a session for the duration of the block.
 
     The record is written to a temporary and linked into place, so checking whether a session
@@ -420,9 +420,29 @@ def busy_lock(agent: str, session_id: str, conversation_id: str,
         raise SessionBusyError({'agent': agent, 'session_id': session_id})
 
     try:
-        yield
+        yield token
     finally:
         _release_lock_file(path, token)
+
+
+def renew_busy_lock(agent: str, session_id: str, token: str, ttl_seconds: float) -> bool:
+    """Extend only our own live claim. A replaced lock must never be overwritten."""
+    path = _lock_path(agent, session_id)
+    with _lock_transition():
+        record = _read_busy_lock_held(agent, session_id)
+        if not record or record.get('token') != token or record.get('pid') != os.getpid():
+            return False
+        # Older servers only read started_at, so refresh that lease timestamp too.
+        record.update(started_at=time.time(), ttl_seconds=ttl_seconds)
+        tmp = f'{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp'
+        try:
+            with config.secure_open(tmp) as f:
+                json.dump(record, f)
+            os.replace(tmp, path)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+    return True
 
 
 def list_busy_locks() -> List[Dict[str, Any]]:

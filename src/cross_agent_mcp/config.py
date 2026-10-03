@@ -100,16 +100,12 @@ ACTIVE_WINDOW_MINUTES: int = get_env_int('CROSS_AGENT_ACTIVE_WINDOW_MIN', 240)
 # ping-pong guard: how many bridge hops a single conversation may take
 MAX_HOPS: int = get_env_int('CROSS_AGENT_MAX_HOPS', 4)
 
-# how long a single relayed turn may take before it is aborted - on the CLI path, where the
-# turn is our own subprocess. A panel turn cannot be aborted from here at all; see below.
+# Maximum CLI inactivity, measured by output and target transcript activity, before the
+# process group is stopped. Active turns have no wall-clock limit.
 SEND_TIMEOUT_SECONDS: int = get_env_int('CROSS_AGENT_TIMEOUT', 600)
 
-# How long a panel delivery keeps listening for the peer's turn to end. The panel path can only
-# watch: the turn belongs to the editor's own session and goes on whether we listen or not, so
-# giving up early never saved any work - it only turned a finished answer into a guess read out
-# of the transcript. Peer turns of 500..820s were routine on the day this was measured; the
-# default leaves room above that. After this the bridge still watches the transcript for a
-# while (outbox.RECOVERY_WINDOW_SECONDS) before closing the delivery.
+# Busy-wait budget and threshold for an informational still-running panel notice. Once the
+# hand-over is accepted, the bridge keeps collecting the answer until the turn ends.
 PANEL_PATIENCE_SECONDS: int = get_env_int('CROSS_AGENT_PANEL_PATIENCE', 3600)
 
 # 'cwd' = only sessions rooted at the same directory, 'any' = every recorded session

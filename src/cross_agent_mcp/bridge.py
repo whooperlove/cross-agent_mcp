@@ -260,6 +260,19 @@ def _build_notice_envelope(job: outbox.Job, remaining: int) -> str:
                     'run starts on top of the first.\n')
         advice = (f'- Call `bridge_status` with delivery_id="{job.delivery_id}" to read the '
                   f'{target_label} transcript and see how far it got.\n')
+    elif job.is_killed_by_timeout:
+        headline = (f'Your message reached {target_label} (session {session}), but its turn was '
+                    f'killed by bridge timeout after {job.timeout}s without CLI output or '
+                    'transcript activity.')
+        standing = (f'- {target_label} is no longer running this request and may have done part '
+                    'of the work. Check its files before sending again.\n')
+        advice = (f'- Call `bridge_status` with delivery_id="{job.delivery_id}" to see how far '
+                  'it got. An open turn left in the transcript does not mean it is alive.\n')
+    elif job.is_stopped_after_lock_loss:
+        headline = (f'Your message reached {target_label} (session {session}), but the bridge '
+                    'stopped its CLI after losing ownership of the session busy lock.')
+        standing = '- The stopped CLI may have done part of the work. Check its files before resending.\n'
+        advice = f'- Call `bridge_status` with delivery_id="{job.delivery_id}" for its status.\n'
     else:
         headline = (f'Your message reached {target_label} (session {session}), but no answer '
                     f'came back in {round((job.finished_at or time.time()) - (job.started_at or time.time()))}s.')
@@ -375,19 +388,20 @@ def _terminate_group(process: subprocess.Popen) -> None:
     The agent CLIs run builds, test suites and shell commands as their own children. Killing
     only the direct child would leave those running unsupervised after a timeout.
     """
-    try:
-        group_id = os.getpgid(process.pid)
-    except OSError:
-        process.kill()
-        return
-
+    # Every CLI we start uses start_new_session=True, so its pid is also its group id.
+    # Keep using it even after the leader exits: surviving tools may still hold the pipes.
+    group_id = process.pid
     with contextlib.suppress(OSError):
         os.killpg(group_id, signal.SIGTERM)
     try:
         process.wait(timeout=KILL_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
-        with contextlib.suppress(OSError):
-            os.killpg(group_id, signal.SIGKILL)
+        pass
+    # The leader exiting does not prove the entire tool tree honored SIGTERM.
+    with contextlib.suppress(OSError):
+        os.killpg(group_id, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=KILL_GRACE_SECONDS)
 
 
 # Deliveries this process started and has not finished. A CLI runs in its own process group
@@ -500,6 +514,20 @@ def install_shutdown_guard() -> None:
 
 def _run_cli(command: List[str], cwd: str, env: Dict[str, str], timeout: int) -> subprocess.CompletedProcess:
     logger.debug(f'_run_cli [BEGIN]: cwd={cwd} cmd={command[:4]}')
+    job = outbox.current_job()
+    agent, _, session_id = (env.get(config.ENV_SELF_SESSION) or '').partition(':')
+    if job is not None:
+        agent = job.target_agent
+        session_id = job.resolved_session_id or job.target_session_id or session_id
+    transcript_path = None
+    transcript_activity = None
+    if agent in config.AGENTS and session_id:
+        known = discovery.find_session(agent, session_id)
+        transcript_path = (known or {}).get('path')
+        if transcript_path:
+            with contextlib.suppress(OSError):
+                stat = os.stat(transcript_path)
+                transcript_activity = (stat.st_size, stat.st_mtime_ns)
     try:
         # start_new_session puts the CLI in its own process group so the whole tree is killable
         process = subprocess.Popen(
@@ -511,14 +539,80 @@ def _run_cli(command: List[str], cwd: str, env: Dict[str, str], timeout: int) ->
         raise outbox.NotDeliveredError(f'CLI not found: {command[0]}')
 
     _track_child(process)
+    last_activity = time.monotonic()
+    output_activity = (0, 0)
+    poll_seconds = min(5, max(timeout / 4, 0.01))
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        logger.error(f'_run_cli [exception]: timeout after {timeout}s, killing process group')
-        _terminate_group(process)
-        with contextlib.suppress(Exception):
-            process.communicate(timeout=KILL_GRACE_SECONDS)
-        raise BridgeError(f'peer agent did not answer within {timeout}s')
+        while True:
+            # communicate can be retried without losing output. TimeoutExpired carries the
+            # bytes collected so far, including a partial UTF-8 character or JSON line.
+            remaining = max(timeout - (time.monotonic() - last_activity), 0.01)
+            try:
+                stdout, stderr = process.communicate(timeout=min(poll_seconds, remaining))
+                break
+            except subprocess.TimeoutExpired as e:
+                if process.poll() is not None:
+                    # The CLI finished, but its tools can still own a pipe. Preserve its
+                    # result and clean that leftover group instead of leaking descendants.
+                    _terminate_group(process)
+                    stdout, stderr = process.communicate(timeout=KILL_GRACE_SECONDS)
+                    break
+                if job is not None and job.is_lock_lost:
+                    _terminate_group(process)
+                    with contextlib.suppress(Exception):
+                        process.communicate(timeout=KILL_GRACE_SECONDS)
+                    job.is_stopped_after_lock_loss = True
+                    raise BridgeError('the bridge stopped the CLI after losing ownership of '
+                                      'the session busy lock')
+                activity = (len(e.output or b''), len(e.stderr or b''))
+                is_active = activity != output_activity
+                output_activity = activity
+
+                # A fresh Codex thread has no id until the CLI announces it. Learn only the
+                # exact id it reports; never watch the most recently active unrelated session.
+                if agent == config.AGENT_CODEX and not session_id and e.output:
+                    output = e.output
+                    if isinstance(output, bytes):
+                        output = output.decode('utf-8', errors='replace')
+                    for line in output[:65536].splitlines():
+                        with contextlib.suppress(ValueError, AttributeError):
+                            event = json.loads(line)
+                            if event.get('type') == 'thread.started' and event.get('thread_id'):
+                                session_id = event['thread_id']
+                                if job is not None:
+                                    job.resolved_session_id = session_id
+                                    outbox.persist(job)
+                                break
+
+                if not transcript_path and agent in config.AGENTS and session_id:
+                    known = discovery.find_session(agent, session_id)
+                    transcript_path = (known or {}).get('path')
+                if transcript_path:
+                    with contextlib.suppress(OSError):
+                        stat = os.stat(transcript_path)
+                        activity = (stat.st_size, stat.st_mtime_ns)
+                        is_active = is_active or activity != transcript_activity
+                        transcript_activity = activity
+                if is_active:
+                    last_activity = time.monotonic()
+                if time.monotonic() - last_activity < timeout:
+                    continue
+
+                # A completed CLI wins a race with the idle deadline.
+                if process.poll() is not None:
+                    _terminate_group(process)
+                    stdout, stderr = process.communicate(timeout=KILL_GRACE_SECONDS)
+                    break
+                logger.error(f'_run_cli [exception]: no activity for {timeout}s, '
+                             'killing process group')
+                _terminate_group(process)
+                with contextlib.suppress(Exception):
+                    process.communicate(timeout=KILL_GRACE_SECONDS)
+                if job is not None:
+                    job.is_killed_by_timeout = True
+                raise BridgeError(
+                    f'peer agent killed by bridge timeout after {timeout}s without CLI output '
+                    'or transcript activity')
     finally:
         _untrack_child(process)
         logger.debug('_run_cli [END]')
@@ -632,12 +726,14 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
                     on_accepted: Optional[Any] = None, wants_result: bool = True,
                     patience: Optional[float] = None, target_agent: Optional[str] = None,
                     request_token: Optional[str] = None,
-                    is_new_session: bool = False) -> Dict[str, Any]:
+                    is_new_session: bool = False,
+                    on_progress: Optional[Any] = None) -> Dict[str, Any]:
     """Deliver through the editor panel shim, so the exchange shows up in the panel.
 
     The hand-over and the answer are two waits, not one. The shim answers the first as soon as
     the peer has the message; the answer is then collected with as many `await` calls as the
-    turn takes, up to `patience`. A single socket wait for the whole turn was how a 600s
+    turn takes. `patience` is when a still-running accepted turn is reported as information,
+    not stopped or failed. A single socket wait for the whole turn was how a 600s
     deadline cut off turns that ran 500..820s, and the peer kept working after each cut.
 
     Between two awaits the peer's transcript is read as well. The shim reports the turn over
@@ -668,10 +764,17 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
     response = uihook.send(message, ui_shim, session_id, timeout, cwd, title,
                            accept_timeout=PANEL_ACCEPT_SECONDS, create_new=create_new)
     _raise_for_panel_failure(response)
+    resolved_session_id = response.get('sessionId') or session_id
+    was_created = bool(response.get('wasCreated'))
     is_new_unconfirmed = create_new and not _raise_unless_really_new(response, existing)
 
     is_accepted_reported = False
+    is_progress_reported = False
     while response.get('pending'):
+        job = outbox.current_job()
+        if job is not None and job.is_lock_lost:
+            raise BridgeError('the bridge lost ownership of the session busy lock; the peer '
+                              'panel turn may still be running')
         if response.get('accepted') and not is_accepted_reported:
             is_accepted_reported = True
             if on_accepted is not None:
@@ -680,17 +783,17 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
                 # a reply is complete the moment it lands; nobody reads what the peer says next
                 break
 
-        if response.get('accepted'):
+        if is_accepted_reported:
             confirmed = _transcript_answer(
-                target_agent, response.get('sessionId') or session_id, started, request_token)
+                target_agent, resolved_session_id, started, request_token)
             if confirmed is not None:
                 logger.info(f'_call_via_panel [confirmed by transcript]: {request_token} - the '
                             'peer finished and echoed the request while the shim still reported '
                             'the turn as running')
                 return {
-                    'session_id': response.get('sessionId') or session_id or '',
+                    'session_id': resolved_session_id or '',
                     'reply': confirmed.strip(),
-                    'is_new_session': bool(response.get('wasCreated')),
+                    'is_new_session': was_created,
                     'is_reply_confirmed_by_transcript': True,
                     'usage': None,
                     'cost_usd': None,
@@ -698,20 +801,35 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
 
         remaining = started + budget - time.time()
         if remaining <= 0:
-            raise BridgeError(
-                f'IDE panel relay failed: the peer turn is still running after '
-                f'{round(time.time() - started)}s; its answer will be read from the transcript '
-                'when it ends')
+            if not is_accepted_reported or not wants_result:
+                raise BridgeError('IDE panel relay did not acknowledge the hand-over within '
+                                  f'{budget}s')
+            if not is_progress_reported:
+                is_progress_reported = True
+                note = (f'The peer turn is still running after {round(time.time() - started)}s. '
+                        'The bridge is still collecting its answer and will send it back when '
+                        'the turn ends. Do not resend this request.')
+                logger.info(f'_call_via_panel [still running]: {request_token} {note}')
+                if on_progress is not None:
+                    try:
+                        on_progress(note)
+                    except Exception as e:
+                        logger.error(f'_call_via_panel [progress notice exception]: '
+                                     f'{request_token} {e}')
+            remaining = PANEL_AWAIT_CHUNK_SECONDS
         response = uihook.await_turn(ui_shim, str(response.get('injectionId')),
                                      int(min(PANEL_AWAIT_CHUNK_SECONDS, max(remaining, 1))))
         _raise_for_panel_failure(response)
+        resolved_session_id = response.get('sessionId') or resolved_session_id
+        was_created = was_created or bool(response.get('wasCreated'))
         if is_new_unconfirmed:
-            is_new_unconfirmed = not _raise_unless_really_new(response, existing)
+            is_new_unconfirmed = not _raise_unless_really_new(
+                {**response, 'sessionId': resolved_session_id, 'wasCreated': was_created}, existing)
 
     return {
-        'session_id': response.get('sessionId') or session_id or '',
+        'session_id': resolved_session_id or '',
         'reply': str(response.get('reply') or '').strip(),
-        'is_new_session': bool(response.get('wasCreated')),
+        'is_new_session': was_created,
         'is_reply_confirmed_by_transcript': False,
         'usage': None,
         'cost_usd': None,
@@ -1126,10 +1244,15 @@ def _deliver(job: outbox.Job) -> Dict[str, Any]:
     # The route can go stale between building this job and running it - a tab closed in
     # between. Return traffic without a panel is refused here rather than resumed, so the rule
     # holds however the job reached a worker; the retry gives a reopening panel its chance.
-    if job.ui_shim is None and job.kind in (outbox.KIND_REPLY, outbox.KIND_NOTICE):
+    if job.ui_shim is None and job.kind != outbox.KIND_REQUEST:
         raise outbox.NotDeliveredError(
             f'{job.kind} for {job.target_agent} session {job.target_session_id} has no live '
             'panel to deliver into, and return traffic is not delivered by resuming a session')
+
+    if job.kind == outbox.KIND_PROGRESS and job.target_session_id:
+        if panel_state(job.target_agent, job.target_session_id).get('is_turn_active'):
+            raise outbox.NotDeliveredError('the sender is busy; the informational progress '
+                                          'update remains on the request record')
 
     result = CALLERS[job.target_agent](
         job.payload, job.target_session_id, job.run_cwd, job.env, job.timeout, job.ui_shim,
@@ -1143,6 +1266,7 @@ def _deliver(job: outbox.Job) -> Dict[str, Any]:
         request_token=job.delivery_id if job.wants_reply else None,
         # a fresh conversation was asked for, so the transport has to say it opened one
         is_new_session=job.is_new_session,
+        on_progress=lambda note: _report_panel_progress(job, note),
     )
 
     if result['is_new_session'] and result['session_id']:
@@ -1231,7 +1355,20 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
     )
 
 
-def _build_notice_job(job: outbox.Job) -> Optional[outbox.Job]:
+def _report_panel_progress(job: outbox.Job, note: str) -> None:
+    """Record and announce a long accepted turn once, without closing the request."""
+    if job.progress_note is not None:
+        return
+    job.progress_note = note
+    notice = _build_notice_job(job, is_progress=True)
+    if notice is not None:
+        notice.parent_delivery_id = job.delivery_id
+        job.progress_delivery_id = notice.delivery_id
+        outbox.OUTBOX.submit(notice)
+    outbox.persist(job)
+
+
+def _build_notice_job(job: outbox.Job, is_progress: bool = False) -> Optional[outbox.Job]:
     """Turn a request that produced no answer into a notice aimed back at its sender.
 
     A notice travels like a reply - into the sender's session, spending no hop, expecting no
@@ -1244,11 +1381,22 @@ def _build_notice_job(job: outbox.Job) -> Optional[outbox.Job]:
 
     hop = int(registry.get_conversation(job.conversation_id).get('hops', job.hop))
     remaining = max(config.MAX_HOPS - hop, 0)
-    payload = _build_notice_envelope(job, remaining)
+    if is_progress:
+        payload = (
+            '=== CROSS-AGENT BRIDGE PROGRESS (INFO) ===\n'
+            f'from: {AGENT_LABEL.get(job.target_agent, job.target_agent)}\n'
+            f'delivery: {job.delivery_id}\n'
+            f'conversation: {job.conversation_id}\n\n'
+            f'{job.progress_note}\n\n'
+            'This is an informational update. The request remains awaiting-peer. '
+            'No reply is required; continue your own work.\n')
+    else:
+        payload = _build_notice_envelope(job, remaining)
 
     shim = _return_shim(job.sender_agent, job.sender_session_id, job.delivery_id, 'the notice')
     if shim is None:
-        job.is_return_status_only = True
+        if not is_progress:
+            job.is_return_status_only = True
         logger.info(f'_build_notice_job [not sent]: {job.delivery_id} no notice goes back; the '
                     'failure is on the record for bridge_status to report')
         return None
@@ -1267,14 +1415,15 @@ def _build_notice_job(job: outbox.Job) -> Optional[outbox.Job]:
         env=_child_env(job.conversation_id, hop, job.target_agent, []),
         timeout=config.SEND_TIMEOUT_SECONDS,
         ui_shim=shim,
-        title=f'bridge: delivery {job.delivery_id} failed',
+        title=f'bridge: delivery {job.delivery_id} {"still running" if is_progress else "failed"}',
         conversation_id=job.conversation_id,
         hop=hop,
         sender_agent=job.target_agent,
         sender_session_id=job.resolved_session_id or job.target_session_id,
         wants_reply=False,
-        summary=f'delivery failed: {(job.error or "")[:PANEL_TITLE_LIMIT * 2]}',
-        kind=outbox.KIND_NOTICE,
+        summary=(f'delivery still running: {job.delivery_id}' if is_progress else
+                 f'delivery failed: {(job.error or "")[:PANEL_TITLE_LIMIT * 2]}'),
+        kind=outbox.KIND_PROGRESS if is_progress else outbox.KIND_NOTICE,
     )
 
 
@@ -1340,6 +1489,12 @@ def delivery_report(delivery_id: str) -> Dict[str, Any]:
         return {'ok': False,
                 'error': f'no delivery {delivery_id} is known to this server or kept on disk'}
 
+    # Legacy CLI timeout records predate the explicit flag, but that error came only from
+    # _run_cli after it killed the process group. Report those stopped turns accurately too.
+    is_killed_by_timeout = bool(record.get('is_killed_by_timeout')) or str(
+        record.get('error') or '').startswith('BridgeError: peer agent did not answer within ')
+    if is_killed_by_timeout:
+        record['is_killed_by_timeout'] = True
     report: Dict[str, Any] = {'ok': True, 'delivery': record}
 
     # A request's record is final before its answer has been delivered, so on its own it says
@@ -1419,6 +1574,19 @@ def delivery_report(delivery_id: str) -> Dict[str, Any]:
                                              'kept, so the answer is not filtered by time; check '
                                              'it against the request yourself.')),
             }
+            if (is_killed_by_timeout or record.get('is_stopped_with_carrier')
+                    or record.get('is_stopped_after_lock_loss')):
+                report['peer_transcript'].update(
+                    is_working=False,
+                    transcript_has_open_turn=progress.get('is_working'),
+                    note=('This request was killed by bridge timeout.' if is_killed_by_timeout
+                          else 'This request was stopped after the session busy lock was lost.'
+                          if record.get('is_stopped_after_lock_loss')
+                          else 'This request was stopped when its carrier exited.')
+                         + ' It is no longer running. The transcript may still contain an '
+                         'open turn because the killed process could not write a completion '
+                         'event; that is not evidence of live work. Later turns in the same '
+                         'session are separate from this stopped request.')
         report['peer_panel'] = panel_state(target_agent, target_session)
     return report
 
@@ -1785,9 +1953,9 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
             'alongside you with your tools and permissions.')
     if requested_timeout is not None and requested_timeout < timeout:
         warnings.append(
-            f'timeout={requested_timeout}s was raised to {timeout}s. It bounds the peer\'s '
-            'turn, not your wait - this call already returned - so a shorter value only '
-            'aborts work that would have finished. Pass a larger one to allow more time.')
+            f'timeout={requested_timeout}s was raised to {timeout}s. On the headless path it '
+            'limits inactivity, not the total turn length; on the panel path the accepted '
+            'turn keeps running until it ends.')
 
     # `is_new_target`, not `is_new_over_cli`: a fresh CLI session is started whenever nothing
     # was resolved to resume, and that is not only the forced case. Ordinary resolution that
@@ -1795,6 +1963,12 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
     # and would let the stale-target warning fire about a conversation that does not exist yet.
     delivery = ('ide-panel' if (target or {}).get('ui_shim')
                 else 'cli-new-session' if is_new_target else 'cli-resume')
+    if delivery != 'ide-panel':
+        warnings.append(
+            f'This delivery uses the headless CLI. There is no wall-clock turn limit: CLI '
+            f'output or target transcript activity resets the {timeout}s idle timeout. '
+            'If both remain inactive for that long, the bridge stops the process group and '
+            'records killed by bridge timeout.')
     is_carried_by_a_turn = _is_bridge_started_turn()
     if is_carried_by_a_turn:
         warnings.append(_short_lived_carrier_warning(target_agent, delivery))
@@ -1835,6 +2009,8 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         'caller_supplied_session_id': selected_by == SELECTED_CALLER,
         'will_create_session': is_new_target,
         'delivery': delivery,
+        'timeout_policy': 'panel-progress-notice' if delivery == 'ide-panel' else 'cli-idle',
+        'timeout_seconds': timeout,
         'is_visible_in_panel': bool((target or {}).get('ui_shim')),
         # Whether this session has a panel to be answered into *as of now*. The route is
         # resolved again when the answer exists, so false here does not prove no answer will

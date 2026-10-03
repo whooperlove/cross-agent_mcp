@@ -165,7 +165,8 @@ async def send_to_codex(
     scope: 'cwd' (default) = same directory or below, 'tree' = also parent directories,
         'any' = every recorded thread.
     cwd: Working directory used for discovery and for a newly created thread.
-    timeout: Budget for the Codex turn itself, applied by the background worker. It does not
+    timeout: CLI inactivity limit in seconds; active output or transcript writes reset it.
+        Accepted panel turns keep running until completion. It does not
         make this call wait, so a small value only aborts work that would have finished -
         anything below the configured default is raised to it and the result says so.
     conversation_id: Continue an existing bridge conversation (shares the hop budget).
@@ -216,7 +217,8 @@ async def send_to_claude(
     scope: 'cwd' (default) = same directory or below, 'tree' = also parent directories,
         'any' = every recorded session.
     cwd: Working directory used for discovery and for a newly created session.
-    timeout: Budget for the Claude turn itself, applied by the background worker. It does not
+    timeout: CLI inactivity limit in seconds; active output or transcript writes reset it.
+        Accepted panel turns keep running until completion. It does not
         make this call wait, so a small value only aborts work that would have finished -
         anything below the configured default is raised to it and the result says so.
     conversation_id: Continue an existing bridge conversation (shares the hop budget).
@@ -268,7 +270,8 @@ async def send_to_grok(
     scope: 'cwd' (default) = same directory or below, 'tree' = also parent directories,
         'any' = every recorded session.
     cwd: Working directory used for discovery and for a newly created session.
-    timeout: Budget for the Grok turn itself, applied by the background worker. It does not
+    timeout: CLI inactivity limit in seconds; active output or transcript writes reset it.
+        Accepted panel turns keep running until completion. It does not
         make this call wait, so a small value only aborts work that would have finished -
         anything below the configured default is raised to it and the result says so.
     conversation_id: Continue an existing bridge conversation (shares the hop budget).

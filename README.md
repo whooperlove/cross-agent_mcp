@@ -29,8 +29,8 @@ useful for:
 - **Watch it happen, not just read a log.** With the panel shims from
   [section 3](#3-registration) installed, every direction renders in VS Code's real chat panel
   like any other message, instead of just appending a line to a transcript file.
-- **Nothing is lost to a timeout.** Because nothing blocks, a peer turn that takes ten minutes is
-  fine — the reply lands whenever it lands.
+- **Long active turns keep running.** Headless turns use an inactivity timeout, reset by CLI
+  output or target transcript writes. Accepted panel turns are watched until they finish.
 
 ### A real example
 
@@ -563,7 +563,7 @@ Common `send_to_*` parameters:
 | `new_session` | `false` | Forces a new session even if one is active |
 | `scope` | `cwd` | `cwd` = same directory and its subdirectories, `tree` = up through parent directories too, `any` = everything |
 | `cwd` | the server's working directory | Basis for discovery and where a new session gets created |
-| `timeout` | `600` | **Budget (seconds) for the peer's turn itself.** Enforced by the worker; it doesn't make the caller wait |
+| `timeout` | `600` | **CLI inactivity limit (seconds)**, reset by output or target transcript writes. Accepted panel turns have no wall-clock limit. It doesn't make the caller wait |
 | `conversation_id` | auto-generated | Continues an existing bridge conversation, sharing its hop budget |
 | `raw` | `false` | Delivers the raw text with no bridge header |
 
@@ -661,8 +661,8 @@ Every delivered message carries a header with the sender, conversation ID, and h
 | `CROSS_AGENT_HOME` | `~/.cross-agent` | Location of the registry, locks, logs, delivery records and panel registrations. Must be a directory of the bridge's own — see below |
 | `CROSS_AGENT_ACTIVE_WINDOW_MIN` | `240` | Maximum elapsed time (minutes) for a session to still count as active |
 | `CROSS_AGENT_MAX_HOPS` | `4` | Maximum number of relays per conversation |
-| `CROSS_AGENT_TIMEOUT` | `600` | Budget (seconds) for the peer's turn itself. Doesn't make the caller wait |
-| `CROSS_AGENT_PANEL_PATIENCE` | `3600` | On the panel path, how long (seconds) a delivery keeps waiting out a busy session, and, separately, how long it then waits for the peer's turn to end. Each wait gets the larger of this value and the job timeout. Doesn't make the caller wait |
+| `CROSS_AGENT_TIMEOUT` | `600` | CLI inactivity limit (seconds). Output or target transcript writes reset it; active turns have no wall-clock limit. Doesn't make the caller wait |
+| `CROSS_AGENT_PANEL_PATIENCE` | `3600` | Panel busy-wait budget and threshold for a `PROGRESS (INFO)` notice. Each uses the larger of this value and the job timeout. An accepted turn remains `awaiting-peer` until it finishes, then its answer is pushed to the sender's open panel |
 | `CROSS_AGENT_DELIVERY_TTL` | `604800` | How long finished delivery records are kept (seconds, default 7 days) |
 | `CROSS_AGENT_SCOPE` | `cwd` | Default discovery scope (`cwd` / `tree` / `any`) |
 | `CROSS_AGENT_UI_HOOK` | `auto` | Panel injection (`auto` / `off` / `require`) |
@@ -860,9 +860,8 @@ it finished as, and when an approval prompt appeared and was answered.
     - Why the in-flight record lives in a subfolder: a server running a version prior to this
       feature treats any `deliveries/*.json` record without a `finished_at` as expired and
       deletes it. It never looks inside a subfolder.
-    - Expiry: past `expires_at` — the longest this delivery could legitimately still be
-      running (attempt count × (busy-wait + turn, each with its own patience) + transcript
-      watch + margin) — an in-flight record is treated as orphaned even if its pid is still
+    - Expiry: past `expires_at` — a delivery lease renewed by the running worker, together
+      with its session busy lock — an in-flight record is treated as orphaned even if its pid is still
       alive (to guard against pid reuse). The file itself is deleted only after the TTL
       (default 7 days) has also passed from there — deleting it right at expiry would make the
       app go back to "I don't know" if it asks the next day. A finished record still follows
@@ -888,13 +887,23 @@ it finished as, and when an approval prompt appeared and was answered.
     bridge attempts a `DELIVERY FAILED` notice in the sender's panel saying so. Sending again
     is safe. The failure stays readable with `bridge_status(delivery_id=...)`. The failed
     request is not replayed.
+  - **A long panel turn stays in progress.** Passing `CROSS_AGENT_PANEL_PATIENCE` sends one
+    `PROGRESS (INFO)` notice to the sender's idle open panel, records `progress_note`, and keeps
+    the request `awaiting-peer`. The final answer follows the usual reply delivery path when
+    the turn ends. The progress notice has its own `progress_delivery_id`, separate from the
+    final answer's `return_delivery_id`. No failure notice is sent just because time passed.
+    INFO does not wait for a busy sender and is skipped if the final answer is already ready;
+    the progress note remains readable on the request record.
   - **Even after giving up on the transport, the peer keeps working.** On the panel path, the
     peer is a session we neither spawned nor can stop, so a socket timing out doesn't mean the
-    turn is over. So when a delivery times out, it isn't closed as a failure — instead,
+    turn is over. When the transport actually breaks, it isn't closed immediately — instead,
     **the peer transcript is periodically re-checked** (every 15 seconds by default, up to 15
     minutes). It's picked up the moment the peer writes its answer. On the CLI path, that turn
-    was our own child process and the timeout already killed its process group, so there's
-    nothing left to wait for — it closes immediately, with no waiting.
+    was our own child process. Only inactivity exceeding `timeout` kills its process group,
+    recorded as `is_killed_by_timeout: true` and `killed by bridge timeout`; it closes without
+    another wait. `peer_transcript.is_working` is false for that stopped request even if the
+    killed process left an open turn in its transcript. Legacy wall-clock timeout records are
+    reported the same way. The headless receipt states the idle policy and duration explicitly.
   - **Even if the shim misses the turn, the answer is picked up within 30 seconds.** The shim
     reports a turn finished when the app-server's completion event matches the turn id it
     itself started — but sometimes that id never matches (a turn queued behind another turn,

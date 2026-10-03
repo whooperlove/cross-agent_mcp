@@ -260,7 +260,7 @@ def test_timeout_kills_descendants() -> None:
         try:
             bridge._run_cli(command, work_dir, dict(os.environ), timeout=2)
         except bridge.BridgeError as e:
-            raised = 'did not answer within' in str(e)
+            raised = 'killed by bridge timeout' in str(e) and 'without CLI output' in str(e)
 
         check('timeout surfaces as a BridgeError', raised)
 
@@ -273,6 +273,209 @@ def test_timeout_kills_descendants() -> None:
 
         check('grandchild process is killed with the group',
               not registry._is_pid_alive(grandchild), f'pid {grandchild} still alive')
+
+
+def test_active_cli_output_outlives_the_idle_timeout() -> None:
+    script = (
+        'import sys, time\n'
+        'sys.stderr.write("e" * 100000); sys.stderr.flush()\n'
+        'for part in "긴 작업 완료".encode("utf-8"):\n'
+        '    sys.stdout.buffer.write(bytes([part])); sys.stdout.buffer.flush()\n'
+        '    time.sleep(0.08)\n')
+    started = time.monotonic()
+    result = bridge._run_cli([sys.executable, '-B', '-c', script], STATE_ROOT,
+                             dict(os.environ), timeout=0.5)
+    check('active CLI output keeps a turn alive past its timeout',
+          result.returncode == 0 and time.monotonic() - started > 0.5)
+    check('retried communicates preserve partial UTF-8 output', result.stdout == '긴 작업 완료',
+          repr(result.stdout))
+    check('stderr is drained and preserved too', len(result.stderr) == 100000)
+
+
+def test_transcript_only_activity_keeps_a_cli_alive() -> None:
+    original = discovery.find_session
+    with tempfile.TemporaryDirectory(prefix='cli-idle-') as store:
+        path = store + '/transcript.jsonl'
+        with open(path, 'w') as f:
+            f.write('old transcript\n')
+        discovery.find_session = lambda agent, sid: {'path': path}
+        script = (
+            'import sys, time\n'
+            'for i in range(8):\n'
+            '    with open(sys.argv[1], "a") as f: f.write("activity\\n")\n'
+            '    time.sleep(0.12)\n'
+            'print("final JSON result")\n')
+        try:
+            env = bridge._running_as(dict(os.environ), 'claude', 'peer-sid')
+            result = bridge._run_cli([sys.executable, '-B', '-c', script, path], store,
+                                     env, timeout=0.4)
+            check('transcript writes keep an otherwise silent CLI alive',
+                  result.returncode == 0 and result.stdout.strip() == 'final JSON result')
+        finally:
+            discovery.find_session = original
+
+
+def test_a_fresh_codex_cli_watches_its_announced_transcript() -> None:
+    original = (discovery.find_session, outbox.current_job)
+    with tempfile.TemporaryDirectory(prefix='cli-new-idle-') as store:
+        path = store + '/transcript.jsonl'
+        looked_up = []
+
+        def find(agent, sid):
+            looked_up.append((agent, sid))
+            return {'path': path} if sid == 'new-thread-id' and os.path.exists(path) else None
+
+        discovery.find_session = find
+        job = _job(outbox.Outbox(), 'placeholder', wants_reply=True)
+        job.target_session_id = None
+        outbox.current_job = lambda: job
+        script = (
+            'import sys, time\n'
+            'print(\'{"type":"thread.started","thread_id":"new-thread-id"}\', flush=True)\n'
+            'for i in range(8):\n'
+            '    with open(sys.argv[1], "a") as f: f.write("activity\\n")\n'
+            '    time.sleep(0.12)\n'
+            'print(\'{"type":"turn.completed"}\')\n')
+        try:
+            result = bridge._run_cli([sys.executable, '-B', '-c', script, path], store,
+                                     dict(os.environ), timeout=0.4)
+            check('a fresh Codex CLI learns its exact thread id before the turn ends',
+                  job.resolved_session_id == 'new-thread-id')
+            check('and watches only that thread while stdout is silent',
+                  result.returncode == 0 and looked_up
+                  and all(pair == ('codex', 'new-thread-id') for pair in looked_up), str(looked_up))
+        finally:
+            discovery.find_session, outbox.current_job = original
+
+
+def test_a_cli_timeout_is_recorded_as_stopped_work() -> None:
+    original = (outbox.OUTBOX, discovery.peer_progress)
+    box = outbox.Outbox()
+    outbox.OUTBOX = box
+    box.deliver = lambda job: bridge._run_cli(
+        [sys.executable, '-B', '-c', 'import time; time.sleep(30)'], STATE_ROOT,
+        dict(os.environ), timeout=job.timeout)
+    discovery.peer_progress = lambda *a, **kw: {'answer': None, 'is_working': True}
+    try:
+        job = _job(box, 'idle-peer', wants_reply=True)
+        job.timeout = 0.15
+        delivery_id = box.submit(job)
+        _drain(box)
+        check('an idle-killed CLI records why it stopped',
+              job.state == outbox.STATE_FAILED and job.is_killed_by_timeout
+              and 'killed by bridge timeout' in job.error)
+        check('its failure notice does not say it may still be working',
+              'is no longer running' in bridge._build_notice_envelope(job, 3))
+        for reader in (box, outbox.Outbox()):
+            outbox.OUTBOX = reader
+            report = bridge.delivery_report(delivery_id)
+            check('memory and disk reports reject the killed transcript open turn',
+                  report['delivery']['is_killed_by_timeout'] is True
+                  and report['peer_transcript']['is_working'] is False
+                  and report['peer_transcript']['transcript_has_open_turn'] is True)
+        legacy = job.describe()
+        legacy['delivery_id'] = 'req_1_legacykill'
+        legacy.pop('is_killed_by_timeout')
+        legacy['error'] = 'BridgeError: peer agent did not answer within 600s'
+        outbox._write_record(legacy)
+        report = bridge.delivery_report(legacy['delivery_id'])
+        check('legacy fixed-timeout records are reported as killed too',
+              report['delivery']['is_killed_by_timeout'] is True
+              and report['peer_transcript']['is_working'] is False)
+    finally:
+        outbox.OUTBOX, discovery.peer_progress = original
+
+
+def test_unrelated_transcript_activity_does_not_extend_a_cli_turn() -> None:
+    original = discovery.find_session
+    with tempfile.TemporaryDirectory(prefix='cli-unrelated-') as store:
+        target = store + '/target.jsonl'
+        unrelated = store + '/other.jsonl'
+        with open(target, 'w') as f:
+            f.write('frozen target transcript\n')
+        discovery.find_session = lambda agent, sid: {'path': target}
+        script = (
+            'import sys, time\n'
+            'print("initial activity", flush=True)\n'
+            'for i in range(20):\n'
+            '    with open(sys.argv[1], "a") as f: f.write("other session\\n")\n'
+            '    time.sleep(0.08)\n')
+        try:
+            started = time.monotonic()
+            try:
+                bridge._run_cli([sys.executable, '-B', '-c', script, unrelated], store,
+                                bridge._running_as(dict(os.environ), 'claude', 'peer-sid'),
+                                timeout=0.3)
+                check('a turn that becomes idle is killed despite unrelated session writes', False)
+            except bridge.BridgeError as e:
+                check('a turn that becomes idle is killed despite unrelated session writes',
+                      'killed by bridge timeout' in str(e)
+                      and time.monotonic() - started < 1.2 and os.path.getsize(unrelated) > 0)
+        finally:
+            discovery.find_session = original
+
+
+def test_a_finished_cli_does_not_leave_pipe_holding_descendants() -> None:
+    with tempfile.TemporaryDirectory(prefix='cli-exit-tree-') as store:
+        marker = store + '/descendant.pid'
+        script = (
+            'import subprocess, sys, time\n'
+            'child = subprocess.Popen([sys.executable, "-B", "-c", '
+            '"import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"])\n'
+            'with open(sys.argv[1], "w") as f: f.write(str(child.pid))\n'
+            'time.sleep(0.08)\n'
+            'print("final answer", flush=True)\n')
+        started = time.monotonic()
+        result = bridge._run_cli([sys.executable, '-B', '-c', script, marker], store,
+                                 dict(os.environ), timeout=0.4)
+        child_pid = int(open(marker).read())
+        deadline = time.monotonic() + 2
+        while registry._is_pid_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        check('a finished CLI preserves its result even if a tool still holds stdout',
+              result.returncode == 0 and result.stdout.strip() == 'final answer'
+              and time.monotonic() - started < 3)
+        check('pipe-holding descendants are killed even if they ignore SIGTERM',
+              not registry._is_pid_alive(child_pid))
+
+
+def test_a_cli_stops_after_losing_its_exact_busy_lock() -> None:
+    original = outbox.LEASE_RENEW_SECONDS
+    outbox.LEASE_RENEW_SECONDS = 0.02
+    box = outbox.Outbox()
+    with tempfile.TemporaryDirectory(prefix='cli-lock-loss-') as store:
+        marker = store + '/cli.pid'
+        script = (
+            'import os, sys, time\n'
+            'with open(sys.argv[1], "w") as f: f.write(str(os.getpid()))\n'
+            'while True:\n'
+            '    print("active", flush=True); time.sleep(0.04)\n')
+        box.deliver = lambda job: bridge._run_cli(
+            [sys.executable, '-B', '-c', script, marker], store, dict(os.environ), job.timeout)
+        job = _job(box, 'lock-loss-' + uuid_hex(), wants_reply=True)
+        job.timeout = 0.4
+        try:
+            box.submit(job)
+            deadline = time.monotonic() + 2
+            while not os.path.exists(marker) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            path = registry._lock_path('codex', job.target_session_id)
+            with registry._lock_transition():
+                record = json.load(open(path))
+                record['started_at'] -= record['ttl_seconds'] + 1
+                json.dump(record, open(path, 'w'))
+            with registry.busy_lock('codex', job.target_session_id, 'replacement') as replacement:
+                _drain(box)
+                check('even an active CLI stops when it loses ownership of its session lock',
+                      job.state == outbox.STATE_FAILED and job.is_lock_lost
+                      and job.is_stopped_after_lock_loss
+                      and not registry._is_pid_alive(int(open(marker).read())))
+                check('the lost owner cannot release or overwrite its replacement lock',
+                      registry.read_busy_lock('codex', job.target_session_id)['token'] == replacement)
+                check('lock loss is persisted instead of a stale running record',
+                      outbox.read_record(job.delivery_id)['is_stopped_after_lock_loss'] is True)
+        finally:
+            outbox.LEASE_RENEW_SECONDS = original
 
 
 # ------------------------------- sub-agent threads must never receive a relay
@@ -3141,21 +3344,36 @@ def test_a_panel_request_is_listened_to_until_the_turn_ends() -> None:
         check('each bounded by the await chunk',
               all(t <= bridge.PANEL_AWAIT_CHUNK_SECONDS for t in awaits), str(awaits))
 
-        # patience is a ceiling, not a verdict: past it the transcript watch takes over
-        def never_ends(shim, injection_id, timeout):
-            time.sleep(0.02)
-            return {'ok': False, 'pending': True, 'accepted': True, 'injectionId': injection_id}
+        # Accepted turns outlive patience; it is an informational threshold, not a failure.
+        long_awaits = []
+        progress = []
 
-        bridge.uihook.await_turn = never_ends
-        try:
-            bridge._call_via_panel('do it', 'peer-sid', {'socket': '/s'}, 600, '/w',
-                                   wants_result=True, patience=0.01)
-            check('running out of patience raises', False, 'nothing raised')
-        except bridge.BridgeError as e:
-            check('running out of patience hands over to the transcript watch',
-                  'still running' in str(e) and 'transcript' in str(e), str(e))
-        except Exception as e:
-            check('running out of patience raises a BridgeError', False, repr(e))
+        def ends_late(shim, injection_id, timeout):
+            long_awaits.append(timeout)
+            time.sleep(0.02)
+            if len(long_awaits) == 4:
+                return {'ok': True, 'sessionId': 'peer-sid', 'reply': 'long turn finished'}
+            return {'ok': False, 'pending': True, 'injectionId': injection_id}
+
+        bridge.uihook.await_turn = ends_late
+        result = bridge._call_via_panel('do it', 'peer-sid', {'socket': '/s'}, 600, '/w',
+                                        wants_result=True, patience=0.01,
+                                        on_progress=lambda note: progress.append(note))
+        check('an accepted panel turn keeps running beyond patience',
+              result['reply'] == 'long turn finished' and len(long_awaits) == 4)
+        check('one informational update replaces the old failure',
+              len(progress) == 1 and 'still running' in progress[0]
+              and 'will send it back' in progress[0], str(progress))
+        long_awaits.clear()
+
+        def broken_notice(note):
+            raise RuntimeError('failed to build progress notice')
+
+        result = bridge._call_via_panel('do it', 'peer-sid', {'socket': '/s'}, 600, '/w',
+                                        wants_result=True, patience=0.01,
+                                        on_progress=broken_notice)
+        check('a failed informational notice never stops final answer collection',
+              result['reply'] == 'long turn finished')
     finally:
         bridge.uihook.send, bridge.uihook.await_turn = original
 
@@ -3544,6 +3762,152 @@ def test_a_long_panel_turn_keeps_its_busy_lock() -> None:
               registry.read_busy_lock(config.AGENT_CODEX, session_id) is None)
 
 
+def test_running_delivery_leases_are_renewed_without_stealing_locks() -> None:
+    box = outbox.Outbox()
+    job = _job(box, 'lease-' + uuid_hex(), wants_reply=True)
+    job.state = outbox.STATE_AWAITING
+    job.started_at = time.time()
+    job.expires_at = time.time() + 0.05
+    waiting = _job(box, job.target_session_id, wants_reply=True)
+    waiting.expires_at = time.time() + 0.05
+    box._queues[job.key()] = [waiting]
+    outbox.persist(waiting)
+    original = box._longest_run
+    box._longest_run = lambda job: 0.12
+    try:
+        with registry.busy_lock('codex', job.target_session_id, job.conversation_id,
+                                ttl_seconds=0.15) as token:
+            with box._keep_alive(job, 0.15, token):
+                time.sleep(0.3)
+                record = outbox.read_record(job.delivery_id)
+                check('a running delivery renews its on-disk lease past the original expiry',
+                      record is not None and record['expires_at'] > time.time())
+                queued_record = outbox.read_record(waiting.delivery_id)
+                check('queued requests behind a long turn renew their leases without starting',
+                      queued_record['expires_at'] > record['expires_at']
+                      and queued_record['state'] == outbox.STATE_QUEUED
+                      and queued_record['started_at'] is None)
+                check('and its lock remains exclusive beyond its original TTL',
+                      registry.read_busy_lock('codex', job.target_session_id) is not None)
+                try:
+                    with registry.busy_lock('codex', job.target_session_id, 'other'):
+                        check('a second delivery cannot claim the renewed session', False)
+                except registry.SessionBusyError:
+                    check('a second delivery cannot claim the renewed session', True)
+                check('an incorrect owner token cannot renew or replace the lock',
+                      registry.renew_busy_lock('codex', job.target_session_id, 'wrong', 60)
+                      is False)
+        with registry.busy_lock('codex', job.target_session_id, 'replacement') as replacement:
+            check('the original token cannot overwrite a replacement claim',
+                  registry.renew_busy_lock('codex', job.target_session_id, token, 60) is False
+                  and registry.read_busy_lock('codex', job.target_session_id)['token'] == replacement)
+        check('the lease keeper stops and the busy lock is released at completion',
+              registry.read_busy_lock('codex', job.target_session_id) is None)
+    finally:
+        box._longest_run = original
+
+
+def test_a_long_panel_turn_pushes_information_then_its_final_answer_once() -> None:
+    original = (outbox.OUTBOX, bridge.uihook.send, bridge.uihook.await_turn,
+                bridge._panel_session, bridge.registry.touch_pin, config.PANEL_PATIENCE_SECONDS)
+    box = outbox.Outbox()
+    outbox.OUTBOX = box
+    config.PANEL_PATIENCE_SECONDS = 0.01
+    bridge._panel_session = _fake_panel('sender-sid')
+    bridge.registry.touch_pin = lambda *a: None
+    bridge.uihook.send = lambda *a, **kw: {
+        'ok': False, 'pending': True, 'accepted': True, 'injectionId': 'long-turn',
+        'sessionId': 'long-peer'}
+    traffic = []
+    awaits = []
+
+    def await_turn(*a):
+        awaits.append(1)
+        time.sleep(0.02)
+        if len(awaits) == 5:
+            return {'ok': True, 'sessionId': 'long-peer', 'reply': 'late final answer'}
+        return {'ok': False, 'pending': True, 'accepted': True, 'injectionId': 'long-turn',
+                'sessionId': 'long-peer'}
+
+    def deliver(job):
+        if job.kind == outbox.KIND_REQUEST:
+            return bridge._deliver(job)
+        traffic.append((job.kind, job.target_session_id, job.payload))
+        return {'session_id': job.target_session_id, 'reply': '', 'is_new_session': False}
+
+    bridge.uihook.await_turn = await_turn
+    box.deliver = deliver
+    box.build_reply = bridge._build_reply_job
+    box.build_notice = bridge._build_notice_job
+    try:
+        job = _job(box, 'long-peer', wants_reply=True)
+        job.ui_shim = {'socket': '/fake-panel'}
+        job.timeout = 0.01
+        box.submit(job)
+        _drain(box)
+        check('the long panel request completes as delivered without a timeout error',
+              job.state == outbox.STATE_DELIVERED and job.error is None)
+        check('one INFO notice goes back to the sender, followed by one final reply',
+              [kind for kind, sid, payload in traffic] == [outbox.KIND_PROGRESS, outbox.KIND_REPLY]
+              and all(sid == 'sender-sid' for kind, sid, payload in traffic), str(traffic)[:200])
+        check('the progress message is informational and asks for no resend',
+              'PROGRESS (INFO)' in traffic[0][2] and 'Do not resend' in traffic[0][2]
+              and 'DELIVERY FAILED' not in traffic[0][2])
+        check('the final reply is collected through the normal route',
+              'late final answer' in traffic[1][2])
+        check('progress and final return deliveries are separate and persisted',
+              job.progress_delivery_id != job.return_delivery_id
+              and outbox.read_record(job.delivery_id)['progress_delivery_id'] == job.progress_delivery_id
+              and job.return_delivery_id is not None)
+    finally:
+        (outbox.OUTBOX, bridge.uihook.send, bridge.uihook.await_turn,
+         bridge._panel_session, bridge.registry.touch_pin, config.PANEL_PATIENCE_SECONDS) = original
+
+
+def test_progress_never_waits_ahead_of_the_final_answer() -> None:
+    box = outbox.Outbox()
+    parent = _job(box, 'info-peer', wants_reply=True)
+    parent.reply = 'final answer is ready'
+    box._history.append(parent)
+    info = _notice(box, parent)
+    info.kind = outbox.KIND_PROGRESS
+    info.parent_delivery_id = parent.delivery_id
+    calls = []
+    box.deliver = lambda job: calls.append(job.kind) or {
+        'session_id': job.target_session_id, 'reply': '', 'is_new_session': False}
+    box.submit(info)
+    _drain(box)
+    check('queued INFO is skipped once the final answer is already ready',
+          info.is_undelivered and calls == [] and 'superseded' in info.error)
+
+    def busy(job):
+        calls.append(job.kind)
+        raise outbox.PeerBusyError('the sender is busy with another turn')
+
+    box.deliver = busy
+    info = _notice(box, parent)
+    info.kind = outbox.KIND_PROGRESS
+    started = time.monotonic()
+    try:
+        box._deliver_with_retries(info)
+        check('INFO does not busy-wait or retry in front of the final reply', False)
+    except outbox.PeerBusyError:
+        check('INFO does not busy-wait or retry in front of the final reply',
+              time.monotonic() - started < 0.5 and calls == [outbox.KIND_PROGRESS])
+
+    original = bridge.panel_state
+    bridge.panel_state = lambda *a: {'is_turn_active': True}
+    info.ui_shim = {'socket': '/fake'}
+    try:
+        try:
+            bridge._deliver(info)
+            check('INFO never queues a new panel turn behind a busy sender', False)
+        except outbox.NotDeliveredError as e:
+            check('INFO never queues a new panel turn behind a busy sender', 'sender is busy' in str(e))
+    finally:
+        bridge.panel_state = original
+
+
 def test_delivery_report_rereads_the_peer_transcript() -> None:
     """The follow-up read koppa asked for: a recovered fragment, or a notice that the peer may
     still be working, and a way to look again once it has finished."""
@@ -3618,27 +3982,46 @@ def test_a_finished_turn_that_echoes_the_request_ends_the_wait() -> None:
         check('and looked up by the request id',
               asked and asked[0] == ('codex', 'peer-sid', 'req_1_abcdef'), str(asked))
 
+        # A pending response can omit acceptance/session metadata already acknowledged.
+        awaits.clear()
+
+        def omitted_metadata(shim, injection_id, timeout):
+            awaits.append(timeout)
+            return {'ok': False, 'pending': True, 'injectionId': injection_id}
+
+        bridge.uihook.await_turn = omitted_metadata
+        bridge.discovery.peer_progress = lambda *a, **kw: {
+            'answer': 'req_1_abcdef final from transcript' if awaits else None,
+            'is_working': not bool(awaits)}
+        result = bridge._call_via_panel('do it', 'peer-sid', {'socket': '/s'}, 600, '/w',
+                                        patience=0.05, target_agent='codex',
+                                        request_token='req_1_abcdef')
+        check('accepted metadata remains valid when later pending responses omit it',
+              result['reply'] == 'req_1_abcdef final from transcript'
+              and result['session_id'] == 'peer-sid'
+              and result['is_reply_confirmed_by_transcript'] is True and len(awaits) == 1)
+
         # a finished turn that does not echo the request is somebody else's turn
         bridge.discovery.peer_progress = lambda agent, session_id, after=None, token=None: {
             'answer': '다른 턴의 답', 'answered_at': 1.0, 'is_working': False}
-        try:
-            bridge._call_via_panel('do it', 'peer-sid', {'socket': '/s'}, 600, '/w',
-                                   wants_result=True, patience=0.05, target_agent='codex',
-                                   request_token='req_1_abcdef')
-            check('a finished turn without the echo does not end the wait', False, 'nothing raised')
-        except bridge.BridgeError as e:
-            check('a finished turn without the echo does not end the wait',
-                  'still running' in str(e), str(e))
+        def ends_after_wait(shim, injection_id, timeout):
+            awaits.append(timeout)
+            return {'ok': True, 'sessionId': 'peer-sid', 'reply': 'the shim final answer'}
+
+        bridge.uihook.await_turn = ends_after_wait
+        result = bridge._call_via_panel('do it', 'peer-sid', {'socket': '/s'}, 600, '/w',
+                                        wants_result=True, patience=0.05, target_agent='codex',
+                                        request_token='req_1_abcdef')
+        check('a finished turn without the echo does not end the wait',
+              result['reply'] == 'the shim final answer' and awaits
+              and not result['is_reply_confirmed_by_transcript'])
 
         # with no request id there is nothing to match, so the transcript is not consulted
         asked.clear()
         bridge.discovery.peer_progress = lambda *a, **kw: asked.append(kw) or {'answer': 'x'}
-        try:
-            bridge._call_via_panel('do it', 'peer-sid', {'socket': '/s'}, 600, '/w',
-                                   wants_result=True, patience=0.05, target_agent='codex',
-                                   request_token=None)
-        except bridge.BridgeError:
-            pass
+        bridge._call_via_panel('do it', 'peer-sid', {'socket': '/s'}, 600, '/w',
+                               wants_result=True, patience=0.05, target_agent='codex',
+                               request_token=None)
         check('without a request id the transcript is not consulted', not asked, str(asked))
         check('and a shim that lost the turn is asked again within half a minute',
               bridge.PANEL_AWAIT_CHUNK_SECONDS <= 30, str(bridge.PANEL_AWAIT_CHUNK_SECONDS))
@@ -7121,6 +7504,13 @@ def run_all() -> None:
     test_cwd_relations()
     test_codex_scan_filters_before_limit()
     test_timeout_kills_descendants()
+    test_active_cli_output_outlives_the_idle_timeout()
+    test_transcript_only_activity_keeps_a_cli_alive()
+    test_a_fresh_codex_cli_watches_its_announced_transcript()
+    test_a_cli_timeout_is_recorded_as_stopped_work()
+    test_unrelated_transcript_activity_does_not_extend_a_cli_turn()
+    test_a_finished_cli_does_not_leave_pipe_holding_descendants()
+    test_a_cli_stops_after_losing_its_exact_busy_lock()
     test_subagent_threads_are_rejected()
     test_new_session_is_the_last_resort()
     test_the_receipt_says_who_chose_the_conversation()
@@ -7200,6 +7590,9 @@ def run_all() -> None:
     test_a_codex_turn_outliving_the_first_wait_can_be_awaited()
     test_the_claude_shim_hands_over_and_reports_later()
     test_a_long_panel_turn_keeps_its_busy_lock()
+    test_running_delivery_leases_are_renewed_without_stealing_locks()
+    test_a_long_panel_turn_pushes_information_then_its_final_answer_once()
+    test_progress_never_waits_ahead_of_the_final_answer()
     test_delivery_report_rereads_the_peer_transcript()
     test_a_finished_turn_that_echoes_the_request_ends_the_wait()
     test_the_caller_named_by_its_metadata_is_the_return_address()
