@@ -10,6 +10,12 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
+LATEST_CODEX="/Users/dexter/.nvm/versions/node/v22.22.1/bin/codex"
+
+# The VS Code extension bundles an older Codex binary that lacks newer models.
+if [[ -z "${CROSS_AGENT_REAL_CODEX:-}" && -x "${LATEST_CODEX}" ]]; then
+    export CROSS_AGENT_REAL_CODEX="${LATEST_CODEX}"
+fi
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "cross-agent shim: venv missing at ${PYTHON_BIN}, running Codex directly" >&2
