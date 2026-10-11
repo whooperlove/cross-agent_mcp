@@ -26,13 +26,18 @@ os.environ['CODEX_HOME'] = STATE_ROOT + '/codex'
 os.environ['GROK_HOME'] = STATE_ROOT + '/grok'
 # the names the editor keeps for Grok conversations are the user's own
 os.environ['CROSS_AGENT_GROK_NAMES_DB'] = STATE_ROOT + '/no-such-state.vscdb'
+os.environ['CROSS_AGENT_COPILOT_HOST_DB'] = STATE_ROOT + '/copilot/agent-host.db'
+os.environ['CROSS_AGENT_COPILOT_SESSION_DIR'] = STATE_ROOT + '/copilot/sessions'
+os.environ['CROSS_AGENT_COPILOT_SDK_SESSION_DIR'] = STATE_ROOT + '/copilot/sdk'
+os.environ['CROSS_AGENT_COPILOT_ENDPOINT_DIR'] = STATE_ROOT + '/copilot/endpoints'
 
 # The bridge hands these to the turns it starts, and a suite run from inside such a turn - a
 # peer reviewing a branch through the bridge, say - inherits that conversation. The hop
 # counter comes with it, so `send_message` raises "reached the hop limit" and the run ends
 # partway through rather than reporting anything. The suite is not part of anyone's exchange.
 for _inherited in ('CROSS_AGENT_CONVERSATION_ID', 'CROSS_AGENT_HOP', 'CROSS_AGENT_SENDER',
-                   'CROSS_AGENT_BUSY', 'CROSS_AGENT_SELF_SESSION', 'GROK_SESSION_ID'):
+                   'CROSS_AGENT_BUSY', 'CROSS_AGENT_SELF_SESSION', 'GROK_SESSION_ID',
+                   'COPILOT_AGENT_SESSION_ID'):
     os.environ.pop(_inherited, None)
 # a strict bridge hands that setting on too, and most checks here send without a session_id
 os.environ.pop('CROSS_AGENT_REQUIRE_EXPLICIT_TARGET', None)
@@ -6631,11 +6636,12 @@ def test_a_grok_process_is_recognised_as_the_caller() -> None:
 
 
 def test_every_agent_is_named_by_the_tool_that_reaches_it() -> None:
-    check('the bridge lists three agents', set(config.AGENTS) == {'claude', 'codex', 'grok'},
+    check('the bridge lists four agents',
+          set(config.AGENTS) == {'claude', 'codex', 'grok', 'copilot'},
           str(config.AGENTS))
     check('each is reached by send_to_<agent>',
           [bridge.reach_tool(a) for a in config.AGENTS]
-          == ['send_to_claude', 'send_to_codex', 'send_to_grok'])
+          == ['send_to_claude', 'send_to_codex', 'send_to_grok', 'send_to_copilot'])
     check('and something that is not an agent is not given a tool name',
           bridge.reach_tool('unknown') == 'the cross-agent tool')
 
@@ -6664,8 +6670,10 @@ def test_every_agent_is_named_by_the_tool_that_reaches_it() -> None:
           'send_to_grok' in notice and 'Grok' in notice, notice[:600])
 
     check('a refused self-send names the tools that lead elsewhere, all of them',
-          bridge._tools_reaching_others('grok') == '`send_to_claude` or `send_to_codex`'
-          and bridge._tools_reaching_others('claude') == '`send_to_codex` or `send_to_grok`',
+          bridge._tools_reaching_others('grok')
+          == '`send_to_claude` or `send_to_codex` or `send_to_copilot`'
+          and bridge._tools_reaching_others('claude')
+          == '`send_to_codex` or `send_to_grok` or `send_to_copilot`',
           bridge._tools_reaching_others('grok'))
 
 

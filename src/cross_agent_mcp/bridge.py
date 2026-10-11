@@ -74,6 +74,7 @@ AGENT_LABEL: Dict[str, str] = {
     config.AGENT_CLAUDE: 'Claude Code',
     config.AGENT_CODEX: 'Codex',
     config.AGENT_GROK: 'Grok',
+    config.AGENT_COPILOT: 'Copilot',
 }
 
 # Agents that can start a session under an id the bridge picks, so the receipt can name the
@@ -761,8 +762,11 @@ def _call_via_panel(message: str, session_id: Optional[str], ui_shim: Dict[str, 
     # exist a moment ago, and that is only checkable against the sessions that did.
     existing = _live_session_ids(target_agent) if create_new else set()
 
+    return_options = ({'requires_interactive_client': True}
+                      if target_agent == config.AGENT_COPILOT and not wants_result else {})
     response = uihook.send(message, ui_shim, session_id, timeout, cwd, title,
-                           accept_timeout=PANEL_ACCEPT_SECONDS, create_new=create_new)
+                           accept_timeout=PANEL_ACCEPT_SECONDS, create_new=create_new,
+                           **return_options)
     _raise_for_panel_failure(response)
     resolved_session_id = response.get('sessionId') or session_id
     was_created = bool(response.get('wasCreated'))
@@ -1034,8 +1038,19 @@ def _call_grok(message: str, session_id: Optional[str], cwd: str, env: Dict[str,
     }
 
 
+def _call_copilot(message: str, session_id: Optional[str], cwd: str,
+                  env: Dict[str, str], timeout: int,
+                  ui_shim: Optional[Dict[str, Any]] = None,
+                  title: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+    """Address the existing Agent Host runtime, preserving its model and tool settings."""
+    if not ui_shim or not session_id:
+        raise BridgeError('Copilot requires an existing session on a live VS Code Agent Host. '
+                          'No CLI resume or new conversation was started.')
+    return _call_via_panel(message, session_id, ui_shim, timeout, cwd, title, **kwargs)
+
+
 CALLERS = {config.AGENT_CLAUDE: _call_claude, config.AGENT_CODEX: _call_codex,
-           config.AGENT_GROK: _call_grok}
+           config.AGENT_GROK: _call_grok, config.AGENT_COPILOT: _call_copilot}
 
 
 # ------------------------------------------------------------------ dispatch
@@ -1044,6 +1059,7 @@ PANEL_SETTING = {
     config.AGENT_CODEX: 'chatgpt.cliExecutable -> codex-shim.sh',
     config.AGENT_CLAUDE: 'claudeCode.claudeProcessWrapper -> claude-shim.sh',
     config.AGENT_GROK: 'grok.cliPath -> grok-shim.sh',
+    config.AGENT_COPILOT: 'VS Code Agent Host local endpoint (no shim installation required)',
 }
 
 
@@ -1067,6 +1083,10 @@ def _panel_session(target_agent: str, wanted_id: Optional[str],
     """An already-open conversation in this window's panel, or None."""
     if not uihook.is_enabled():
         return None
+
+    if target_agent == config.AGENT_COPILOT and wanted_id:
+        # Pins and return traffic must not bypass an ambiguous stored Host UUID.
+        discovery.find_session(target_agent, wanted_id)
 
     live = uihook.find_live_session(target_agent, wanted_id)
     if not live or live['session_id'] in exclude_ids:
@@ -1108,6 +1128,8 @@ def _return_shim(agent: str, session_id: str, delivery_id: str,
     with contextlib.suppress(Exception):
         panel = _panel_session(agent, session_id, [])
     shim = (panel or {}).get('ui_shim')
+    if shim is not None and not uihook.is_return_available(shim, session_id):
+        shim = None
     if shim is None:
         logger.info(f'_return_shim [no panel]: {delivery_id} {what} for {agent} session '
                     f'{session_id} has no live panel to deliver into; not resuming it')
@@ -1192,6 +1214,9 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
         return target
 
     if is_new_forced:
+        if target_agent == config.AGENT_COPILOT:
+            raise BridgeError('Copilot supports existing Agent Host sessions only. '
+                              'Pass session_id with its name or id; nothing was sent.')
         host = _new_panel_conversation(target_agent)
         if host is None and config.UI_HOOK_MODE == uihook.UI_HOOK_REQUIRE:
             raise BridgeError(
@@ -1203,6 +1228,9 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
         return chosen(host, SELECTED_FORCED_NEW)
 
     wanted_id, requested = _requested_session_id(target_agent, session_id, cwd)
+    if target_agent == config.AGENT_COPILOT and not wanted_id:
+        raise BridgeError('Copilot requires an explicit session_id or a sticky pin. '
+                          'Use list_agent_sessions(agent="copilot") to choose the session.')
 
     # 1. the session that was named (or pinned) - in the panel if it happens to be open there
     if wanted_id:
@@ -1210,6 +1238,11 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
         panel = _panel_session(target_agent, wanted_id, exclude_ids)
         if panel:
             return chosen(panel, how)
+
+        if target_agent == config.AGENT_COPILOT:
+            raise BridgeError(f'Copilot session {requested or wanted_id!r} has no reachable '
+                              'VS Code Agent Host local endpoint. Nothing was sent; '
+                              'no CLI resume or new conversation was started.')
 
         found = discovery.find_session(target_agent, wanted_id)
         if not found:
@@ -1610,6 +1643,17 @@ def panel_state(agent: str, session_id: str) -> Dict[str, Any]:
                 'note': 'not open in any panel this bridge can see; only the transcript speaks '
                         'for it'}
 
+    if agent == config.AGENT_COPILOT:
+        presence = uihook.read_presence(live['shim'], session_id)
+        if not presence.get('ok') or not presence.get('is_open_in_panel'):
+            has_own_runtime = bool(presence.get('ok') and presence.get('is_caller_runtime_available'))
+            return {'is_open_in_a_panel': False,
+                    'is_caller_runtime_available': has_own_runtime,
+                    'note': ('The exact Copilot SDK caller can receive replies on its existing '
+                             'host without an editor client.' if has_own_runtime else
+                             'No attached editor or exact SDK caller runtime was confirmed. '
+                             'Return traffic stays on the delivery record.')}
+
     approval = live.get('awaiting_approval')
     return {
         'is_open_in_a_panel': True,
@@ -1642,9 +1686,25 @@ def _host_declared_session(sender_agent: str) -> Optional[str]:
 
     Grok exports `GROK_SESSION_ID` to every MCP server it starts, and starts them per session,
     so - unlike a Claude or Codex process tree - the id is exact without anything being
-    guessed. Only a Grok caller counts: the variable rides down into everything Grok runs, and
-    a `claude` started from one of its shell commands is not that session.
+    guessed. Copilot exports its separate SDK UUID in `COPILOT_AGENT_SESSION_ID`; registered
+    default-chat metadata maps it to the editor UUID. Only the matching caller product counts:
+    a different agent started by a host inherits its variables without becoming that session.
     """
+    if sender_agent == config.AGENT_COPILOT:
+        value = os.environ.get(config.ENV_COPILOT_SESSION)
+        if not value:
+            return None
+        if not discovery.is_session_id(value):
+            raise BridgeError('Copilot supplied an invalid SDK session UUID. Nothing was sent.')
+        from . import copilot
+        try:
+            found = copilot.find_copilot_session_by_sdk_id(value)
+        except copilot.AmbiguousCopilotSession as error:
+            raise BridgeError(f'{error} Nothing was sent.') from error
+        if not found:
+            raise BridgeError('Copilot SDK session has no unique registered default chat. '
+                              'It may be archived, a subagent or a side chat. Nothing was sent.')
+        return found['session_id']
     if sender_agent != config.AGENT_GROK:
         return None
     value = os.environ.get(config.ENV_GROK_SESSION) or ''
@@ -1662,6 +1722,9 @@ def _own_session_id(sender_agent: str) -> Optional[str]:
     if sender_agent not in CALLERS:
         return None
 
+    if sender_agent == config.AGENT_COPILOT:
+        return _resolve_copilot_caller_session()
+
     declared = _declared_session(sender_agent) or _host_declared_session(sender_agent)
     if declared:
         return declared
@@ -1676,6 +1739,20 @@ def _own_session_id(sender_agent: str) -> Optional[str]:
     found = discovery.find_active_session(
         sender_agent, discovery.SCOPE_CWD, os.getcwd(), use_pin=False)
     return found['session_id'] if found else None
+
+
+def _resolve_copilot_caller_session(caller_session_id: Optional[str] = None) -> Optional[str]:
+    """Host metadata and the SDK's own process binding must not name different chats."""
+    declared = _host_declared_session(config.AGENT_COPILOT)
+    if caller_session_id:
+        if not discovery.is_session_id(caller_session_id):
+            raise BridgeError('Copilot caller metadata has an invalid session UUID. Nothing was sent.')
+        caller_session_id = caller_session_id.lower()
+        if declared and declared != caller_session_id:
+            raise BridgeError('Copilot caller metadata conflicts with its SDK process session. '
+                              'Nothing was sent; no return address was guessed.')
+        return caller_session_id
+    return declared or _declared_session(config.AGENT_COPILOT)
 
 
 # A CLI session that has not been touched for this long, and is not open in a panel, is more
@@ -1747,7 +1824,8 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
                  cwd: Optional[str] = None, timeout: Optional[int] = None,
                  conversation_id: Optional[str] = None, is_raw: bool = False,
                  allows_same_agent: bool = False,
-                 caller_session_id: Optional[str] = None) -> Dict[str, Any]:
+                 caller_session_id: Optional[str] = None,
+                 caller_agent: Optional[str] = None) -> Dict[str, Any]:
     """Queue `message` for the peer agent's active session and return once it is accepted.
 
     The peer's answer is not this function's return value. It arrives later as a message in
@@ -1780,8 +1858,12 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
 
     identity = caller.detect_caller()
     sender_agent = identity['agent']
+    if caller_agent == config.AGENT_COPILOT and discovery.is_session_id(caller_session_id):
+        sender_agent = caller_agent
 
-    self_session_id = caller_session_id or _own_session_id(sender_agent)
+    self_session_id = (_resolve_copilot_caller_session(caller_session_id)
+                       if sender_agent == config.AGENT_COPILOT else
+                       caller_session_id or _own_session_id(sender_agent))
     if caller_session_id:
         logger.info(f'send_message [caller named itself]: {sender_agent} {caller_session_id}')
 

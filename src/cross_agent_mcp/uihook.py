@@ -65,6 +65,9 @@ def list_shims(agent: Optional[str] = None) -> List[Dict[str, Any]]:
 
         record['registry_path'] = path
         shims.append(record)
+    if agent is None or agent == config.AGENT_COPILOT:
+        from . import copilot_transport
+        shims.extend(copilot_transport.list_shims())
     return shims
 
 
@@ -143,9 +146,31 @@ def _request(socket_path: str, payload: Dict[str, Any], timeout: float) -> Dict[
 
 def read_status(shim: Dict[str, Any]) -> Dict[str, Any]:
     try:
+        if shim.get('transport') == 'copilot-ahp':
+            from . import copilot_transport
+            return copilot_transport.request(shim, {'op': 'status'}, CONNECT_TIMEOUT_SECONDS)
         return _request(shim['socket'], {'op': 'status'}, CONNECT_TIMEOUT_SECONDS)
     except Exception as e:
         return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+
+
+def read_presence(shim: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+    """Keep actual editor presence separate from the SDK caller's own live runtime."""
+    from . import copilot_transport
+    try:
+        return copilot_transport.request(
+            shim, {'op': 'presence', 'sessionId': session_id}, CONNECT_TIMEOUT_SECONDS)
+    except Exception:
+        return {'ok': False, 'is_open_in_panel': False, 'is_caller_runtime_available': False}
+
+
+def is_return_available(shim: Dict[str, Any], session_id: str) -> bool:
+    """A catalog entry alone is insufficient; an exact SDK caller can receive its own reply."""
+    if shim.get('transport') != 'copilot-ahp':
+        return True
+    presence = read_presence(shim, session_id)
+    return bool(presence.get('ok') and (
+        presence.get('is_open_in_panel') or presence.get('is_caller_runtime_available')))
 
 
 def find_live_sessions(agent: str) -> List[Dict[str, Any]]:
@@ -296,7 +321,8 @@ def find_panel_host(agent: str) -> Optional[Dict[str, Any]]:
 def send(text: str, shim: Dict[str, Any], session_id: Optional[str], timeout: int,
          cwd: Optional[str] = None, title: Optional[str] = None,
          accept_timeout: Optional[int] = None,
-         create_new: bool = False) -> Dict[str, Any]:
+         create_new: bool = False,
+         requires_interactive_client: bool = False) -> Dict[str, Any]:
     """Hand a message to the panel.
 
     With `accept_timeout` the shim answers as soon as the peer has taken the message, with
@@ -317,10 +343,15 @@ def send(text: str, shim: Dict[str, Any], session_id: Optional[str], timeout: in
         # said out loud to the shim as well, not only decided here: the shim is the only
         # party that knows whether it can honour it
         payload['createNew'] = True
+    if requires_interactive_client:
+        payload['requiresInteractiveClient'] = True
 
     logger.info(f'send [BEGIN]: via {shim.get("agent")} panel shim '
                 f'pid={shim.get("pid")} session={session_id}')
     try:
+        if shim.get('transport') == 'copilot-ahp':
+            from . import copilot_transport
+            return copilot_transport.request(shim, payload, timeout + CONNECT_TIMEOUT_SECONDS)
         return _request(shim['socket'], payload, timeout + CONNECT_TIMEOUT_SECONDS)
     except PanelUnreachable as e:
         logger.error(f'send [unreachable]: {e}')
@@ -341,6 +372,9 @@ def await_turn(shim: Dict[str, Any], injection_id: str, timeout: int) -> Dict[st
     """
     payload = {'op': 'await', 'injectionId': injection_id, 'timeout': timeout}
     try:
+        if shim.get('transport') == 'copilot-ahp':
+            from . import copilot_transport
+            return copilot_transport.request(shim, payload, timeout + CONNECT_TIMEOUT_SECONDS)
         return _request(shim['socket'], payload, timeout + CONNECT_TIMEOUT_SECONDS)
     except Exception as e:
         logger.error(f'await_turn [exception]: {injection_id} {e}')

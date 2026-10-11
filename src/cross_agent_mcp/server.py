@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 
-from . import bridge, caller, config, discovery, outbox, panel, registry, uihook
+from . import bridge, caller, config, copilot, discovery, outbox, panel, registry, uihook
 
 
 logger = logging.getLogger('cross_agent_mcp')
@@ -25,9 +25,11 @@ logger = logging.getLogger('cross_agent_mcp')
 SERVER_INSTRUCTIONS = (
     'Bridge between the coding agents running in this editor. '
     '`send_to_codex` resumes the live Codex thread; `send_to_claude` resumes the live '
-    'Claude Code session; `send_to_grok` resumes a Grok Build session. Each keeps the '
+    'Claude Code session; `send_to_grok` resumes a Grok Build session; '
+    '`send_to_copilot` addresses an existing Copilot Agent Host session. Each keeps the '
     'peer\'s existing conversation context. '
-    'When no active peer session exists, a fresh one is created automatically. '
+    'Claude, Codex and Grok can create a fresh session when none exists. Copilot requires '
+    'an exact existing session and a live VS Code local endpoint. '
     'Sending is asynchronous: the tool returns as soon as the message is queued and never '
     'carries the peer\'s answer. If this session is open in an editor panel when the peer '
     'answers, the answer arrives later as a separate message here; if it is not, no message '
@@ -103,15 +105,31 @@ def caller_session_from_meta(meta: Optional[Dict[str, Any]]) -> Optional[str]:
         thread_id = turn_meta.get('thread_id') or turn_meta.get('session_id')
         if isinstance(thread_id, str) and thread_id:
             return thread_id
+    conversation = meta.get('vscode.conversationId')
+    if isinstance(conversation, str) and conversation.startswith(
+            ('agent-host-copilotcli:/', 'copilotcli:/')):
+        return copilot.normalize_session_id(conversation)
+    return None
+
+
+def caller_agent_from_meta(meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(meta, dict) or meta.get('x-codex-turn-metadata'):
+        return None
+    conversation = meta.get('vscode.conversationId')
+    if isinstance(conversation, str) and conversation.startswith(
+            ('agent-host-copilotcli:/', 'copilotcli:/')) and caller_session_from_meta(meta):
+        return config.AGENT_COPILOT
     return None
 
 
 async def _send(target_agent: str, ctx: Optional[Context] = None, **kwargs) -> Dict[str, Any]:
     try:
-        caller_session_id = caller_session_from_meta(_request_meta(ctx))
+        meta = _request_meta(ctx)
+        caller_session_id = caller_session_from_meta(meta)
         return await _run_blocking(bridge.send_message, target_agent,
-                                   caller_session_id=caller_session_id, **kwargs)
-    except bridge.BridgeError as e:
+                                   caller_session_id=caller_session_id,
+                                   caller_agent=caller_agent_from_meta(meta), **kwargs)
+    except (bridge.BridgeError, copilot.AmbiguousCopilotSession) as e:
         logger.error(f'_send [exception]: {target_agent} {e}')
         return {'ok': False, 'target_agent': target_agent, 'error': str(e)}
     except Exception as e:
@@ -286,10 +304,43 @@ async def send_to_grok(
 
 
 @server.tool(
-    name='list_agent_sessions',
-    title='List discoverable Claude, Codex and Grok sessions',
+    name='send_to_copilot',
+    title='Send a message to an existing Copilot Agent Host session',
     description=(
-        'Show the Claude Code sessions, Codex threads and Grok Build sessions the bridge can '
+        'Send a message to an existing Copilot session on the live VS Code Agent Host, '
+        'preserving its conversation, custom model and tools. Pass session_id with the '
+        'exact name (for example copilot-test), UUID or Copilot session URI. The target '
+        'must be reachable through the published local endpoint. No CLI or new session '
+        'is started. ASYNCHRONOUS: the receipt carries a delivery id, never the answer. '
+        'The answer returns to the sender panel when available; otherwise read '
+        'bridge_status(delivery_id=...). Do not resend an accepted request.'
+    ),
+)
+async def send_to_copilot(
+    message: str,
+    session_id: Optional[str] = None,
+    new_session: bool = False,
+    scope: Optional[str] = None,
+    cwd: Optional[str] = None,
+    timeout: Optional[int] = None,
+    conversation_id: Optional[str] = None,
+    raw: bool = False,
+    allow_same_agent: bool = False,
+    ctx: Optional[Context] = None,
+) -> Dict[str, Any]:
+    """Address an existing Copilot session; new_session is unsupported and refused."""
+    return await _send(
+        config.AGENT_COPILOT, ctx, message=message, session_id=session_id,
+        is_new_session=new_session, scope=scope, cwd=cwd, timeout=timeout,
+        conversation_id=conversation_id, is_raw=raw, allows_same_agent=allow_same_agent,
+    )
+
+
+@server.tool(
+    name='list_agent_sessions',
+    title='List discoverable Claude, Codex, Grok and Copilot sessions',
+    description=(
+        'Show the Claude Code, Codex, Grok Build and Copilot Agent Host sessions the bridge can '
         'reach, newest first, together with how long ago each was touched and whether it '
         'counts as active.'
     ),
@@ -301,7 +352,7 @@ async def list_agent_sessions(
     limit: int = 10,
 ) -> Dict[str, Any]:
     """Args:
-    agent: 'claude', 'codex', 'grok', 'both' (Claude and Codex) or 'all' (all three).
+    agent: 'claude', 'codex', 'grok', 'copilot', 'both' (Claude and Codex) or 'all'.
     scope: 'cwd' (default), 'tree' or 'any'.
     cwd: Working directory to scope the lookup to.
     limit: Maximum number of sessions per agent.
@@ -366,6 +417,17 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
     target_cwd = os.path.realpath(os.path.expanduser(cwd)) if cwd else os.getcwd()
 
     identity = await _run_blocking(caller.detect_caller)
+    declared_agent = caller_agent_from_meta(caller_meta)
+    if declared_agent:
+        identity['agent'] = declared_agent
+    caller_session_error = None
+    if identity['agent'] == config.AGENT_COPILOT:
+        try:
+            caller_session_id = await _run_blocking(
+                bridge._resolve_copilot_caller_session, caller_session_id)
+        except bridge.BridgeError as error:
+            caller_session_id = None
+            caller_session_error = str(error)
     resolved: Dict[str, Any] = {}
     for name in config.AGENTS:
         try:
@@ -405,6 +467,7 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
         # the thread this call came from, when the host says so (Codex does); replies to a
         # request made from here are addressed to it
         'caller_session_id': caller_session_id,
+        'caller_session_error': caller_session_error,
         'caller_meta': caller_meta,
         'cwd': target_cwd,
         'scope': scope,
@@ -478,12 +541,12 @@ async def pin_agent_session(
     cwd: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Args:
-    agent: 'claude', 'codex' or 'grok'.
+    agent: 'claude', 'codex', 'grok' or 'copilot'.
     session_id: Session/thread id - or the conversation name - to pin. Empty removes the pin.
     cwd: Working directory the pin applies to.
     """
     if agent not in config.AGENTS:
-        return {'ok': False, 'error': f"agent must be 'claude', 'codex' or 'grok', got: {agent}"}
+        return {'ok': False, 'error': f"agent must be one of {', '.join(config.AGENTS)}, got: {agent}"}
 
     target_cwd = os.path.realpath(os.path.expanduser(cwd)) if cwd else os.getcwd()
 
@@ -538,7 +601,9 @@ def run_check() -> int:
             if resolved.get('title'):
                 print(f'      title: {resolved["title"]}')
         else:
-            print(f'\n  active {agent}: none in scope -> a new session would be created')
+            note = ('choose an existing session; no new session is created'
+                    if agent == config.AGENT_COPILOT else 'a new session would be created')
+            print(f'\n  active {agent}: none in scope -> {note}')
 
     locks = registry.list_busy_locks()
     print(f'\n  busy locks     : {len(locks)}')

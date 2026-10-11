@@ -56,6 +56,8 @@ def classify_process_name(name: str) -> Optional[str]:
         return config.AGENT_CLAUDE
     if 'grok' in base:
         return config.AGENT_GROK
+    if 'copilot' in base:
+        return config.AGENT_COPILOT
     return None
 
 
@@ -82,6 +84,11 @@ def detect_caller() -> Dict[str, Any]:
             agent_pid = pid
 
         pid = info['ppid']
+
+    # The SDK can be embedded in a generically named host. Another identified agent
+    # takes precedence over an inherited Copilot variable (e.g. Codex started by Copilot).
+    if agent is None and os.environ.get(config.ENV_COPILOT_SESSION):
+        agent = config.AGENT_COPILOT
 
     # an explicit override wins: useful when the bridge runs behind a wrapper process
     override = os.environ.get('CROSS_AGENT_SELF')

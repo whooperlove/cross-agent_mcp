@@ -29,6 +29,11 @@ os.environ['CODEX_HOME'] = STATE_DIR + '/codex'
 os.environ['GROK_HOME'] = STATE_DIR + '/grok'
 # the editor's name store is the user's own; the run must not read it either
 os.environ['CROSS_AGENT_GROK_NAMES_DB'] = STATE_DIR + '/no-such-state.vscdb'
+os.environ['CROSS_AGENT_COPILOT_HOST_DB'] = STATE_DIR + '/copilot/agent-host.db'
+os.environ['CROSS_AGENT_COPILOT_SESSION_DIR'] = STATE_DIR + '/copilot/sessions'
+os.environ['CROSS_AGENT_COPILOT_SDK_SESSION_DIR'] = STATE_DIR + '/copilot/sdk'
+os.environ['CROSS_AGENT_COPILOT_ENDPOINT_DIR'] = STATE_DIR + '/copilot/endpoints'
+os.environ.pop('COPILOT_AGENT_SESSION_ID', None)
 for _empty in ('/claude/projects', '/codex/sessions', '/grok/sessions'):
     os.makedirs(STATE_DIR + _empty, exist_ok=True)
 
@@ -146,7 +151,7 @@ async def main() -> int:
             names = [t.name for t in tools.tools]
             print(f'[ok] tools/list -> {names}')
 
-            expected = {'send_to_codex', 'send_to_claude', 'send_to_grok',
+            expected = {'send_to_codex', 'send_to_claude', 'send_to_grok', 'send_to_copilot',
                         'list_agent_sessions', 'bridge_status', 'pin_agent_session'}
             missing = expected - set(names)
             if missing:
@@ -191,7 +196,7 @@ async def main() -> int:
             # is covered without any turn by unit_guards.test_a_busy_session_is_waited_out.
 
     # both identities: under ambient detection exactly one of these was a real send
-    for agent in ('claude', 'codex', 'grok'):
+    for agent in config.AGENTS:
         if await _refuses_its_own_agent(agent):
             return 1
 
@@ -203,7 +208,7 @@ async def main() -> int:
             await session.initialize()
             listing = json.loads(_text_of(await session.call_tool(
                 'list_agent_sessions', {'agent': 'all', 'scope': 'any'})))
-    if listing['claude'] or listing['codex'] or listing['grok']:
+    if any(listing[agent] for agent in config.AGENTS):
         print(f'[FAIL] the isolated stores were not empty: {listing}')
         return 1
     print('[ok] ambient identity sees no real session to reach for')

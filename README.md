@@ -4,17 +4,26 @@
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-**Let your Claude Code session, your Codex thread and your Grok Build session talk to each other, live, without any of them losing its memory.**
+**Let your Claude Code, Codex, Grok Build and Copilot sessions talk to each other, live, without losing their existing context.**
 
-cross-agent MCP is a relay MCP server for the coding agents you already have running — an active
-**Claude Code** session, an active **Codex** thread and an active **Grok Build** session, in VS Code
-or in a plain terminal, it doesn't matter which. Any one of them can hand a message to
-another through `send_to_codex` / `send_to_claude` / `send_to_grok`, and the bridge finds each
-product's **currently active session** from the
-transcript it leaves on disk and **resumes it** — instead of spawning a disposable new agent —
-so both sides keep their full existing context. VS Code isn't required for any of this; it only
-unlocks one extra feature, covered in [section 3](#3-registration): seeing the exchange render
-live in the real chat panel instead of just landing in the transcript.
+Copilot support targets **existing VS Code Agent Host sessions**, including sessions using custom
+models. It connects to VS Code's authenticated local Agent Host Protocol (AHP) endpoint; the
+model, tools and approvals remain managed by the existing host. Copilot does not use the CLI
+fallback described below and requires an exact session name, UUID or Copilot session URI.
+
+cross-agent MCP is a relay MCP server for the coding agents you already have running —
+**Claude Code**, **Codex**, **Grok Build** and **Copilot**. Any one of them can hand a message to
+another through `send_to_codex` / `send_to_claude` / `send_to_grok` / `send_to_copilot`, keeping
+both sides' existing context. Claude, Codex and Grok work in VS Code or a plain terminal:
+the bridge finds their **currently active session** from the transcript on disk and
+**resumes it**. Their optional panel shims make the exchange render live in the real chat
+panel, as covered in [section 3](#3-registration). Copilot requires VS Code and uses its
+existing Agent Host session directly.
+
+Use `send_to_copilot(session_id="copilot-test", message="...")` for an existing Copilot
+conversation. `list_agent_sessions(agent="copilot")` includes its editor UUID, host URI,
+working directory and selected model. This integration has been verified with VS Code
+**1.141.0 / AHP 0.10.0** on macOS. Other AHP versions are refused until supported explicitly.
 
 That's the difference from just running a second CLI by hand: neither side has to re-explain
 the task, and neither one loses the conversation it was already having. A few things this is
@@ -24,11 +33,12 @@ useful for:
   Claude's plan, or the other way around, and keep working while it thinks.
 - **Hand off a long task and keep going.** `send_to_*` is asynchronous — it queues the message
   and returns immediately. Whenever the peer's answer is ready, it arrives back as a new message
-  in your own session — provided that session is open in a panel. If it isn't, the answer waits
-  on the delivery record for `bridge_status` instead, and the receipt says so up front.
+  in your own session — provided that session is open in a panel, or it is the Copilot caller's
+  verified SDK session on its existing host. Otherwise the answer waits on the delivery record
+  for `bridge_status`, and the receipt says so up front.
 - **Watch it happen, not just read a log.** With the panel shims from
-  [section 3](#3-registration) installed, every direction renders in VS Code's real chat panel
-  like any other message, instead of just appending a line to a transcript file.
+  [section 3](#3-registration) installed, Claude, Codex and Grok exchanges render in VS Code's
+  real chat panels. Copilot uses the host protocol directly and needs no shim.
 - **Long active turns keep running.** Headless turns use an inactivity timeout, reset by CLI
   output or target transcript writes. Accepted panel turns are watched until they finish.
 
@@ -62,25 +72,25 @@ the human.
 - [License](#license)
 
 ```
-                       VS Code or Terminal
-                                │
-     ┌───────────┬──────────┬───┴──────┬───────────┬──────────┐
-     │           │          │          │           │          │
-  Claude      Claude      Codex      Codex       Grok       Grok
- session A   session B   thread C   thread D   session E  session F
-     │           │          │          │           │          │
-     └───────────────── cross-agent MCP ────────────────────┘
-                                │
-                        session registry
-                 (~/.cross-agent/registry.json)
+          VS Code or Terminal                 VS Code Agent Host
+                   │                                  │
+        ┌──────────┼──────────┐                       │
+        │          │          │                       │
+      Claude     Codex       Grok                   Copilot
+     session A  thread B   session C                chat D
+        │          │          │                       │
+        └───────────── cross-agent MCP ────────────────┘
+                              │
+                      session registry
+               (~/.cross-agent/registry.json)
 ```
 
 Any of these can reach any other through the same hub — across products (Claude ↔ Codex ↔
-Grok), or Claude ↔ Claude / Codex ↔ Codex / Grok ↔ Grok within the same product (see the
+Grok ↔ Copilot), or between sessions within the same product (see the
 same-agent rows in the table below, and [section 6](#6-preventing-infinite-calls) for how
 that's gated).
 
-| Direction | Tool | With panel shim | Without it (fallback) |
+| Direction | Tool | Live editor transport | Without it (fallback) |
 |---|---|---|---|
 | Claude → Codex | `send_to_codex` | Inject `turn/start` into the panel's app-server | `codex exec resume <thread-id> --json` |
 | Codex → Claude | `send_to_claude` | Inject a stream-json user message into the panel process | `claude -p --resume <session-id> --output-format json` |
@@ -90,13 +100,23 @@ that's gated).
 | Claude → Claude¹ | `send_to_claude` | Inject a stream-json user message into the panel process | `claude -p --resume <session-id> --output-format json` |
 | Codex → Codex¹ | `send_to_codex` | Inject `turn/start` into the panel's app-server | `codex exec resume <thread-id> --json` |
 | Grok → Grok¹ | `send_to_grok` | Inject an ACP `session/prompt` into the panel's `grok agent stdio` | `grok --single=<message> --resume <session-id> --output-format streaming-json` |
+| Claude, Codex, Grok → Copilot | `send_to_copilot` | Authenticated AHP `chat/turnStarted` on an existing default chat; no shim | Refused; no CLI fallback |
+| Copilot → Claude, Codex, Grok | Matching `send_to_claude` / `send_to_codex` / `send_to_grok` | The target's panel shim, as above | The target's CLI resume, as above |
+| Copilot → Copilot¹ | `send_to_copilot` | Same existing-host AHP transport | Refused; no CLI fallback |
 
 ¹ Same-agent rows need an explicit target — `allow_same_agent=true` or a `session_id` for
-Claude and Grok, a `session_id` for Codex — see [section 6](#6-preventing-infinite-calls).
+Claude and Grok, a `session_id` for Codex. Copilot always needs `session_id` or a sticky pin;
+using that pin for Copilot → Copilot also needs `allow_same_agent=true` — see
+[section 6](#6-preventing-infinite-calls).
 
 With the shim attached, the exchange **renders directly in the real VS Code panel** (see section 3).
 
-The exchange is **asynchronous**. `send_to_*` queues the message and returns immediately — it does not carry the peer's reply. A background worker runs the peer's turn, and once a reply exists, it's **delivered into the sender's panel as a new message** (see [Return traffic needs a panel](#return-traffic-needs-a-panel)). Because nothing blocks, neither session is locked while the peer's turn runs, and a turn that takes several minutes won't be lost to a timeout.
+The exchange is **asynchronous**. `send_to_*` queues the message and returns immediately — it
+does not carry the peer's reply. A background worker runs the peer's turn, and once a reply
+exists, it is delivered as a new message through the sender's live return route (see
+[Return traffic needs a panel](#return-traffic-needs-a-panel), including Copilot's verified
+SDK route). Because nothing blocks, neither session is locked while the peer's turn runs,
+and a turn that takes several minutes won't be lost to a timeout.
 
 ```
 send_to_codex ──▶ [outbox queue] ──▶ Codex turn (minutes)
@@ -109,13 +129,22 @@ returns immediately                answer generated
 
 #### Reply address
 
-Since the reply needs somewhere to land, the sender must **know its own session precisely.** This isn't inferred — because the shim sits between the extension and the agent, the MCP server is a descendant of its own shim, and **the shim whose pid appears in its own ancestor chain is exactly the conversation hosting it.** That's a certainty, not a guess.
+Since the reply needs somewhere to land, the sender must **know its own session precisely.**
+For a per-conversation panel process, the MCP server is a descendant of its own shim, so
+the shim in its ancestor chain identifies that conversation. Shared runtimes need the
+caller bindings described below.
 
 A pin must not substitute for this. A pin records "where to **send**," not "who **I am**." When it once worked that way, a stale pin got used as the reply address and replies landed in the wrong session.
 
 Grok Build hands it over directly: it exports `GROK_SESSION_ID` to every MCP server it starts, and starts one **per session** — even when several sessions share one `grok agent stdio` process (checked by opening two in one process: two servers, each with its own id). So a Grok caller's return address is exact without any inference. The variable is inherited by everything Grok runs, which is why it counts **only for a Grok caller**: a `claude` started from one of Grok's shell commands is not that session.
 
 Codex needs one more level of precision. All the Codex threads in one window **share** a single app-server and a single MCP server, so the process tree can only tell you "this window," not which thread within it (back when the most-recently-active thread was picked instead, four replies landed in threads that had never asked anything). Instead, Codex attaches `x-codex-turn-metadata` (thread id, turn id) to every MCP call, so the bridge uses **the id the calling thread declares about itself** as the reply address. When this value is present it takes priority over inference. Claude Code runs a separate process per conversation, so the process tree alone is enough there.
+
+Copilot's SDK starts a separate MCP child per SDK session and supplies
+`COPILOT_AGENT_SESSION_ID`. The bridge maps that SDK UUID to the editor's Host UUID through
+registered default-chat metadata. It never uses a target pin or a shared runtime PID as the
+caller address. An invalid SDK binding or a conflict stops a send; see
+[Copilot registration](#copilot-vs-code-agent-host).
 
 The address is also written into the envelope — like the From line of an email.
 
@@ -134,25 +163,33 @@ Reply delivery runs **from the sender session's directory.** Claude transcripts 
 
 A request is addressed: somebody chose a session and sent to it, and resuming that session over the CLI is the delivery they asked for. **Return traffic is not addressed.** A reply, and the `DELIVERY FAILED` notice that stands in for one, goes back to whichever session started the exchange — and that session was live moments ago, because it was the one that sent.
 
-So return traffic is written into that session's panel, or it is not delivered at all. It is never delivered by resuming the session, because a resume there is not a message arriving in a conversation: it is **a second agent started in a conversation that already has one**, with the same tools, the same permissions and the same directory, answering as that session while the first is still working. Two agents speaking as one conversation is not a delivery problem.
+Return traffic is delivered through that session's live editor transport. For Claude, Codex
+and Grok, this requires a panel. Copilot can also receive it on its caller's own verified
+SDK session while the chat is hidden; the exact binding and host ownership are checked again
+before dispatch. Return delivery never resumes a CLI or starts another SDK runtime.
 
-When the sender has no panel:
+When the sender has neither an available panel nor that verified Copilot return route:
 
 - the `send_to_*` receipt says so at once — `return_panel_available_now: false`, plus a warning and a note saying where to read the answer instead. It reports the probe, not a promise: the route is resolved again when the answer exists, so a panel opened in the meantime is used, and one closed in the meantime is not replaced by a resume;
 - `bridge_status(delivery_id=...)` reports `is_return_status_only: true`, keeps a **2,000-character `reply_preview`** on the record, and reads the **full answer fresh from the peer's transcript** as `peer_transcript.answer`. If that transcript is later gone, the preview is what remains. Nothing is re-sent;
 - a reply whose panel closes *after* the route was resolved is retried — a reopened tab is found again — and fails as undelivered rather than resuming. The request names that delivery as `return_delivery_id`, and `bridge_status` on the request reports its outcome under `return_delivery`: a request finishes before its answer is delivered, so on its own it cannot say whether the answer landed.
 
-Sending **to** a dormant session is unchanged: it still resumes over the CLI, and the receipt still warns when that session has been idle long enough to look retired.
+Sending **to** a dormant Claude, Codex or Grok session still resumes over the CLI, and the
+receipt warns when it has been idle long enough to look retired. Copilot requires a reachable
+existing host even when the target chat is hidden.
 
 ---
 
 ## 1. Requirements
 
 - macOS / Linux, Python 3.10+
-- `claude` CLI (Claude Code 2.x), `codex` CLI (0.146+), and for Grok Build the `grok` CLI
-  (developed against 1.0.44)
+- For each CLI product you relay to: `claude` (Claude Code 2.x), `codex` (0.146+), or
+  `grok` (Grok Build, developed against 1.0.44)
 - Every CLI you use logged in (`grok login`, or `XAI_API_KEY` — see
   [What a spawned agent CLI inherits](#what-a-spawned-agent-cli-inherits))
+- For Copilot: VS Code with an existing Copilot Agent Host default chat, including a chat
+  using a custom model. Verified on macOS with **VS Code 1.141.0 / AHP 0.10.0**; no standalone
+  Copilot CLI is required. See [registration](#copilot-vs-code-agent-host).
 - For Grok in a VS Code chat panel (optional; everything else works from a terminal): the
   [Grok Build GUI](https://marketplace.visualstudio.com/items?itemName=SahilRakhaiya.grok-build-gui) extension
   (`SahilRakhaiya.grok-build-gui`, developed against 1.0.4). **It is the only Grok extension this
@@ -206,6 +243,122 @@ default_tools_approval_mode = "approve"   # so the UI doesn't show an approval p
 ```
 
 `default_tools_approval_mode` has no corresponding flag on `codex mcp add`, so it's added directly to config.toml. Valid values are `auto` / `prompt` / `writes` / `approve`; use `approve` to stop the approval prompt from popping up every time (`auto` kept asking). This does **not** fix the cancellation problem with headless `codex exec` (see section 9). Clicking **"Always allow"** once on the UI prompt has the same effect.
+
+### Copilot (VS Code Agent Host)
+
+Register this stdio server in VS Code's user-level `<VS Code user data>/User/mcp.json`
+(macOS Stable: `~/Library/Application Support/Code/User/mcp.json`; Linux Stable:
+`~/.config/Code/User/mcp.json`):
+
+```json
+{
+  "servers": {
+    "cross-agent": {
+      "type": "stdio",
+      "command": "/absolute/path/to/cross-agent_mcp/run-server.sh"
+    }
+  }
+}
+```
+
+For Copilot turns sent while no editor client is attached to that conversation, also merge
+the same definition into the Agent Host's persistent `mcpServers` map in
+`<VS Code user data>/User/globalStorage/agent-host-config.json`:
+
+```json
+{
+  "mcpServers": {
+    "cross-agent": {
+      "type": "stdio",
+      "command": "/absolute/path/to/cross-agent_mcp/run-server.sh"
+    }
+  }
+}
+```
+
+Preserve the file's other settings and other server definitions. On macOS Stable the file is
+`~/Library/Application Support/Code/User/globalStorage/agent-host-config.json`; on Linux Stable
+it is `~/.config/Code/User/globalStorage/agent-host-config.json`.
+
+After adding this host definition to a running installation, **fully quit and reopen VS Code
+once**. The host loads this file at startup; **Reload Window can keep the same host process
+alive and does not reread it**. Its supported `root/configChanged` API can apply and persist
+the same declaration without restarting, but the MCP server does not silently change host
+settings. User `mcp.json` alone is an editor client contribution: a reload or detached chat
+can remove it from an existing SDK session. The host-level definition keeps cross-agent
+available there. An active client's definition with the same server name takes precedence.
+
+No shim or extra extension is installed. The bridge discovers live editor endpoints under
+`<VS Code user data>/agent-host/local-endpoint/entries/`, authenticates using the existing
+owner-only metadata and subscribes to the target session's exact default chat. Authentication
+tokens never enter bridge records or logs. Both the outgoing model selection and its options
+are preserved from that chat. Accepted turns are correlated by their own turn ID and client
+sequence; an uncertain hand-over is reported without resending it.
+
+Copilot must already have an existing session on a reachable host. `new_session=true`, a
+missing target and a closed/unreachable host are refused; no CLI runtime is started. This does
+not cover legacy extension-host Copilot Chat or standalone Copilot CLI sessions. Returns to
+Copilot go through the same existing host, never a second runtime. Read-only recovery links
+the editor's UUID to the separate Copilot SDK session UUID in its metadata and reads completed
+SDK events matching the delivery token.
+
+Copilot's SDK gives its MCP process `COPILOT_AGENT_SESSION_ID`, the exact SDK session UUID.
+The bridge maps it through registered `defaultChatProviderData.sdkSessionId` metadata to the
+editor's Host UUID, including for `bridge_status`. It does not choose the newest chat, use
+a target pin as the caller, or derive a session from the shared runtime PID. The inherited
+variable is ignored when another known agent (such as Codex or Claude) is the caller.
+
+There must be one unarchived registered default chat for that SDK UUID. Missing metadata,
+an archived session, a side-chat/subagent UUID without a default-chat mapping, or duplicate
+mappings stop a send instead of inventing a return address. If both MCP caller metadata and
+the SDK binding are present, they must name the same Host UUID. Older hosts supplying neither
+an exact caller URI nor the SDK variable retain status-only return traffic.
+
+Copilot is detected from its runtime process or its own SDK variable, so this registration
+does not force `CROSS_AGENT_SELF=copilot` on servers that another Agent Host runtime may use.
+The SDK caller binding is not forwarded to peer CLIs started by the bridge.
+
+Tool approvals are separate from session delivery. With Manual permissions, Copilot may
+ask before using cross-agent tools. For the tested Agent Host version, `settings.json` and
+`mcp.json` do not provide a verified per-server persistent auto-approval declaration.
+`chat.tools.eligibleForAutoApproval` only controls eligibility. The supported setting
+`chat.tools.global.autoApprove` applies to all tools; it is not a cross-agent-only permission.
+
+If the installer explicitly chooses global automatic approval, add the following to VS Code's
+**User** `settings.json`, then run **Developer: Reload Window** once:
+
+```json
+"chat.tools.global.autoApprove": true
+```
+
+This includes file edits, terminal commands and other tools, as well as cross-agent. It also
+affects existing Manual-permissions Copilot Agent Host sessions. A workspace-only setting does
+not provide the same Agent Host behavior. Leave it unset to retain the existing approvals.
+The MCP server itself never changes these permission settings or replays a skipped tool call.
+See [VS Code approval settings](https://code.visualstudio.com/docs/agents/run/approvals#allow-all-tools-globally).
+
+A stored catalog entry does not establish a return address. A reply or failure notice requires
+an attached editor client, or the caller's own verified SDK session on its existing host.
+The latter allows a Copilot caller to receive an answer while its chat is hidden: its SDK
+UUID must resolve to exactly that default chat, and the authenticated endpoint owner must
+still be an ancestor of the MCP process. Both checks are repeated immediately before return
+dispatch. The bridge never starts another SDK runtime or resumes a CLI to deliver the answer.
+Its read-only observer subscription does not count as an editor client. Without either proof,
+the answer remains available through `bridge_status`.
+
+Default paths cover VS Code Stable and Insiders on macOS/Linux. For a custom `--user-data-dir`,
+set these path-list environment variables (separate multiple paths with `:`):
+
+| Variable | Location |
+|---|---|
+| `CROSS_AGENT_COPILOT_HOST_DB` | `<user data>/User/globalStorage/agent-host.db` |
+| `CROSS_AGENT_COPILOT_SESSION_DIR` | `<user data>/agentSessionData` |
+| `CROSS_AGENT_COPILOT_SDK_SESSION_DIR` | Copilot SDK `session-state` directory (default `~/.copilot/session-state`) |
+| `CROSS_AGENT_COPILOT_ENDPOINT_DIR` | `<user data>/agent-host/local-endpoint/entries` |
+
+The host DB and session directories must correspond in order when arbitrary override paths
+are used. Duplicate UUIDs in different configured stores are refused rather than selecting
+the newest copy. These paths are always read-only.
 
 ### Grok Build
 
@@ -327,8 +480,9 @@ Claude Code session messages another this way, the **recipient** applies a permi
 
 ### IDE panel integration (bidirectional)
 
-This section is optional, and only matters if you use the VS Code extensions' chat panels —
-everything above works the same from a plain terminal.
+This section covers the optional Claude, Codex and Grok panel shims. Those products also
+work from a plain terminal. Copilot uses the Agent Host transport described in its
+[registration section](#copilot-vs-code-agent-host) and needs none of these shims.
 
 The CLI resume path (`codex exec resume` / `claude -p --resume`) appends a turn to the session history, so context is preserved, but it **doesn't show up in the VS Code panel.** The panel's session lives only inside the child process the extension spawned and connected to directly over stdio, and there's no way in from outside.
 
@@ -462,11 +616,17 @@ Even when the panel is only showing a conversation list, there's a live process 
 - Claude: just writes a user message to the panel process that's running without a session. The CLI starts a new conversation and the session id is captured from `system/init`
 - Grok: writes the prompt into a session the extension opened and nobody has prompted yet. A shim cannot open a session of its own (see above), so when every session it hosts already has history, a request for a new conversation goes to the CLI instead: `grok --single=<message> --session-id <new uuid>`
 
+Copilot never creates a conversation through the bridge. Create its chat in VS Code first,
+then send to its exact name, UUID or session URI.
+
 When the receipt's `will_create_session` is `true`, this is the conversation that will be opened. Codex also sets a title of the form **"sender: start of the message"** via `thread/name/set`; otherwise it would just sit in the list as "New chat" with no way to tell which conversation it is.
 
 The new conversation shows up in the list with an unread marker, but **the panel doesn't automatically open it.** The app-server protocol has no notification that moves the client to a specific conversation, and the extension's `vscode://` deep link (the `/local/<thread-id>` route) **can't target a specific window** — it moves the Codex panel of every open VS Code instance at once. So it wasn't adopted.
 
 #### Which conversation tab it goes to
+
+The selection order below applies to Claude, Codex and Grok shims. Copilot requires an explicit
+target or a sticky pin and does not select a chat from focus or recent activity.
 
 The extension **spawns a separate process per conversation tab**, so a single window ends up with multiple shims running. Nothing records which tab has focus, so it's picked using the following order of evidence.
 
@@ -529,6 +689,9 @@ Without this distinction, a session in another window would fall back to a headl
 
 `CROSS_AGENT_UI_HOOK` selects the behavior — `auto` (default: use it if present, fall back to CLI otherwise), `off` (always CLI), `require` (fail instead of silently falling back if the panel can't be found).
 
+For Copilot, `auto` and `require` use its existing Agent Host endpoint; `off` refuses delivery
+because there is no CLI fallback.
+
 > [!WARNING]
 > The shim is a process wedged between the extension and the agent. It can break when the extension updates, and `chatgpt.cliExecutable` is an application-scoped setting the extension itself marks "DEVELOPMENT ONLY."
 > To revert, delete that setting line and reload the window.
@@ -539,7 +702,9 @@ Without this distinction, a session in another window would fall back to a headl
 ./run-server.sh --check
 ```
 
-Prints who's running it, both CLI paths, the currently resolved active session, and the settings in effect, then exits. Run with no arguments, it comes up as an MCP stdio server and waits on stdin (this is normal — exit with Ctrl-C).
+Prints who's running it, CLI paths, resolved sessions and the settings in effect, then exits.
+Run with no arguments, it comes up as an MCP stdio server and waits on stdin (this is normal —
+exit with Ctrl-C).
 
 ---
 
@@ -550,27 +715,30 @@ Prints who's running it, both CLI paths, the currently resolved active session, 
 | `send_to_codex(message, ...)` | Sends a message to the active Codex thread. **Asynchronous — the response isn't carried back** |
 | `send_to_claude(message, ...)` | Sends a message to the active Claude session. **Asynchronous — the response isn't carried back** |
 | `send_to_grok(message, ...)` | Sends a message to the active Grok Build session. **Asynchronous — the response isn't carried back** |
-| `list_agent_sessions(agent, scope, cwd, limit)` | List of sessions the bridge can find (newest first, including active status). `agent` is `claude`, `codex`, `grok`, `both` (Claude and Codex) or `all` (the default) |
+| `send_to_copilot(message, session_id, ...)` | Sends to an existing Copilot Agent Host default chat by exact name, UUID or URI (or a sticky pin). **Asynchronous; no CLI fallback or new sessions** |
+| `list_agent_sessions(agent, scope, cwd, limit)` | List of sessions the bridge can find (newest first, including active status). `agent` is `claude`, `codex`, `grok`, `copilot`, `both` (Claude and Codex) or `all` (the default, all four) |
 | `bridge_status(cwd, scope, delivery_id)` | Diagnostics: who's running, the resolved session, settings, lock state, and **deliveries in flight**. Given a `delivery_id`, it re-reads that one delivery's peer transcript (`peer_transcript`) and panel state (`peer_panel`: whether a turn is running, **whether it's stuck on an approval prompt**) and reports both |
-| `pin_agent_session(agent, session_id, cwd)` | `agent` is `claude`, `codex` or `grok`. Pins a specific session (by id or conversation name). While pinned, no new conversation is opened. Leave it empty to unpin |
+| `pin_agent_session(agent, session_id, cwd)` | `agent` is `claude`, `codex`, `grok` or `copilot`. Pins a specific session (by id or conversation name). While pinned, no new conversation is opened. Leave it empty to unpin |
 
 Common `send_to_*` parameters:
 
 | Name | Default | Meaning |
 |---|---|---|
 | `message` | (required) | The content to send to the peer agent. The peer can't see this side's conversation, so write it self-contained |
-| `session_id` | auto-discovered | Targets a specific session. **Session id or conversation name.** If nothing matches, it fails instead of creating a new one |
-| `new_session` | `false` | Forces a new session even if one is active |
+| `session_id` | auto-discovered; Copilot requires this or a sticky pin | Targets a specific session. **Session id or conversation name** (Copilot also accepts its session URI). If nothing matches, it fails instead of creating a new one |
+| `new_session` | `false` | Forces a new session even if one is active. Unsupported for Copilot; `true` is refused |
 | `scope` | `cwd` | `cwd` = same directory and its subdirectories, `tree` = up through parent directories too, `any` = everything |
 | `cwd` | the server's working directory | Basis for discovery and where a new session gets created |
 | `timeout` | `600` | **CLI inactivity limit (seconds)**, reset by output or target transcript writes. Accepted panel turns have no wall-clock limit. It doesn't make the caller wait |
 | `conversation_id` | auto-generated | Continues an existing bridge conversation, sharing its hop budget |
 | `raw` | `false` | Delivers the raw text with no bridge header |
 
-`send_to_claude` and `send_to_grok` additionally take `allow_same_agent` (default `false`) — a
+`send_to_claude`, `send_to_grok` and `send_to_copilot` additionally take `allow_same_agent` (default `false`) — a
 session messaging another session of its own agent is refused unless this is set, or an explicit
 `session_id` is given. `send_to_codex` has no such flag; reaching another Codex thread requires an explicit
 `session_id` (see [section 6](#6-preventing-infinite-calls)).
+For Copilot, the flag does not enable automatic target discovery: a sticky pin or explicit
+target is still required.
 
 The return value of `send_to_*` is a **receipt**, not an answer.
 
@@ -580,13 +748,18 @@ The return value of `send_to_*` is a **receipt**, not an answer.
 | `accepted` | Successfully queued |
 | `note` | States that there's no response yet, and where it will appear — as a message here, or on the delivery record only |
 | `reply_lands_in_session` | The **return address**: the sender session id the peer's answer is aimed at. `null` means there's nowhere for the answer to return to. It names the address, not proof anything lands there |
-| `return_panel_available_now` | Whether that session has a panel to be answered into **as of now**. `false` means that unless one is open when the peer answers, no message will arrive and the answer must be read from `bridge_status` |
+| `return_panel_available_now` | Whether the sender has an available return route **as of now**: an open panel, or its own verified Copilot SDK session on its existing host. The route is checked again when the peer answers. Without one, read the answer from `bridge_status` |
 | `queue_depth` | Number of deliveries already waiting ahead of this one for the same target session |
 | `will_create_session` | Whether a new conversation will be opened because no existing session was found |
 
 ---
 
 ## 5. Session resolution rules
+
+Copilot only uses an explicit `session_id` or a sticky pin created with `pin_agent_session`.
+Its existing default chat must resolve uniquely and have a reachable authenticated host.
+It does not auto-select by activity, create a session, or fall back to a CLI. The scanning
+and creation rules below apply to Claude, Codex and Grok.
 
 On a `send_to_*` call, the target session is determined in the following order.
 Under `CROSS_AGENT_REQUIRE_EXPLICIT_TARGET` only rule 1 applies, alongside `new_session=true`:
@@ -624,15 +797,15 @@ In short: **if there's an active session, it continues the context; if not, it c
 
 ## 6. Preventing infinite calls
 
-It's blocked in three layers.
+The bridge applies these guards.
 
 1. **Hop budget** — at most `MAX_HOPS` (default 4) per conversation. `conversation_id` propagates to child processes as an environment variable, so an A→B→A→B chain automatically shares the same budget. Rejected once exceeded.
 2. **Busy lock** — prevents two turns from overlapping in the same session. Agent CLIs allow only one writer per transcript, so this isn't courtesy, it's mandatory. It's acquired atomically in `~/.cross-agent/locks/` with `O_EXCL`, so there's no race between "check" and "acquire." It's released only while its own token is still present, and locks held by dead processes are reclaimed automatically. **Since the move to async, this lock is a reason to wait in line, not a reason to reject** — the worker waits for the lock to free up and then delivers. The sender's own session is no longer locked at all, since nobody's waiting on it, so a relay coming back around can't create a deadlock.
 3. **Self-call guard** — by default, an agent refuses to relay into another session of its *own*
-   kind: Claude cannot reach another Claude session, Codex cannot reach another Codex thread, and
-   Grok cannot reach another Grok session.
-   The caller is identified from the parent process chain, not a self-reported label. This exists
-   because the peer tools (`send_to_codex` / `send_to_claude` / `send_to_grok`) are meant to cross
+   kind: Claude cannot reach another Claude session, Codex cannot reach another Codex thread,
+   Grok cannot reach another Grok session, and Copilot cannot reach another Copilot chat.
+   The caller is identified from process ancestry and host-supplied caller bindings. This exists
+   because the peer tools (`send_to_codex` / `send_to_claude` / `send_to_grok` / `send_to_copilot`) are meant to cross
    from one product to another — routing Claude into Claude by mistake should fail loudly instead of
    silently starting a same-agent relay. The refusal names the tools that lead elsewhere.
    - **Claude → Claude** is allowed either by passing `allow_same_agent=true` on `send_to_claude`
@@ -642,6 +815,8 @@ It's blocked in three layers.
      `session_id`.
    - **Codex → Codex** has no `allow_same_agent` flag — `send_to_codex` doesn't expose one — so the
      only way to reach another Codex thread is to name it explicitly with `session_id`.
+   - **Copilot → Copilot** needs an explicit `session_id`, or `allow_same_agent=true` with a
+     sticky pin. Copilot does not discover a same-agent target automatically.
    - Either way, **auto-discovery never picks the caller's own current session** as the target, so
      a same-agent relay can't be routed back into itself.
 4. **A delivery doesn't outlive the server** — since the CLI runs in its own process group, it survives even if the server dies. It would then keep writing to the peer session and store with nobody watching, and since the busy lock **decides life or death by the server's pid**, it can no longer protect that session. If a re-request comes in, a second agent attaches to the same file — in practice, two `claude -p --resume` processes once ran concurrently against the same session after a window reload. On server shutdown (atexit, SIGTERM, SIGINT, SIGHUP), the process groups of any in-flight deliveries are cleaned up together with it.
@@ -676,6 +851,11 @@ Every delivered message carries a header with the sender, conversation ID, and h
 | `CROSS_AGENT_CODEX_MODEL` / `CROSS_AGENT_CLAUDE_MODEL` / `CROSS_AGENT_GROK_MODEL` | (unset) | Force a specific model |
 | `CROSS_AGENT_CLAUDE_BIN` / `CROSS_AGENT_CODEX_BIN` / `CROSS_AGENT_GROK_BIN` | `claude` / `codex` / `grok` | CLI path. `grok` falls back to `~/.grok/bin/grok` when the PATH does not have it — an editor started from the Dock does not read a shell profile |
 | `CROSS_AGENT_GROK_NAMES_DB` | (the editor's `state.vscdb`) | Where the Grok VS Code extension's conversation names are read from, `:`-separated if several |
+| `CROSS_AGENT_COPILOT_HOST_DB` | VS Code Stable/Insiders defaults | Read-only Agent Host session catalog DB paths, `:`-separated |
+| `CROSS_AGENT_COPILOT_SESSION_DIR` | VS Code Stable/Insiders defaults | Read-only editor session directories; correspond to the host DB paths in order |
+| `CROSS_AGENT_COPILOT_SDK_SESSION_DIR` | `~/.copilot/session-state` | Read-only SDK event directories, `:`-separated |
+| `CROSS_AGENT_COPILOT_ENDPOINT_DIR` | VS Code Stable/Insiders defaults | Authenticated local endpoint registry directories, `:`-separated |
+| `COPILOT_AGENT_SESSION_ID` | supplied by Copilot SDK | Exact SDK caller UUID, mapped to the editor Host UUID. Host-owned identity; do not set it manually or forward it to peer CLIs |
 | `GROK_HOME` | `~/.grok` | Where Grok's own session store lives (Grok reads it too, so the two agree) |
 | `CROSS_AGENT_CODEX_SCAN_LIMIT` | `2000` | Safety cap on Codex rollout scanning (applies only to scope=`any`) |
 | `CROSS_AGENT_SELF` | (auto-detected) | Force which agent is treated as the caller |
@@ -727,7 +907,8 @@ The child is built up from a named baseline instead (`config.CHILD_ENV_BASELINE`
 - `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME` — the session stores the bridge itself resolves against
 - the bridge's own settings from the table above, so a spawned agent runs a bridge
   configured like this one (`CROSS_AGENT_SELF` is deliberately **not** inherited: a child
-  must work out its own identity, not adopt its parent's)
+  must work out its own identity, not adopt its parent's). Copilot's
+  `COPILOT_AGENT_SESSION_ID` caller binding is not forwarded either
 
 Every CLI authenticates through files under `HOME` in the normal editor setup (Grok: `grok
 login` writes `~/.grok/auth.json`), so this is enough. If yours authenticates through an
@@ -755,6 +936,10 @@ Two withheld variables are worth calling out, because a CLI-relayed peer used to
 ```bash
 # Unit-level checks of locks/pins/scope/timeout (consumes no agent turns)
 PYTHONPATH=src .venv/bin/python tests/unit_guards.py
+PYTHONPATH=src .venv/bin/python tests/copilot_discovery.py
+PYTHONPATH=src .venv/bin/python tests/copilot_bridge.py
+PYTHONPATH=src .venv/bin/python tests/copilot_transport.py
+PYTHONPATH=src .venv/bin/python tests/copilot_caller_mcp.py
 
 # Shim pass-through, injection, and panel rendering checks (no VS Code config needed)
 PYTHONPATH=src .venv/bin/python tests/shim_roundtrip.py          # 1 Codex turn
@@ -775,6 +960,14 @@ it finished as, and when an approval prompt appeared and was answered.
 
 ## 9. Known limitations
 
+- **Copilot support is limited to existing VS Code Agent Host default chats.** Verified with
+  VS Code 1.141.0 / AHP 0.10.0 on macOS, including custom models and Copilot-origin automatic
+  return delivery. Other protocol versions, legacy extension-host Copilot Chat, standalone
+  Copilot CLI, side chats/subagents and new-session creation are unsupported. Ambiguous catalog
+  identities and invalid or conflicting caller bindings are refused. An unavailable host is
+  never replaced with a second runtime. Host MCP configuration needs a full VS Code restart
+  after initial setup; Reload Window alone may keep the old host. See
+  [registration](#copilot-vs-code-agent-host).
 - **Codex's MCP tool approval (upstream limitation)** — in the VS Code Codex UI, an approval
   prompt appears and things work fine once the user allows it. In headless `codex exec` mode,
   though, there's nobody to approve, so every MCP call auto-cancels with
@@ -820,9 +1013,9 @@ it finished as, and when an approval prompt appeared and was answered.
   extension's own is still holding it. Grok keeps lock files in a session folder, which suggests
   the writes are serialized, but this was tested only against a session no live process held.
 - **When the UI reflects changes** — without the shim attached, the bridge only appends a
-  turn to the session transcript, so the VS Code chat window doesn't update live (it shows up
-  the next time that session is reopened). Setting up the shims from section 3 renders every
-  direction in the panel.
+  turn to a Claude, Codex or Grok session transcript, so the VS Code chat window doesn't update
+  live (it shows up the next time that session is reopened). Setting up the shims from section
+  3 renders those exchanges in the panel. Copilot uses its host protocol directly.
 - **Chain-state propagation through the shim** — panel injection doesn't spawn a new child
   process, so environment variables like `CROSS_AGENT_CONVERSATION_ID` aren't passed to the
   peer. The envelope header carries the conversation id instead, so the peer can still
@@ -853,8 +1046,8 @@ it finished as, and when an approval prompt appeared and was answered.
     `deliveries.earlier`, and a delivery another server has recorded as in progress shows up
     in `deliveries.in_flight_elsewhere`. A record carrying `is_return_status_only: true` is one
     whose answer — or failure notice — was never put into the sender's session, because that
-    session had no panel to put it into. `reply_preview` holds the first 2,000 characters of
-    the answer if there was one; the whole answer is read fresh from the peer's own transcript
+    session had no available live return route. `reply_preview` holds the first 2,000 characters
+    of the answer if there was one; the whole answer is read fresh from the peer's own transcript
     as `peer_transcript.answer`, so the record is a summary of it, not a copy. The payload and child environment variables are
     **never stored** — env holds every variable of this process.
     - Why the in-flight record lives in a subfolder: a server running a version prior to this
@@ -950,15 +1143,15 @@ it finished as, and when an approval prompt appeared and was answered.
   design can recover from.
 - **A session in another VS Code window is only reachable if it's named explicitly** —
   specifying it via `session_id` delivers to that window's shim, but auto-selection only ever
-  happens within this window (see section 3). A session with no panel open in any window still
-  goes through headless CLI resume, and gets rejected with `thread-store conflict` if some
-  window's panel is holding onto that conversation.
-- **A reply arrives in the sender's panel, or not at all** — delivering the answer writes into
-  the panel showing that session, which appears as a new message while a human may be doing
-  something else there. With no panel it is not delivered: the bridge will not answer a session
-  by resuming it, so the answer is read from `bridge_status` instead.
-- **Session discovery is mtime-based.** If several sessions are open at once in the same
-  directory, pinning the target with `pin_agent_session` is the more reliable choice.
+  happens within this window (see section 3). A Claude, Codex or Grok session with no panel
+  open in any window still goes through headless CLI resume, and gets rejected with
+  `thread-store conflict` if some window's panel is holding onto that conversation.
+- **A reply requires a live return route** — an available sender panel, or the Copilot caller's
+  own verified SDK session on its existing host. Without one, read the answer from
+  `bridge_status`; the bridge never starts another runtime to deliver it.
+- **Automatic CLI session discovery is mtime-based.** If several sessions are open at once in
+  the same directory, pinning the target with `pin_agent_session` is the more reliable choice.
+  Copilot always requires an explicit target or a sticky pin.
 
 ## License
 

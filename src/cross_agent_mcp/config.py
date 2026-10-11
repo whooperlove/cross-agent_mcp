@@ -76,6 +76,28 @@ GROK_NAMES_DBS: tuple = tuple(os.path.expanduser(path) for path in (
      '~/.config/Code/User/globalStorage/state.vscdb')))
 
 
+def _env_paths(name: str, defaults: tuple) -> tuple:
+    override = get_env_optional(name)
+    return tuple(os.path.expanduser(path) for path in (
+        override.split(os.pathsep) if override else defaults) if path)
+
+
+# Copilot Agent Host owns the live runtime, while its SDK owns the conversation events.
+# These stores are read-only; the bridge connects to the published local AHP endpoint.
+_COPILOT_USER_DATA_DIRS: tuple = (
+    '~/Library/Application Support/Code', '~/.config/Code',
+    '~/Library/Application Support/Code - Insiders', '~/.config/Code - Insiders',
+)
+COPILOT_HOST_DBS: tuple = _env_paths('CROSS_AGENT_COPILOT_HOST_DB', tuple(
+    root + '/User/globalStorage/agent-host.db' for root in _COPILOT_USER_DATA_DIRS))
+COPILOT_SESSION_DIRS: tuple = _env_paths('CROSS_AGENT_COPILOT_SESSION_DIR', tuple(
+    root + '/agentSessionData' for root in _COPILOT_USER_DATA_DIRS))
+COPILOT_SDK_SESSION_DIRS: tuple = _env_paths(
+    'CROSS_AGENT_COPILOT_SDK_SESSION_DIR', ('~/.copilot/session-state',))
+COPILOT_ENDPOINT_DIRS: tuple = _env_paths('CROSS_AGENT_COPILOT_ENDPOINT_DIR', tuple(
+    root + '/agent-host/local-endpoint/entries' for root in _COPILOT_USER_DATA_DIRS))
+
+
 def _default_grok_bin() -> str:
     """`grok` when the PATH has it, else where its installer puts it.
 
@@ -145,11 +167,15 @@ ENV_SENDER: str = 'CROSS_AGENT_SENDER'
 ENV_SELF_SESSION: str = 'CROSS_AGENT_SELF_SESSION'
 # Grok's own name for it: set on every MCP server it starts, one server per session.
 ENV_GROK_SESSION: str = 'GROK_SESSION_ID'
+# Copilot supplies the SDK session UUID to each session's MCP process. It differs from
+# the editor UUID and is resolved through the registered default-chat metadata.
+ENV_COPILOT_SESSION: str = 'COPILOT_AGENT_SESSION_ID'
 
 AGENT_CLAUDE: str = 'claude'
 AGENT_CODEX: str = 'codex'
 AGENT_GROK: str = 'grok'
-AGENTS: tuple = (AGENT_CLAUDE, AGENT_CODEX, AGENT_GROK)
+AGENT_COPILOT: str = 'copilot'
+AGENTS: tuple = (AGENT_CLAUDE, AGENT_CODEX, AGENT_GROK, AGENT_COPILOT)
 
 
 # Everything the bridge writes is owner-only. The state tree names the sessions being
@@ -175,7 +201,8 @@ _is_repaired: bool = False
 _PROTECTED_EXACTLY = {os.path.realpath(p) for p in ('/', os.path.expanduser('~'))}
 _PROTECTED_TREES = {os.path.realpath(p) for p in (
     CLAUDE_HOME_DIR, CLAUDE_PROJECTS_DIR, CODEX_HOME_DIR, CODEX_SESSIONS_DIR,
-    GROK_HOME_DIR, GROK_SESSIONS_DIR)}
+    GROK_HOME_DIR, GROK_SESSIONS_DIR, *COPILOT_HOST_DBS, *COPILOT_SESSION_DIRS,
+    *COPILOT_SDK_SESSION_DIRS, *COPILOT_ENDPOINT_DIRS)}
 _PROTECTED_ROOTS = _PROTECTED_EXACTLY | _PROTECTED_TREES
 
 
@@ -350,6 +377,8 @@ CHILD_ENV_BRIDGE: tuple = (
     'CROSS_AGENT_CODEX_SANDBOX', 'CROSS_AGENT_CODEX_MODEL', 'CROSS_AGENT_CODEX_SCAN_LIMIT',
     'CROSS_AGENT_CLAUDE_PERMISSION_MODE', 'CROSS_AGENT_CLAUDE_MODEL',
     'CROSS_AGENT_GROK_PERMISSION_MODE', 'CROSS_AGENT_GROK_MODEL', 'CROSS_AGENT_GROK_NAMES_DB',
+    'CROSS_AGENT_COPILOT_HOST_DB', 'CROSS_AGENT_COPILOT_SESSION_DIR',
+    'CROSS_AGENT_COPILOT_SDK_SESSION_DIR', 'CROSS_AGENT_COPILOT_ENDPOINT_DIR',
     # so the opt-in survives another hop, rather than a grandchild losing it silently
     'CROSS_AGENT_CHILD_ENV',
     # CROSS_AGENT_SELF is deliberately absent: it forces which agent the caller is taken to

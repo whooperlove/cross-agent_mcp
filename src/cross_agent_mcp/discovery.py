@@ -512,6 +512,9 @@ def list_sessions(agent: str, scope: str, cwd: str, limit: int = 20,
         return list_codex_sessions(scope, cwd, limit, since_mtime, stats=stats)
     if agent == config.AGENT_GROK:
         return list_grok_sessions(scope, cwd, limit, since_mtime)
+    if agent == config.AGENT_COPILOT:
+        from .copilot import list_copilot_sessions
+        return list_copilot_sessions(scope, cwd, limit, since_mtime)
     raise ValueError(f'unknown agent: {agent}')
 
 
@@ -552,6 +555,9 @@ def find_session(agent: str, session_id: str) -> Optional[Dict[str, Any]]:
     """
     if agent not in config.AGENTS:
         raise ValueError(f'unknown agent: {agent}')
+    if agent == config.AGENT_COPILOT:
+        from .copilot import find_copilot_session
+        return find_copilot_session(session_id)
     if not is_session_id(session_id):
         return None
     session_id = session_id.lower()
@@ -1096,6 +1102,9 @@ def peer_progress(agent: str, session_id: str, after: Optional[float] = None,
     delivery report - it just is not the answer, and is reported under its own name so nothing
     downstream can mistake it for one.
     """
+    if agent == config.AGENT_COPILOT:
+        from .copilot import peer_progress as copilot_progress
+        return copilot_progress(session_id, after=after, token=token)
     session = find_session(agent, session_id)
     if not session:
         return None
