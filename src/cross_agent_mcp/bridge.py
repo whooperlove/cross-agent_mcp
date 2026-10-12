@@ -514,6 +514,13 @@ def install_shutdown_guard() -> None:
 
 
 def _run_cli(command: List[str], cwd: str, env: Dict[str, str], timeout: int) -> subprocess.CompletedProcess:
+    # Every peer CLI the bridge starts is started here, so this is where the setting holds
+    # whatever route led to it. `send_message` refuses earlier with a better message; this
+    # is the line nothing can step around.
+    if config.DISABLE_HEADLESS:
+        raise outbox.NotDeliveredError(
+            f'{config.ENV_DISABLE_HEADLESS} is set, so the bridge did not start {command[0]}. '
+            'Nothing was started and nothing was sent.')
     logger.debug(f'_run_cli [BEGIN]: cwd={cwd} cmd={command[:4]}')
     job = outbox.current_job()
     agent, _, session_id = (env.get(config.ENV_SELF_SESSION) or '').partition(':')
@@ -1819,6 +1826,23 @@ def _unaddressed_refusal(target_agent: str, session_id: Optional[str]) -> str:
             'the tab the human last typed into: neither is something this call said.')
 
 
+def _headless_refusal(target_agent: str, target_id: Optional[str], is_new_session: bool) -> str:
+    if is_new_session:
+        what = f'no {target_agent} panel in this editor window can open a new conversation'
+    elif target_id:
+        what = f'no editor panel holds the {target_agent} session {target_id}'
+    else:
+        what = f'no {target_agent} session is open in an editor panel'
+    hook = ''
+    if not uihook.is_enabled():
+        hook = (' CROSS_AGENT_UI_HOOK=off also keeps every panel out of reach, so with both set '
+                'every send is refused.')
+    return (f'{config.ENV_DISABLE_HEADLESS} is set, so the bridge never starts a headless '
+            f'{target_agent} CLI, and {what}. Nothing was sent and no hop was spent. Open that '
+            f'conversation in its panel (list_agent_sessions shows which sessions are open) '
+            f'and send again.{hook}')
+
+
 def send_message(target_agent: str, message: str, session_id: Optional[str] = None,
                  is_new_session: bool = False, scope: Optional[str] = None,
                  cwd: Optional[str] = None, timeout: Optional[int] = None,
@@ -1902,6 +1926,11 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
 
     target = _resolve_target(target_agent, session_id, scope, cwd, is_new_session, exclude_ids)
     target_id = target['session_id'] if target else None
+
+    # Anything without a panel behind it is delivered by starting a CLI. Refused here, before a
+    # hop is spent or anything is queued, so the sender hears it on this very call.
+    if config.DISABLE_HEADLESS and not (target or {}).get('ui_shim'):
+        raise BridgeError(_headless_refusal(target_agent, target_id, is_new_session))
 
     # A fresh conversation with no panel to host it goes to the CLI, which starts one under an
     # id of our choosing. Allocating it here rather than inside the call is what lets the

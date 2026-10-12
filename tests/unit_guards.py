@@ -41,6 +41,8 @@ for _inherited in ('CROSS_AGENT_CONVERSATION_ID', 'CROSS_AGENT_HOP', 'CROSS_AGEN
     os.environ.pop(_inherited, None)
 # a strict bridge hands that setting on too, and most checks here send without a session_id
 os.environ.pop('CROSS_AGENT_REQUIRE_EXPLICIT_TARGET', None)
+# and a bridge that forbids a headless CLI would refuse the very processes these checks start
+os.environ.pop('CROSS_AGENT_DISABLE_HEADLESS', None)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/src')
 
@@ -108,6 +110,8 @@ def test_the_suite_writes_nowhere_near_the_real_bridge() -> None:
     check('and the run is not inside somebody else\'s bridge conversation',
           inherited == [], f'inherited {inherited}')
     check('nor under a strict mode it inherited', config.REQUIRE_EXPLICIT_TARGET is False)
+    check('nor with headless CLIs forbidden by a setting it inherited',
+          config.DISABLE_HEADLESS is False)
 
     for label, (configured, intended) in expected.items():
         check(f'the {label} root is the temporary one',
@@ -942,6 +946,168 @@ def test_a_strict_bridge_hands_the_setting_to_the_cli_it_starts() -> None:
     check('a CLI a strict bridge starts gets the setting in its environment',
           env.get(config.ENV_REQUIRE_EXPLICIT_TARGET) == '1',
           str(env.get(config.ENV_REQUIRE_EXPLICIT_TARGET)))
+
+
+# ------------------------------------------------- headless CLI disabled
+
+def _headless_send(is_disabled: bool, panel_ids=(), is_pinned: bool = False,
+                   can_open_new: bool = False, **kwargs) -> dict:
+    """send_message through the real resolver and `_run_cli`'s caller, with the session store,
+    the panels and the outbox stood in. `panel_ids` are the sessions an editor panel holds.
+    Says whether it was refused, what was handed to the outbox, and how many hops it spent."""
+    from cross_agent_mcp import uihook
+
+    cwd = os.path.realpath(tempfile.mkdtemp(prefix='headless-', dir=STATE_ROOT))
+    conversation_id = 'conv_headless_' + os.urandom(4).hex()
+    now = time.time()
+    sessions = {sid: {'agent': 'codex', 'session_id': sid, 'cwd': cwd, 'mtime': now}
+                for sid in (PINNED_SID, DISK_SID)}
+    shim = {'pid': 4243, 'socket': STATE_ROOT + '/headless-panel.sock'}
+    outcome = {'submitted': []}
+
+    def panel(agent, wanted, exclude):
+        sid = wanted or (panel_ids[0] if panel_ids else None)
+        if sid is None or sid not in panel_ids:
+            return None
+        return {'agent': agent, 'session_id': sid, 'cwd': cwd, 'source': 'ide-panel',
+                'ui_shim': shim, 'is_active': True, 'mtime': now}
+
+    def new_host(agent):
+        if not can_open_new:
+            return None
+        return {'agent': agent, 'session_id': None, 'cwd': None, 'source': 'ide-panel-new',
+                'ui_shim': shim, 'is_active': True, 'mtime': now}
+
+    if is_pinned:
+        registry.set_pin('codex', cwd, PINNED_SID, cwd, is_sticky=True)
+    originals = (bridge.caller.detect_caller, bridge._own_session_id, bridge._panel_session,
+                 bridge._new_panel_conversation, uihook.is_enabled, discovery.find_session,
+                 discovery.find_active_session, outbox.OUTBOX.submit,
+                 outbox.OUTBOX.await_outcome, config.DISABLE_HEADLESS)
+    bridge.caller.detect_caller = lambda: {'agent': config.AGENT_CLAUDE, 'chain': []}
+    bridge._own_session_id = lambda agent: 'sender-sid'
+    bridge._panel_session = panel
+    bridge._new_panel_conversation = new_host
+    uihook.is_enabled = lambda: True
+    discovery.find_session = lambda agent, sid: dict(sessions[sid]) if sid in sessions else None
+    discovery.find_active_session = (
+        lambda agent, scope, cwd, exclude=None: dict(sessions[DISK_SID]))
+    outbox.OUTBOX.submit = lambda job: outcome['submitted'].append(job) or 'dlv_headless'
+    outbox.OUTBOX.await_outcome = lambda job: None
+    config.DISABLE_HEADLESS = is_disabled
+    try:
+        outcome['receipt'] = bridge.send_message(config.AGENT_CODEX, 'hello', cwd=cwd,
+                                                 conversation_id=conversation_id, **kwargs)
+    except bridge.BridgeError as e:
+        outcome['refusal'] = str(e)
+    finally:
+        (bridge.caller.detect_caller, bridge._own_session_id, bridge._panel_session,
+         bridge._new_panel_conversation, uihook.is_enabled, discovery.find_session,
+         discovery.find_active_session, outbox.OUTBOX.submit, outbox.OUTBOX.await_outcome,
+         config.DISABLE_HEADLESS) = originals
+    outcome['hops'] = registry.get_conversation(conversation_id).get('hops', 0)
+    return outcome
+
+
+def test_disabled_headless_refuses_every_send_a_panel_does_not_hold() -> None:
+    """With the setting on, only a panel can carry a delivery - and a session that is named,
+    pinned or merely found on disk is not one just because it exists.
+
+    `CROSS_AGENT_UI_HOOK=require` let exactly the named and pinned cases through: they are
+    resolved from the session store, and the CLI resumed them beside the editor's own panel.
+    """
+    control = _headless_send(False, session_id=DISK_SID)
+    receipt = control.get('receipt') or {}
+    check('without the setting, a named session no panel holds is resumed over the CLI',
+          receipt.get('delivery') == 'cli-resume' and len(control['submitted']) == 1,
+          str(control.get('refusal') or receipt.get('delivery')))
+
+    cases = (
+        ('names a session no panel holds', {'session_id': DISK_SID}, {}),
+        ('names nothing and finds a session only on disk', {}, {}),
+        ('names nothing and a pin points at a session no panel holds', {}, {'is_pinned': True}),
+        ('asks for a new conversation no panel can open', {'is_new_session': True}, {}),
+    )
+    for label, kwargs, options in cases:
+        refused = _headless_send(True, **options, **kwargs)
+        check(f'a send that {label} is refused',
+              config.ENV_DISABLE_HEADLESS in (refused.get('refusal') or '')
+              and 'receipt' not in refused, str(refused.get('refusal') or 'delivered'))
+        check(f'and one that {label} queued nothing and spent no hop',
+              not refused['submitted'] and refused['hops'] == 0,
+              f"queued={len(refused['submitted'])} hops={refused['hops']}")
+
+    refusal = _headless_send(True, session_id=DISK_SID).get('refusal') or ''
+    check('the refusal says nothing was sent, names the session and what to do',
+          'Nothing was sent' in refusal and DISK_SID in refusal
+          and 'list_agent_sessions' in refusal, refusal)
+
+    held = _headless_send(True, panel_ids=(DISK_SID,), session_id=DISK_SID)
+    receipt = held.get('receipt') or {}
+    check('a named session a panel holds is delivered into that panel',
+          receipt.get('delivery') == 'ide-panel' and len(held['submitted']) == 1
+          and held['hops'] == 1, str(held.get('refusal') or receipt.get('delivery')))
+    focused = _headless_send(True, panel_ids=(DISK_SID,))
+    receipt = focused.get('receipt') or {}
+    check('so is the conversation the human is working in when nothing is named',
+          receipt.get('delivery') == 'ide-panel' and len(focused['submitted']) == 1,
+          str(focused.get('refusal') or receipt.get('delivery')))
+    fresh = _headless_send(True, can_open_new=True, is_new_session=True)
+    receipt = fresh.get('receipt') or {}
+    check('and a new conversation a panel can open',
+          receipt.get('delivery') == 'ide-panel' and len(fresh['submitted']) == 1,
+          str(fresh.get('refusal') or receipt.get('delivery')))
+
+
+def test_disabled_headless_starts_no_process_whatever_reached_it() -> None:
+    """The refusal in `send_message` is the courtesy; `_run_cli` is the guarantee."""
+    marker = STATE_ROOT + '/headless-marker-' + os.urandom(4).hex()
+    command = [sys.executable, '-B', '-c', 'import sys; open(sys.argv[1], "w").close()', marker]
+    original = config.DISABLE_HEADLESS
+    try:
+        config.DISABLE_HEADLESS = True
+        try:
+            bridge._run_cli(command, STATE_ROOT, dict(os.environ), timeout=10)
+            check('_run_cli refuses to start a CLI', False, 'no error raised')
+        except outbox.NotDeliveredError as e:
+            check('_run_cli refuses to start a CLI, as a delivery that never landed',
+                  config.ENV_DISABLE_HEADLESS in str(e), str(e))
+        check('and the process it was asked for never ran', not os.path.exists(marker))
+
+        config.DISABLE_HEADLESS = False
+        bridge._run_cli(command, STATE_ROOT, dict(os.environ), timeout=10)
+        check('while with the setting off the same command runs', os.path.exists(marker))
+    finally:
+        config.DISABLE_HEADLESS = original
+        with contextlib.suppress(OSError):
+            os.remove(marker)
+
+    # through a real outbox, so the record is what a sender would be told
+    original = (outbox.OUTBOX, config.DISABLE_HEADLESS)
+    box = outbox.Outbox()
+    outbox.OUTBOX = box
+    box.deliver = lambda job: bridge._run_cli(command, STATE_ROOT, dict(os.environ),
+                                              timeout=job.timeout)
+    try:
+        config.DISABLE_HEADLESS = True
+        job = _job(box, 'sid-headless', wants_reply=True)
+        box.submit(job)
+        _drain(box)
+        check('a request that reaches the CLI is recorded as never delivered',
+              job.state == outbox.STATE_FAILED and job.is_undelivered
+              and config.ENV_DISABLE_HEADLESS in (job.error or ''),
+              f'{job.state} undelivered={job.is_undelivered} {job.error}')
+        check('and not retried into running anyway', not os.path.exists(marker))
+    finally:
+        outbox.OUTBOX, config.DISABLE_HEADLESS = original
+
+
+def test_a_headless_disabled_bridge_hands_the_setting_to_the_cli_it_starts() -> None:
+    """Nothing is started under it, but a nested server must not quietly be a lenient one."""
+    with _environ(**{config.ENV_DISABLE_HEADLESS: '1'}):
+        env = bridge._child_env('conv_headless_env', 1, 'claude', [])
+    check('a child environment carries the setting',
+          env.get(config.ENV_DISABLE_HEADLESS) == '1', str(env.get(config.ENV_DISABLE_HEADLESS)))
 
 
 def test_a_session_id_that_matches_nothing_says_how_to_name_one() -> None:
@@ -7527,6 +7693,9 @@ def run_all() -> None:
     test_strict_mode_refuses_a_send_that_does_not_name_its_target()
     test_the_strict_flag_is_on_for_anything_but_an_explicit_off()
     test_a_strict_bridge_hands_the_setting_to_the_cli_it_starts()
+    test_disabled_headless_refuses_every_send_a_panel_does_not_hold()
+    test_disabled_headless_starts_no_process_whatever_reached_it()
+    test_a_headless_disabled_bridge_hands_the_setting_to_the_cli_it_starts()
     test_a_session_id_that_matches_nothing_says_how_to_name_one()
     test_a_bridge_started_turn_is_told_its_delivery_ends_with_it()
     test_the_receipt_says_how_long_the_target_has_been_idle()

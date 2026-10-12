@@ -43,6 +43,11 @@ if config.REQUIRE_EXPLICIT_TARGET:
     SERVER_INSTRUCTIONS += (
         ' This server refuses a send that does not name its target: pass session_id every '
         'time, or new_session=true for a new conversation. A pin does not count.')
+if config.DISABLE_HEADLESS:
+    SERVER_INSTRUCTIONS += (
+        ' This server never starts a headless CLI: a send is delivered only into a session '
+        'that is open in an editor panel, and is refused with nothing sent for any other. '
+        'Check list_agent_sessions for what is open before sending.')
 
 
 def init_logging() -> None:
@@ -479,8 +484,10 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
                      'with no session_id would land. Use pin_agent_session to force a different '
                      'one. other_window_sessions are panels open in OTHER editor windows: they '
                      'are never chosen automatically, but naming one in session_id delivers to '
-                     'it through its panel. A session in neither list falls back to a headless '
-                     'CLI resume the panel will not show.'),
+                     'it through its panel. A session in neither list ' +
+                     ('is refused: CROSS_AGENT_DISABLE_HEADLESS is set, so no headless CLI is '
+                      'ever started.' if config.DISABLE_HEADLESS else
+                      'falls back to a headless CLI resume the panel will not show.')),
             **panels,
         },
         'settings': {
@@ -489,6 +496,7 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
             'timeout_seconds': config.SEND_TIMEOUT_SECONDS,
             'panel_patience_seconds': config.PANEL_PATIENCE_SECONDS,
             'require_explicit_target': config.REQUIRE_EXPLICIT_TARGET,
+            'disable_headless': config.DISABLE_HEADLESS,
             'codex_sandbox_for_new_sessions': config.CODEX_SANDBOX,
             'claude_permission_mode': config.CLAUDE_PERMISSION_MODE,
             'grok_permission_mode': config.GROK_PERMISSION_MODE,

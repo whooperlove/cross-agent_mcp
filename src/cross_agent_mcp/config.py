@@ -142,6 +142,14 @@ UI_HOOK_MODE: str = get_env_str('CROSS_AGENT_UI_HOOK', 'auto')
 ENV_REQUIRE_EXPLICIT_TARGET: str = 'CROSS_AGENT_REQUIRE_EXPLICIT_TARGET'
 REQUIRE_EXPLICIT_TARGET: bool = get_env_flag(ENV_REQUIRE_EXPLICIT_TARGET)
 
+# Never start a headless peer CLI. A send reaches a session that is open in an editor panel, or
+# it is refused with nothing sent. `CROSS_AGENT_UI_HOOK=require` cannot promise this: it only
+# refuses a send that names no session (or a new conversation no panel can open), while a named
+# or pinned session that no panel holds is still resumed over the CLI - a second writer beside
+# the panel, and the editor will not take further instructions into it while the turn runs.
+ENV_DISABLE_HEADLESS: str = 'CROSS_AGENT_DISABLE_HEADLESS'
+DISABLE_HEADLESS: bool = get_env_flag(ENV_DISABLE_HEADLESS)
+
 # applied only when the bridge has to spawn a brand new session
 CODEX_SANDBOX: str = get_env_str('CROSS_AGENT_CODEX_SANDBOX', 'read-only')
 CODEX_MODEL: Optional[str] = get_env_optional('CROSS_AGENT_CODEX_MODEL')
@@ -373,7 +381,7 @@ CHILD_ENV_BRIDGE: tuple = (
     'CROSS_AGENT_REAL_CLAUDE', 'CROSS_AGENT_REAL_CODEX', 'CROSS_AGENT_REAL_GROK',
     'CROSS_AGENT_ACTIVE_WINDOW_MIN', 'CROSS_AGENT_MAX_HOPS', 'CROSS_AGENT_TIMEOUT',
     'CROSS_AGENT_PANEL_PATIENCE', 'CROSS_AGENT_SCOPE', 'CROSS_AGENT_UI_HOOK',
-    'CROSS_AGENT_REQUIRE_EXPLICIT_TARGET',
+    'CROSS_AGENT_REQUIRE_EXPLICIT_TARGET', 'CROSS_AGENT_DISABLE_HEADLESS',
     'CROSS_AGENT_CODEX_SANDBOX', 'CROSS_AGENT_CODEX_MODEL', 'CROSS_AGENT_CODEX_SCAN_LIMIT',
     'CROSS_AGENT_CLAUDE_PERMISSION_MODE', 'CROSS_AGENT_CLAUDE_MODEL',
     'CROSS_AGENT_GROK_PERMISSION_MODE', 'CROSS_AGENT_GROK_MODEL', 'CROSS_AGENT_GROK_NAMES_DB',

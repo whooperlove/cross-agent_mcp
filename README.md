@@ -692,6 +692,25 @@ Without this distinction, a session in another window would fall back to a headl
 For Copilot, `auto` and `require` use its existing Agent Host endpoint; `off` refuses delivery
 because there is no CLI fallback.
 
+#### Never starting a headless CLI
+
+`require` only refuses a send that **names no session** (or a new conversation no panel can open).
+A session named by `session_id` (or by a pin) that no panel holds is resolved from the session store and resumed over the CLI — a second
+writer beside the editor's own panel, which stops taking instructions into that session while
+the turn runs. To rule that out entirely, set `CROSS_AGENT_DISABLE_HEADLESS=1`.
+
+With it set, a send is delivered into a session an editor panel holds, or it is **refused with
+nothing sent**: no CLI is started, nothing is queued and no hop is spent, and the error says
+which session no panel holds. It is enforced twice — `send_message` refuses before anything is
+queued, and `_run_cli`, the one place a peer CLI is ever started, refuses again, so no route
+(a pin, discovery, a stale resolution) can step around it. `bridge_status` reports
+`settings.disable_headless`.
+
+Each client runs its own server, so set it in **every** registration — the Claude Code one and
+the Codex one — for it to guard sends made from both sides. Anything not open in a panel is
+unreachable while it is on: open the conversation in its panel first, or leave the setting off
+for that run. `CROSS_AGENT_UI_HOOK=off` together with it refuses every send.
+
 > [!WARNING]
 > The shim is a process wedged between the extension and the agent. It can break when the extension updates, and `chatgpt.cliExecutable` is an application-scoped setting the extension itself marks "DEVELOPMENT ONLY."
 > To revert, delete that setting line and reload the window.
@@ -842,6 +861,7 @@ Every delivered message carries a header with the sender, conversation ID, and h
 | `CROSS_AGENT_SCOPE` | `cwd` | Default discovery scope (`cwd` / `tree` / `any`) |
 | `CROSS_AGENT_UI_HOOK` | `auto` | Panel injection (`auto` / `off` / `require`) |
 | `CROSS_AGENT_REQUIRE_EXPLICIT_TARGET` | (unset) | Refuse a send that names neither `session_id` nor `new_session=true`; a pin doesn't count. `0` / `false` / `no` / `off` leave it off, any other value turns it on |
+| `CROSS_AGENT_DISABLE_HEADLESS` | (unset) | Never start a headless peer CLI: a send reaches a session an editor panel holds, or is refused with nothing sent. Unlike `CROSS_AGENT_UI_HOOK=require`, it also covers a session named by `session_id` or a pin that no panel holds. `0` / `false` / `no` / `off` leave it off, any other value turns it on. Set it in both the Claude and Codex registrations |
 | `CROSS_AGENT_REAL_CODEX` | (auto-discovered) | The real codex binary for the shim to wrap |
 | `CROSS_AGENT_REAL_CLAUDE` | (auto-discovered) | The real claude binary for the shim to wrap |
 | `CROSS_AGENT_REAL_GROK` | (auto-discovered) | The real grok binary for the shim to wrap |
@@ -1145,7 +1165,8 @@ it finished as, and when an approval prompt appeared and was answered.
   specifying it via `session_id` delivers to that window's shim, but auto-selection only ever
   happens within this window (see section 3). A Claude, Codex or Grok session with no panel
   open in any window still goes through headless CLI resume, and gets rejected with
-  `thread-store conflict` if some window's panel is holding onto that conversation.
+  `thread-store conflict` if some window's panel is holding onto that conversation. Under
+  `CROSS_AGENT_DISABLE_HEADLESS=1` that send is refused instead.
 - **A reply requires a live return route** — an available sender panel, or the Copilot caller's
   own verified SDK session on its existing host. Without one, read the answer from
   `bridge_status`; the bridge never starts another runtime to deliver it.
