@@ -1912,6 +1912,41 @@ def test_a_recovered_answer_says_it_may_not_be_finished() -> None:
           and 'still doing rather than its' in recovered, recovered)
 
 
+def test_an_answer_that_hands_over_work_says_how_to_report_back() -> None:
+    """It happened: an answer said "go ahead, tell me when it is done", the note under it said
+    "Nothing is waiting on you", and the finished report stayed in the reader's transcript until
+    the sender went looking for it thirty minutes later.
+    """
+    plain = bridge._build_reply_envelope('claude', 'codex', 'conv_x', 2, 2, '진행하라', 'sid')
+    check('an answer no longer says flatly that nothing is waiting',
+          '- Nothing is waiting on you.\n' not in plain, plain)
+    check('and says the bridge will not carry the next message back',
+          'does not carry your next message back to Claude Code' in plain, plain)
+    check('work handed over in an answer is reported back as a new request',
+          'asks for a report' in plain
+          and 'send_to_claude(session_id="sid", conversation_id="conv_x")' in plain
+          and '(2 bridge hop(s) left)' in plain, plain)
+    check('and a plain answer still leaves nothing waiting',
+          'If it only answers, nothing is waiting on you' in plain, plain)
+
+    unaddressed = bridge._build_reply_envelope('claude', 'codex', 'conv_x', 2, 2, '진행하라')
+    check('a sender with no session is still reached within the same conversation',
+          'send_to_claude(conversation_id="conv_x")' in unaddressed, unaddressed)
+
+    exhausted = bridge._build_reply_envelope('claude', 'codex', 'conv_x', 4, 0, '진행하라', 'sid')
+    check('with no hop left the report is not sent through the bridge',
+          'Do NOT call any cross-agent tool' in exhausted
+          and 'not even to report work' in exhausted
+          and 'conversation_id="conv_x"' not in exhausted, exhausted)
+
+    recovered = bridge._build_reply_envelope(
+        'codex', 'claude', 'conv_x', 1, 3, '진행하라', 'sid', is_recovered=True)
+    check('a recovered answer keeps its warning and the way to report back',
+          'RECOVERED, NOT RECEIVED' in recovered
+          and 'send_to_codex(session_id="sid", conversation_id="conv_x")' in recovered,
+          recovered)
+
+
 def test_the_recovered_flag_reaches_the_envelope() -> None:
     originals = (discovery.find_session, bridge._panel_session)
     discovery.find_session = lambda agent, session_id: None
@@ -7713,6 +7748,7 @@ def run_all() -> None:
     test_recovery_refuses_a_message_older_than_the_question()
     test_recovery_refuses_a_message_with_no_timestamp_when_asked_for_one()
     test_a_recovered_answer_says_it_may_not_be_finished()
+    test_an_answer_that_hands_over_work_says_how_to_report_back()
     test_the_recovered_flag_reaches_the_envelope()
     test_a_reply_runs_where_the_senders_session_lives()
     test_an_answer_with_no_panel_to_land_in_is_kept_rather_than_resumed()

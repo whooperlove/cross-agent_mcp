@@ -188,19 +188,37 @@ def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: i
     exactly like a finished answer, and the reader acts on a report that was never made. And
     delivered without the reason, the reader cannot tell a panel that refused the message from
     a socket that merely ran out of patience, which are different things to do next.
+
+    An answer can also hand over work - "go ahead, tell me when it is done" - and the bridge
+    relays nothing back from the turn that does it. The note used to say "Nothing is waiting
+    on you" either way, so the work got done and the report stayed in the reader's transcript
+    until the sender went looking for it. It names the conversation as well as the session:
+    a panel's MCP server never inherits the conversation, so a report sent without it would
+    open a fresh hop budget instead of spending from this one.
     """
     sender_label = AGENT_LABEL.get(sender, sender)
     reply_tool = reach_tool(sender)
 
-    if remaining > 0 and reply_to:
-        follow_up = (f'- Only if you have a NEW request, call `{reply_tool}` with '
-                     f'session_id="{reply_to}" ({remaining} bridge hop(s) left).')
-    elif remaining > 0:
-        follow_up = (f'- Only if you have a NEW request, call `{reply_tool}` '
-                     f'({remaining} bridge hop(s) left).')
+    no_return = (f'- The bridge does not carry your next message back to {sender_label}: it '
+                 'relays answers\n  to requests, and this is itself an answer.\n')
+    if remaining > 0:
+        address = (f'session_id="{reply_to}", conversation_id="{conversation_id}"' if reply_to
+                   else f'conversation_id="{conversation_id}"')
+        follow_up = (
+            no_return
+            + '- If it hands you work or asks for a report ("go ahead, tell me when it is done"), '
+            'do the\n  work, then send the result yourself as a NEW request '
+            f'({remaining} bridge hop(s) left):\n'
+            f'    {reply_tool}({address})\n'
+            f'  Without that call {sender_label} never sees the result.\n'
+            '- If it only answers, nothing is waiting on you; call '
+            f'`{reply_tool}` only for a NEW\n  request.')
     else:
-        follow_up = ('- The hop budget for this conversation is exhausted. Do NOT call any '
-                     'cross-agent tool.')
+        follow_up = (
+            no_return
+            + '- The hop budget for this conversation is exhausted. Do NOT call any cross-agent '
+            'tool,\n  not even to report work this answer asked for: put the result in your own '
+            f'final message,\n  which {sender_label} will not receive automatically.')
 
     if is_recovered:
         provenance = (
@@ -225,7 +243,6 @@ def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: i
         '\n'
         '=== NOTE ===\n'
         f'{provenance}'
-        '- Nothing is waiting on you.\n'
         f'{follow_up}\n'
     )
 

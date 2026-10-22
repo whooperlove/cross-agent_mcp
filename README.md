@@ -848,6 +848,8 @@ The bridge applies these guards.
 
 Every delivered message carries a header with the sender, conversation ID, and hops remaining. The peer's final message is delivered back to the sender's session with a `BRIDGE REPLY` header, and **this reply doesn't consume a hop** — it's closing out a hop the request already paid for. Only new requests spend from the budget.
 
+Nothing comes back from the turn that reads a reply: the bridge relays answers to requests, and a reply is itself an answer. So when a reply hands over work ("go ahead, tell me when it is done"), its note tells the reader to send the result as a new request, naming both the `session_id` and the `conversation_id`. The conversation matters because a panel's MCP server never inherits it — the environment variable only reaches CLI turns the bridge starts — so a report sent without it would open a fresh hop budget instead of spending from this one. With no hop left, the note says to keep the result in the reader's own final message instead.
+
 ## 7. Environment variables
 
 | Variable | Default | Description |
