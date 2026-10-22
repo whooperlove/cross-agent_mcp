@@ -725,6 +725,61 @@ Prints who's running it, CLI paths, resolved sessions and the settings in effect
 Run with no arguments, it comes up as an MCP stdio server and waits on stdin (this is normal —
 exit with Ctrl-C).
 
+### Applying code changes without restarting the editor
+
+Every editor session starts its own server, and Python reads the source once, at start. So
+`run-server.sh` started with no arguments — which is how every registration above starts it —
+runs the server behind a small **front**: the editor talks to the front, and the front relays
+to the server (the *worker*), which is the ordinary server started as its child.
+
+```bash
+./run-server.sh reload
+```
+
+asks every running front to swap its worker for one started from the current source, then
+prints what each did:
+
+```
+reload 1792633199847-69436: asked 3 running front(s)
+  ok      front 68063: server 68071 -> 69694 (generation 2)  cwd=/Users/you/project
+  FAILED  front 70112: the new server (pid 70990) failed: ...; the old one keeps serving
+  -       front 70544: the editor has not connected yet; nothing to replace
+```
+
+- **Nothing in flight is cut off.** New calls go to the new worker only after it has answered
+  the editor's own handshake (`initialize`, or `server/discover` on MCP 2026-07-28). The old
+  worker answers the calls it already took, then is told to drain: it stays until every
+  delivery it carries — a peer turn it is watching, an answer on its way back — is done, and
+  exits.
+- **A broken tree is refused before any front sees it.** The command imports the source in a
+  fresh process first; one that does not import exits with `reload refused` and nothing is
+  asked of the fronts. A worker that still fails to start, or dies while taking over the
+  editor's subscription, is reported per front as `FAILED`, and that front goes on with its old
+  worker. The command exits non-zero when any front failed or did not answer in time.
+- **A call the editor cancels is not waited for.** MCP servers never answer a cancelled
+  request, so the front stops counting it as owed; an interrupted call does not keep a replaced
+  worker alive.
+- **Closing the editor:** the current worker exits as a server always has. A worker a reload
+  already released goes on until its last delivery is done (at most 24 hours), still holding
+  the busy locks of what it carries under its own pid; stopping the server with a signal stops
+  it too.
+- **The editor keeps one connection.** On MCP 2026-07-28 (Claude Code) the editor holds one
+  `subscriptions/listen` request open for the whole session; the front moves it to the new
+  worker under the editor's own request id, so it stays a single stream. After a reload the
+  editor is told the tool list may have changed: Claude Code fetches it again, so a new tool or
+  argument shows up at once. Codex does not refetch, so a change to a tool's signature reaches a
+  Codex thread only when it starts a new server; changes to behaviour reach it at once.
+- **A worker that dies is replaced.** Calls it had not answered are answered with an error, and
+  the front starts another worker. One that keeps dying (more than 3 times in 60s) takes the
+  front down with it, as a crashed server always did.
+- **What still needs an editor restart:** changes to the front itself (`front.py`), to
+  `run-server.sh`, to the server instructions (the editor reads them once, from the first
+  handshake), and to environment variables of a registration.
+
+`bridge_status` reports `server_process`: the worker's `pid`, its `front_pid` and its
+`worker_generation`, so a session can see which code is answering it. Set
+`CROSS_AGENT_RELOAD=0` in a registration to run the server directly, without a front.
+
 ---
 
 ## 4. Tools
@@ -860,6 +915,7 @@ Nothing comes back from the turn that reads a reply: the bridge relays answers t
 | `CROSS_AGENT_TIMEOUT` | `600` | CLI inactivity limit (seconds). Output or target transcript writes reset it; active turns have no wall-clock limit. Doesn't make the caller wait |
 | `CROSS_AGENT_PANEL_PATIENCE` | `3600` | Panel busy-wait budget and threshold for a `PROGRESS (INFO)` notice. Each uses the larger of this value and the job timeout. An accepted turn remains `awaiting-peer` until it finishes, then its answer is pushed to the sender's open panel |
 | `CROSS_AGENT_DELIVERY_TTL` | `604800` | How long finished delivery records are kept (seconds, default 7 days) |
+| `CROSS_AGENT_RELOAD` | on | Read by `run-server.sh` when it is started with no arguments. On, the server runs behind a front that `run-server.sh reload` can swap to the current source; `0`/`false`/`no`/`off` runs the server directly — see [Applying code changes without restarting the editor](#applying-code-changes-without-restarting-the-editor) |
 | `CROSS_AGENT_SCOPE` | `cwd` | Default discovery scope (`cwd` / `tree` / `any`) |
 | `CROSS_AGENT_UI_HOOK` | `auto` | Panel injection (`auto` / `off` / `require`) |
 | `CROSS_AGENT_REQUIRE_EXPLICIT_TARGET` | (unset) | Refuse a send that names neither `session_id` nor `new_session=true`; a pin doesn't count. `0` / `false` / `no` / `off` leave it off, any other value turns it on |
@@ -971,6 +1027,10 @@ PYTHONPATH=src .venv/bin/python tests/grok_shim_roundtrip.py     # 2 Grok turns 
 # Protocol handshake + discovery + all 3 guards (consumes no agent turns)
 PYTHONPATH=src .venv/bin/python tests/smoke_mcp.py
 
+# The front and hot reload: both MCP handshakes, calls carried across a reload, a worker
+# that will not start or dies, and the real server reloaded behind the front (no agent turns)
+PYTHONPATH=src .venv/bin/python tests/front_reload.py
+
 # 5 real round trips (actually consumes Codex/Claude turns)
 PYTHONPATH=src .venv/bin/python tests/live_roundtrip.py
 ```
@@ -978,7 +1038,9 @@ PYTHONPATH=src .venv/bin/python tests/live_roundtrip.py
 Logs go to `~/.cross-agent/logs/bridge.log`. The panel shim runs inside the extension's stdio
 and has no terminal, so it writes separately to `~/.cross-agent/logs/shim-claude.log` /
 `shim-codex.log` / `shim-grok.log` — this is where you'll find when an injected turn was accepted, which turn id
-it finished as, and when an approval prompt appeared and was answered.
+it finished as, and when an approval prompt appeared and was answered. Fronts write
+`~/.cross-agent/logs/front.log`: which worker each started, every reload and what it moved, and
+every worker exit; `~/.cross-agent/fronts/<pid>.json` holds each running front's current state.
 
 ## 9. Known limitations
 

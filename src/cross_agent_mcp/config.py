@@ -52,6 +52,12 @@ LOG_PATH: str = LOG_DIR + 'bridge.log'
 # server re-sending its queue would ask the peer to do the same work twice.
 DELIVERY_DIR: str = HOME_DIR + 'deliveries/'
 
+# Hot reload. `run-server.sh reload` writes the request file; every front (`--reload`) polls
+# it, swaps the server behind it for one started from the current source, and records what it
+# did under fronts/ - which is how the command reports back.
+RELOAD_REQUEST_PATH: str = HOME_DIR + 'reload-request.json'
+FRONT_DIR: str = HOME_DIR + 'fronts/'
+
 # delivery records older than this are pruned when the directory is read
 DELIVERY_TTL_SECONDS: int = get_env_int('CROSS_AGENT_DELIVERY_TTL', 7 * 24 * 3600)
 
@@ -178,6 +184,11 @@ ENV_GROK_SESSION: str = 'GROK_SESSION_ID'
 # Copilot supplies the SDK session UUID to each session's MCP process. It differs from
 # the editor UUID and is resolved through the registered default-chat metadata.
 ENV_COPILOT_SESSION: str = 'COPILOT_AGENT_SESSION_ID'
+# Set by a front on the server it starts: which front it runs behind, and which of the servers
+# that front has started it is. Never passed on to an agent CLI - `child_env` starts from
+# nothing.
+ENV_FRONT_PID: str = 'CROSS_AGENT_FRONT_PID'
+ENV_WORKER_GENERATION: str = 'CROSS_AGENT_WORKER_GENERATION'
 
 AGENT_CLAUDE: str = 'claude'
 AGENT_CODEX: str = 'codex'
@@ -472,7 +483,7 @@ def child_env() -> dict:
 
 def ensure_dirs() -> None:
     global _is_repaired
-    for path in (HOME_DIR, LOCK_DIR, LOG_DIR, DELIVERY_DIR):
+    for path in (HOME_DIR, LOCK_DIR, LOG_DIR, DELIVERY_DIR, FRONT_DIR):
         secure_makedirs(path)
 
     if not _is_repaired:

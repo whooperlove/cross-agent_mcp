@@ -14,4 +14,14 @@ fi
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONUNBUFFERED=1
 
+# Started by an editor (no arguments), the server runs behind a front that can swap it for
+# the current source when `run-server.sh reload` is run - no editor restart needed. Set
+# CROSS_AGENT_RELOAD=0 in the registration to run the server directly instead.
+if [[ $# -eq 0 ]]; then
+    case "$(printf '%s' "${CROSS_AGENT_RELOAD:-1}" | tr '[:upper:]' '[:lower:]')" in
+        0|false|no|off) ;;
+        *) set -- --reload ;;
+    esac
+fi
+
 exec "${PYTHON_BIN}" -m cross_agent_mcp "$@"

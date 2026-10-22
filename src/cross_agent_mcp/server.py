@@ -6,12 +6,16 @@ them reaches a Grok Build session with `send_to_grok`.
 """
 
 import asyncio
+import contextlib
 import functools
 import logging
 import logging.handlers
 import os
 import shutil
+import signal
 import sys
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from mcp.server import MCPServer
@@ -21,6 +25,14 @@ from . import bridge, caller, config, copilot, discovery, outbox, panel, registr
 
 
 logger = logging.getLogger('cross_agent_mcp')
+
+STARTED_AT = time.time()
+
+# A front that has replaced this server sends SIGUSR1 before closing stdin: finish carrying
+# what was already accepted instead of exiting with it. Bounded, so a turn left waiting on a
+# click nobody gives does not keep the process forever.
+DRAIN_LIMIT_SECONDS = 24 * 3600
+_drain_requested = threading.Event()
 
 SERVER_INSTRUCTIONS = (
     'Bridge between the coding agents running in this editor. '
@@ -469,6 +481,14 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
         'ok': True,
         'running_under': identity['agent'],
         'process_chain': identity['chain'],
+        # which code this answer came from: behind a front, `run-server.sh reload` replaces
+        # this process, and worker_generation counts the servers that front has started
+        'server_process': {
+            'pid': os.getpid(),
+            'started_at': STARTED_AT,
+            'front_pid': os.environ.get(config.ENV_FRONT_PID),
+            'worker_generation': os.environ.get(config.ENV_WORKER_GENERATION),
+        },
         # the thread this call came from, when the host says so (Codex does); replies to a
         # request made from here are addressed to it
         'caller_session_id': caller_session_id,
@@ -631,14 +651,35 @@ def main() -> None:
               file=sys.stderr)
 
     bridge.install_shutdown_guard()
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        signal.signal(signal.SIGUSR1, lambda signum, frame: _drain_requested.set())
 
-    logger.info(f'main [BEGIN]: cross-agent MCP server, cwd={os.getcwd()}')
+    logger.info(f'main [BEGIN]: cross-agent MCP server, cwd={os.getcwd()}, '
+                f'front={os.environ.get(config.ENV_FRONT_PID) or "none"}')
     try:
         server.run('stdio')
+        # only after stdin closed: a stop signal raises out of run() and skips this
+        _finish_carrying()
     except KeyboardInterrupt:
         logger.info('main [END]: interrupted')
     finally:
         logging.shutdown()
+
+
+def _finish_carrying() -> None:
+    """Stay until the deliveries this server accepted are done, when its front replaced it.
+
+    Without a drain request, stdin closing means the editor is done with this server and it
+    exits as it always has. A replaced server is different: nobody asked for its deliveries
+    to stop, and exiting would orphan every peer turn it was watching.
+    """
+    if not _drain_requested.is_set():
+        return
+    deadline = time.time() + DRAIN_LIMIT_SECONDS
+    logger.info(f'_finish_carrying [BEGIN]: replaced by a reload, idle={outbox.OUTBOX.is_idle()}')
+    while not outbox.OUTBOX.is_idle() and time.time() < deadline:
+        time.sleep(1)
+    logger.info(f'_finish_carrying [END]: idle={outbox.OUTBOX.is_idle()}')
 
 
 if __name__ == '__main__':

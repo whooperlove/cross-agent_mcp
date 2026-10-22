@@ -610,6 +610,13 @@ class Outbox:
         with self._guard:
             return len(self._queues.get(key, []))
 
+    def is_idle(self) -> bool:
+        """Whether this process carries nothing: no delivery queued, running or awaiting its
+        answer. A delivery stays in `pending` until its record is final, and an answer is queued
+        before the request it answers is archived, so this never reads idle in between."""
+        with self._guard:
+            return not self._pending
+
     def await_outcome(self, job: Job) -> None:
         """Stay with a just-queued job until the peer takes it, it fails, or the window passes.
 
