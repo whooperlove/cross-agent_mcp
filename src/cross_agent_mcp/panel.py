@@ -9,6 +9,7 @@ that lets the bridge find the shim belonging to its own editor window, and the s
 """
 
 import contextlib
+import fcntl
 import json
 import logging
 import logging.handlers
@@ -95,7 +96,58 @@ class SecureRotatingFileHandler(logging.handlers.RotatingFileHandler):
 
     Rotation opens the next file itself, so setting the mode once on the first one would
     leave every later generation at whatever the umask gives it.
+
+    Every server, front and shim writes the same few logs, and the stock handler decides by
+    the size of the file it holds open. Once one process had rotated, every other one still
+    held the renamed file - past the limit - and rotated again with its next line. Dozens of
+    servers released by one reload wrote a line each within a second, each line pushed the
+    history one generation further out, and megabytes of log became four lines. So the size
+    is that of the file at the path now, a process that finds the file was rotated under it
+    reopens instead, and a rotation is made under a lock, by the one process that still finds
+    it due once it holds the lock.
     """
+
+    def _reopen_if_rotated(self) -> bool:
+        """Point the stream at the file the path names now. True when it had to move."""
+        try:
+            on_disk = os.stat(self.baseFilename)
+        except FileNotFoundError:
+            on_disk = None
+        if self.stream is not None and on_disk is not None:
+            try:
+                held = os.fstat(self.stream.fileno())
+                if (held.st_ino, held.st_dev) == (on_disk.st_ino, on_disk.st_dev):
+                    return False
+            except (OSError, ValueError):
+                pass
+        if self.stream is not None:
+            with contextlib.suppress(Exception):
+                self.stream.close()
+        self.stream = self._open()
+        return True
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:
+        if self.maxBytes <= 0:
+            return False
+        self._reopen_if_rotated()
+        try:
+            size = os.fstat(self.stream.fileno()).st_size
+        except (OSError, ValueError):
+            return False
+        return size + len(self.format(record)) + 1 >= self.maxBytes
+
+    def doRollover(self) -> None:
+        fd = os.open(self.baseFilename + '.lock', os.O_WRONLY | os.O_CREAT, config.FILE_MODE)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            # another process rotated while this one waited for the lock: nothing left to do
+            if self._reopen_if_rotated():
+                return
+            super().doRollover()
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     def _open(self):
         flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if 'w' in self.mode else os.O_APPEND)

@@ -2104,6 +2104,61 @@ def test_the_receipt_counts_what_waits_ahead_on_every_server() -> None:
                 os.remove(outbox._record_path(delivery_id, is_finished=False))
 
 
+ROTATING_WRITER = '''
+import logging, sys, time
+sys.path.insert(0, sys.argv[1])
+from cross_agent_mcp import panel
+path, start_at, kind = sys.argv[2], float(sys.argv[3]), sys.argv[4]
+cls = panel.SecureRotatingFileHandler if kind == 'secure' else logging.handlers.RotatingFileHandler
+handler = cls(path, maxBytes=4000, backupCount=3, encoding='utf-8')
+log = logging.getLogger('rot')
+log.addHandler(handler)
+log.setLevel(logging.INFO)
+logging.raiseExceptions = False
+# a server that has been writing all along holds the file at its end, as these do after
+# their first line; the second line is the one a reload makes them all write at once
+for at in (start_at, start_at + 0.7):
+    while time.time() < at:
+        time.sleep(0.001)
+    log.info('drained ' + 'x' * 60)
+handler.close()
+'''
+
+
+def _rotate_together(kind: str, writers: int) -> dict:
+    """Writers that all hold one nearly full log open and each add a line at the same instant."""
+    import subprocess
+    source = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src')
+    with tempfile.TemporaryDirectory(prefix='rotate-') as store:
+        path = store + '/bridge.log'
+        with open(path, 'w') as f:
+            f.write('HISTORY ' + 'h' * 3900 + '\n')
+        start_at = time.time() + 1.5
+        procs = [subprocess.Popen([sys.executable, '-B', '-c', ROTATING_WRITER,
+                                   source, path, str(start_at), kind],
+                                  stderr=subprocess.DEVNULL) for _ in range(writers)]
+        for proc in procs:
+            proc.wait(30)
+        files = {}
+        for name in ('bridge.log', 'bridge.log.1', 'bridge.log.2', 'bridge.log.3'):
+            with contextlib.suppress(OSError):
+                files[name] = open(os.path.join(store, name)).read()
+        return files
+
+
+def test_many_servers_rotating_one_log_keep_its_history() -> None:
+    """It happened: a reload released dozens of servers, each wrote one line within a second,
+    and every one of them rotated the shared bridge.log - megabytes of history, including the
+    record of the incident being investigated, became four files of one line each."""
+    secure = _rotate_together('secure', 12)
+    kept = ''.join(secure.values())
+    check('the history survives a dozen servers writing at once to a full log',
+          'HISTORY' in kept, {k: len(v) for k, v in secure.items()})
+    check('and every line written is kept', kept.count('drained') == 24, kept.count('drained'))
+    check('the log was rotated once, not once per writer',
+          sum(1 for v in secure.values() if v) == 2, {k: len(v) for k, v in secure.items()})
+
+
 def test_the_recovered_flag_reaches_the_envelope() -> None:
     originals = (discovery.find_session, bridge._panel_session)
     discovery.find_session = lambda agent, session_id: None
@@ -7909,6 +7964,7 @@ def run_all() -> None:
     test_an_answer_without_its_id_is_marked_and_the_late_one_follows()
     test_a_message_that_waited_says_how_long()
     test_the_receipt_counts_what_waits_ahead_on_every_server()
+    test_many_servers_rotating_one_log_keep_its_history()
     test_the_recovered_flag_reaches_the_envelope()
     test_a_reply_runs_where_the_senders_session_lives()
     test_an_answer_with_no_panel_to_land_in_is_kept_rather_than_resumed()
