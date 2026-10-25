@@ -81,14 +81,31 @@ def new_inject_id() -> str:
     return INJECT_ID_PREFIX + uuid.uuid4().hex[:12]
 
 
-# The request id the bridge puts in every envelope and asks the peer to echo. A message that
-# carries it back is the answer to that request, whatever else the shim's bookkeeping says.
+# The request id the bridge puts in every envelope and asks the peer to end its answer with. A
+# message that ends with it is the answer to that request, whatever else the shim's
+# bookkeeping says.
 REQUEST_TOKEN_PATTERN = re.compile(r'\breq_\d+_[0-9a-f]{6}\b')
 
 
 def request_token_in(text: Optional[str]) -> Optional[str]:
     match = REQUEST_TOKEN_PATTERN.search(text or '')
     return match.group(0) if match else None
+
+
+def answered_request_tokens(text: Optional[str]) -> List[str]:
+    """The request ids a message answers: the ones on its last line that names any.
+
+    The envelope asks for the id on its own final line, and an answer names other requests
+    along the way - the one it follows up, one it reports on. Any mention used to count: a
+    session answering one sender, which mentioned another sender's request in passing, had
+    that turn relayed to the other sender as its answer. Only the closing line says which
+    request a message answers; an older id quoted above it does not.
+    """
+    for line in reversed((text or '').splitlines()):
+        found = REQUEST_TOKEN_PATTERN.findall(line)
+        if found:
+            return found
+    return []
 
 
 class SecureRotatingFileHandler(logging.handlers.RotatingFileHandler):

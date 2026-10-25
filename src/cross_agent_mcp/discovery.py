@@ -20,7 +20,7 @@ import time
 import urllib.parse
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from . import config, registry
+from . import config, panel, registry
 
 
 logger = logging.getLogger('cross_agent_mcp.discovery')
@@ -841,9 +841,13 @@ def request_tokens_in(text: str) -> List[str]:
     back to an earlier one, or paste a delivery id out of a status report. Comparing only the
     first meant an answer that mentioned an older request and then ended with the right token
     - exactly the shape the envelope asks for, the id on its own final line - was read as
-    answering something else.
+    answering something else. Which request a message *answers* is `answered_request_tokens`.
     """
     return REQUEST_TOKEN_PATTERN.findall(text)
+
+
+# the ids on a message's closing line: the request it answers, not every one it mentions
+answered_request_tokens = panel.answered_request_tokens
 
 
 def _parsed(lines: List[str]) -> Iterator[Dict[str, Any]]:
@@ -1058,11 +1062,12 @@ def _pick_answer(turns: List[Dict[str, Any]], after: Optional[float], token: Opt
              if after is None or (t['written_at'] is not None and t['written_at'] > after)]
 
     if token is not None:
+        # the id on the closing line decides; one quoted in passing belongs to another request
         for turn in spoken:
-            if token in request_tokens_in(turn['text']):
+            if token in panel.answered_request_tokens(turn['text']):
                 return turn, None
         if fresh:
-            echoed = sorted({e for t in fresh for e in request_tokens_in(t['text'])})
+            echoed = sorted({e for t in fresh for e in panel.answered_request_tokens(t['text'])})
             logger.info(f'_pick_answer [unmatched]: {label} finished a turn after the request '
                         f'but it does not echo {token}'
                         + (f' (it answers {echoed})' if echoed else '')

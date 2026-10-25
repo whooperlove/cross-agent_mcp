@@ -26,7 +26,7 @@ import time
 import uuid
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-from . import config, registry
+from . import config, panel, registry
 
 
 logger = logging.getLogger('cross_agent_mcp.outbox')
@@ -789,7 +789,9 @@ class Outbox:
 
         # the outcome is settled here; what follows only tells people about it
         job.finished_at = job.finished_at or time.time()
-        job.is_reply_echoed = bool(job.reply) and job.delivery_id in job.reply
+        # the id on the closing line: an answer to someone else that mentions this request in
+        # passing has not answered it
+        job.is_reply_echoed = job.delivery_id in panel.answered_request_tokens(job.reply)
         try:
             if job.is_stopped_with_carrier:
                 # the server is exiting: whoever can hear about it was told as it stopped the

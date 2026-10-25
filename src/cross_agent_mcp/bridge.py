@@ -769,7 +769,7 @@ def _transcript_answer(target_agent: Optional[str], session_id: Optional[str],
         return None
 
     answer = (progress or {}).get('answer')
-    if answer and token in discovery.request_tokens_in(answer):
+    if answer and token in discovery.answered_request_tokens(answer):
         return answer
     return None
 
@@ -1435,7 +1435,8 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
                                     is_recovered=is_recovered,
                                     failure_reason=job.error if is_recovered else None,
                                     request_id=job.delivery_id,
-                                    is_echoed=job.delivery_id in reply,
+                                    is_echoed=job.delivery_id
+                                    in discovery.answered_request_tokens(reply),
                                     watch_until=job.late_answer_watch_until,
                                     is_late=job.is_late_answer)
 

@@ -25,7 +25,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 from . import config
-from .panel import INJECT_ID_PREFIX, PanelShim, Turn, new_inject_id, request_token_in, shim_logger
+from .panel import (INJECT_ID_PREFIX, PanelShim, Turn, answered_request_tokens, new_inject_id,
+                    request_token_in, shim_logger)
 
 
 # `codex app-server` has sub-subcommands that are not the stdio server; leave those alone
@@ -350,12 +351,13 @@ class CodexAppServerShim(PanelShim):
             return
 
         # The peer's own words are evidence that does not depend on turn ids lining up: a
-        # message on our thread that carries our request token is the answer to our request,
-        # whichever turn the app server filed it under.
+        # message on our thread that ends with our request token is the answer to our request,
+        # whichever turn the app server filed it under. One that only mentions it is not.
         if (method == 'item/completed' and is_our_thread and injection.token
                 and isinstance(params.get('item'), dict)):
             item = params['item']
-            if item.get('type') == 'agentMessage' and injection.token in str(item.get('text') or ''):
+            if (item.get('type') == 'agentMessage' and injection.token
+                    in answered_request_tokens(str(item.get('text') or ''))):
                 injection.echo = str(item['text'])
                 self.log.info(f'token echoed: injection={injection.injection_id} '
                               f'turn={params.get("turnId")} (expected {injection.turn_id})')

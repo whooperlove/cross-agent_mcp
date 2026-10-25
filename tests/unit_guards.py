@@ -2060,6 +2060,73 @@ def test_an_answer_without_its_id_is_marked_and_the_late_one_follows() -> None:
         outbox.LATE_ANSWER_POLL_SECONDS, config.LATE_ANSWER_WATCH_SECONDS = originals
 
 
+def test_a_late_answer_is_only_a_turn_that_closes_with_the_id() -> None:
+    """It happened: a session answering several senders told one of them "master set the new
+    standard (req_…5d3f55)" and closed with that sender's own id. The late-answer watch found
+    master's id in the text and relayed the turn to master as master's answer."""
+    master_id, dev5_id = 'req_1792949541668_5d3f55', 'req_1792948788827_b05d5a'
+    mention = f'dev5께. master가 새 기준을 정했습니다(`{master_id}`). 다시 그려 주세요.\n\n{dev5_id}'
+    check('the closing line names the request a message answers',
+          panel.answered_request_tokens(mention) == [dev5_id])
+    check('two ids on the closing line answer both',
+          panel.answered_request_tokens(f'끝\n{master_id} {dev5_id}') == [master_id, dev5_id])
+    check('the last line naming any id decides, even with text after it',
+          panel.answered_request_tokens(f'답\n{master_id}\n추신') == [master_id])
+    check('a message that names no request answers none',
+          panel.answered_request_tokens('진행 중입니다') == [])
+
+    sent_at = 1_788_000_000.0
+    with tempfile.TemporaryDirectory(prefix='late-misroute-') as store:
+        path = store + '/session.jsonl'
+        original = discovery.find_session
+        discovery.find_session = lambda agent, sid: {'path': path}
+        try:
+            job = outbox.Job(
+                target_agent=config.AGENT_CLAUDE, target_session_id='thumb', payload='x',
+                run_cwd='/tmp', pin_cwd='/tmp', env={}, timeout=5, ui_shim=None, title=None,
+                conversation_id='conv_x', hop=1, sender_agent=config.AGENT_CLAUDE,
+                sender_session_id='master', wants_reply=True, summary='s', delivery_id=master_id)
+            job.started_at = sent_at
+            lines = [_claude_line('기준 초안은 끝냈고 결과는 따로 보고하겠습니다.', 'end_turn', 'r1',
+                                  sent_at + 60),
+                     _claude_line(mention, 'end_turn', 'r2', sent_at + 70)]
+            open(path, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+            check('a turn answering another sender that mentions this request is not its late answer',
+                  bridge._find_late_answer(job) is None)
+            check('nor is it this request\'s answer when the delivery report reads the transcript',
+                  (discovery.peer_progress('claude', 'thumb', after=sent_at, token=master_id)
+                   or {}).get('answer') is None)
+            final = f'master께. 최종 보고입니다.\n\n{master_id}'
+            lines.append(_claude_line(final, 'end_turn', 'r3', sent_at + 600))
+            open(path, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+            check('the turn that closes with this request\'s id is its late answer',
+                  bridge._find_late_answer(job) == final, bridge._find_late_answer(job))
+        finally:
+            discovery.find_session = original
+
+    originals = (outbox.LATE_ANSWER_POLL_SECONDS, config.LATE_ANSWER_WATCH_SECONDS)
+    outbox.LATE_ANSWER_POLL_SECONDS, config.LATE_ANSWER_WATCH_SECONDS = 0.05, 0.3
+    box = outbox.Outbox()
+    box.find_late_answer = lambda job: None
+    box.build_reply = lambda job, reply: outbox.Job(
+        target_agent=config.AGENT_CLAUDE, target_session_id='sender-sid', payload=reply,
+        run_cwd='/tmp', pin_cwd='/tmp', env={}, timeout=5, ui_shim=None, title=None,
+        conversation_id='conv_outbox', hop=1, sender_agent=config.AGENT_CODEX,
+        sender_session_id='peer', wants_reply=False, summary='reply', kind=outbox.KIND_REPLY)
+    box.deliver = lambda job: {'session_id': job.target_session_id or '',
+                               'reply': (f'이 요청({job.delivery_id})은 따로 보고합니다.\n\n{dev5_id}'
+                                         if job.wants_reply else '')}
+    try:
+        quoted = _job(box, 'late-' + uuid_hex(), wants_reply=True)
+        box.submit(quoted)
+        _wait_until(lambda: quoted.finished_at)
+        check('an answer that only quotes its request id is treated as interim and watched',
+              quoted.is_reply_echoed is False and quoted.late_answer_watch_until is not None)
+        _wait_until(box.is_idle, 3)
+    finally:
+        outbox.LATE_ANSWER_POLL_SECONDS, config.LATE_ANSWER_WATCH_SECONDS = originals
+
+
 def test_a_message_that_waited_says_how_long() -> None:
     """One was taken 88 minutes after it was written, and acted on as if it were current."""
     job = _job(outbox.Outbox(), 'age-' + uuid_hex(), wants_reply=True)
@@ -4868,6 +4935,17 @@ def test_a_codex_turn_is_settled_by_its_echo_when_the_ids_never_match() -> None:
         'threadId': 'thr-2', 'turn': {'id': 'turn-Z', 'status': 'completed'}}})
     still = shim.await_turn(receipt['injectionId'], timeout=0.05)
     check('an echo on another thread does not count', still.get('pending') is True,
+          str(still)[:200])
+
+    # on our own thread, a message that names our request in passing and closes with another
+    # sender's id answers that sender, not us
+    shim._observe_from_server({'method': 'item/completed', 'params': {
+        'threadId': 'thr-1', 'turnId': 'turn-Y',
+        'item': {'type': 'agentMessage', 'text': 'req_6_abcdef 건은 따로 보고합니다.\n\nreq_7_abcdef'}}})
+    shim._observe_from_server({'method': 'turn/completed', 'params': {
+        'threadId': 'thr-1', 'turn': {'id': 'turn-Y', 'status': 'completed'}}})
+    still = shim.await_turn(receipt['injectionId'], timeout=0.05)
+    check('a message that only mentions our id does not end ours', still.get('pending') is True,
           str(still)[:200])
 
 
@@ -7964,6 +8042,7 @@ def run_all() -> None:
     test_a_recovered_answer_says_it_may_not_be_finished()
     test_an_answer_that_hands_over_work_says_how_to_report_back()
     test_an_answer_without_its_id_is_marked_and_the_late_one_follows()
+    test_a_late_answer_is_only_a_turn_that_closes_with_the_id()
     test_a_message_that_waited_says_how_long()
     test_the_receipt_counts_what_waits_ahead_on_every_server()
     test_many_servers_rotating_one_log_keep_its_history()
