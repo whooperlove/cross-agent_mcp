@@ -2021,6 +2021,8 @@ def test_an_answer_without_its_id_is_marked_and_the_late_one_follows() -> None:
         check('the later turn ending with the id goes back as a late answer',
               len(built) == 2 and built[1]['is_late'] and job.delivery_id in built[1]['reply'],
               built)
+        # the reply is built first, the record amended right after: wait for the amendment
+        _wait_until(lambda: (outbox.read_record(job.delivery_id) or {}).get('late_reply_delivery_id'))
         record = outbox.read_record(job.delivery_id) or {}
         check('the request record says the first answer lacked its id and where the late one went',
               record.get('is_reply_echoed') is False and job.late_reply_delivery_id
