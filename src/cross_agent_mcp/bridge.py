@@ -137,6 +137,11 @@ def _address_line(sender: str, reply_to: Optional[str]) -> str:
     return f'reply-to: {sender} session {reply_to}\n'
 
 
+def _hours(seconds: float) -> str:
+    hours = seconds / 3600
+    return f'{hours:g}h' if hours >= 1 else f'{round(seconds / 60)} min'
+
+
 def _build_envelope(sender: str, target: str, conversation_id: str, hop: int, remaining: int,
                     message: str, reply_to: Optional[str] = None,
                     request_id: Optional[str] = None) -> str:
@@ -168,7 +173,14 @@ def _build_envelope(sender: str, target: str, conversation_id: str, hop: int, re
         '  own session. Take the time the task needs; nothing is parked waiting on you.\n'
         + (f'- End your final message with the request id on its own line: {request_id}\n'
            '  If the relay drops, that line is how your answer is matched to this request\n'
-           '  rather than mistaken for a reply to something else.\n' if request_id else '')
+           '  rather than mistaken for a reply to something else.\n'
+           + ('- Put the id only on the finished answer. If you end this turn before the work\n'
+              '  is done ("subagents are on it, I will report"), leave the id off that note: it\n'
+              '  is relayed marked as interim, and your later turn that ends with the id is\n'
+              '  relayed as the late answer (watched for '
+              f'{_hours(config.LATE_ANSWER_WATCH_SECONDS)}).\n'
+              if config.LATE_ANSWER_WATCH_SECONDS > 0 else '')
+           if request_id else '')
         +
         '- Answer the peer directly; do not wait for the human and do not ask for confirmation.\n'
         '- Keep the answer self-contained: the peer sees only your final message.\n'
@@ -179,7 +191,10 @@ def _build_envelope(sender: str, target: str, conversation_id: str, hop: int, re
 def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: int,
                           remaining: int, reply: str, reply_to: Optional[str] = None,
                           is_recovered: bool = False,
-                          failure_reason: Optional[str] = None) -> str:
+                          failure_reason: Optional[str] = None,
+                          request_id: Optional[str] = None, is_echoed: bool = True,
+                          watch_until: Optional[float] = None,
+                          is_late: bool = False) -> str:
     """Wrap a peer's answer so the original sender reads it as an answer, not a new request.
 
     A recovered answer says so, and says why the transport failed. Recovery reads the peer's
@@ -195,9 +210,15 @@ def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: i
     until the sender went looking for it. It names the conversation as well as the session:
     a panel's MCP server never inherits the conversation, so a report sent without it would
     open a fresh hop budget instead of spending from this one.
+
+    An answer without the request id may be an interim note: the peer ended its turn on "I'll
+    report when the subagents are done", and wrote the real answer in a later turn nobody
+    carried back. It says so, and says the bridge is reading for that later turn - which, once
+    found, comes as a LATE ANSWER of its own.
     """
     sender_label = AGENT_LABEL.get(sender, sender)
     reply_tool = reach_tool(sender)
+    request_name = f'request {request_id}' if request_id else 'your request'
 
     no_return = (f'- The bridge does not carry your next message back to {sender_label}: it '
                  'relays answers\n  to requests, and this is itself an answer.\n')
@@ -228,15 +249,39 @@ def _build_reply_envelope(sender: str, target: str, conversation_id: str, hop: i
             '  answer. Treat it as finished only if it reads like a finished answer, and check\n'
             f'  with {sender_label} before acting on it as a report.\n'
             f'- Why the transport failed: {failure_reason or "not recorded"}\n')
+    elif is_late:
+        provenance = (
+            f'- LATE ANSWER to {request_name}. {sender_label} first ended its turn with an\n'
+            '  answer that did not carry the request id - you received that one already - and\n'
+            '  wrote this in a later turn, ending with the id. This is the turn that answers\n'
+            '  your message.\n')
     else:
         provenance = '- This is the answer to a message you relayed earlier.\n'
+    if not is_echoed and not is_late:
+        if watch_until:
+            until = time.strftime('%H:%M', time.localtime(watch_until))
+            watching = (f'  The bridge keeps reading {sender_label}\'s transcript until {until} for '
+                        'a later\n  turn that ends with the id, and sends it here as a LATE '
+                        'ANSWER.\n')
+        else:
+            watching = ('  Nothing is watching for a later turn: check it with\n'
+                        f'  bridge_status(delivery_id="{request_id}") if you expect more.\n'
+                        if request_id else '')
+        provenance += (
+            f'- NO REQUEST ID. This answer does not carry the id of {request_name}, so it\n'
+            f'  may be an interim note ("I\'ll report when ...") with {sender_label}\'s real '
+            'answer\n  still to come. If it already reads as a finished answer, treat it as '
+            'one.\n' + watching)
 
     return (
         '=== CROSS-AGENT BRIDGE REPLY ===\n'
         f'from: {sender_label} (peer AI agent, not the human user)\n'
         f'{_address_line(sender, reply_to)}'
         f'conversation: {conversation_id} | answering hop {hop}/{config.MAX_HOPS}'
-        f'{" | recovered from transcript" if is_recovered else ""}\n'
+        f'{" | recovered from transcript" if is_recovered else ""}'
+        f'{" | LATE ANSWER" if is_late else ""}'
+        f'{" | no request id, possibly interim" if not is_echoed and not is_late else ""}\n'
+        + (f'answering: {request_id}\n' if request_id else '')
         + (f'transport failure: {failure_reason}\n' if is_recovered and failure_reason else '')
         + '\n'
         f'{reply}\n'
@@ -1296,6 +1341,24 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
 
 # --------------------------------------------------------- outbox delivery
 
+def _with_queue_age(job: outbox.Job) -> str:
+    """The payload, saying how long it waited when that was long enough to matter.
+
+    A message waits while its session is busy with other messages or a long turn. One that
+    arrived 88 minutes after it was written was acted on as if it were current, against a
+    state that had moved on since. The envelope is written when the message is sent; how long
+    it waited is only known now, so it goes in at hand-over, below the envelope's first line.
+    """
+    waited = time.time() - job.created_at
+    if waited < config.QUEUE_AGE_NOTICE_SECONDS or not job.payload.startswith('=== CROSS-AGENT'):
+        return job.payload
+    first, newline, rest = job.payload.partition('\n')
+    written = time.strftime('%H:%M', time.localtime(job.created_at))
+    line = (f'queued: written at {written}, {round(waited / 60)} min ago, and held until this '
+            'session was free - check it still applies before acting on it\n')
+    return first + newline + line + rest
+
+
 def _deliver(job: outbox.Job) -> Dict[str, Any]:
     """Run one queued delivery. Called on an outbox worker thread, never on the caller's."""
     # The route can go stale between building this job and running it - a tab closed in
@@ -1312,8 +1375,8 @@ def _deliver(job: outbox.Job) -> Dict[str, Any]:
                                           'update remains on the request record')
 
     result = CALLERS[job.target_agent](
-        job.payload, job.target_session_id, job.run_cwd, job.env, job.timeout, job.ui_shim,
-        job.title,
+        _with_queue_age(job), job.target_session_id, job.run_cwd, job.env, job.timeout,
+        job.ui_shim, job.title,
         on_accepted=lambda response: job.mark_accepted(response.get('sessionId')),
         wants_result=job.wants_reply,
         patience=max(job.timeout, config.PANEL_PATIENCE_SECONDS),
@@ -1365,10 +1428,16 @@ def _build_reply_job(job: outbox.Job, reply: str) -> Optional[outbox.Job]:
     hop = int(registry.get_conversation(job.conversation_id).get('hops', job.hop))
     remaining = max(config.MAX_HOPS - hop, 0)
     answering_id = job.resolved_session_id or job.target_session_id
+    # a late answer was found by its token in the transcript: received, not recovered
+    is_recovered = job.is_reply_recovered and not job.is_late_answer
     payload = _build_reply_envelope(job.target_agent, job.sender_agent, job.conversation_id,
                                     hop, remaining, reply, answering_id,
-                                    is_recovered=job.is_reply_recovered,
-                                    failure_reason=job.error if job.is_reply_recovered else None)
+                                    is_recovered=is_recovered,
+                                    failure_reason=job.error if is_recovered else None,
+                                    request_id=job.delivery_id,
+                                    is_echoed=job.delivery_id in reply,
+                                    watch_until=job.late_answer_watch_until,
+                                    is_late=job.is_late_answer)
 
     shim = _return_shim(job.sender_agent, job.sender_session_id, job.delivery_id, 'the answer')
     if shim is None:
@@ -1499,11 +1568,22 @@ def _recover_reply(job: outbox.Job) -> Optional[str]:
         job.target_agent, session_id, after=job.started_at, token=job.delivery_id)
 
 
+def _find_late_answer(job: outbox.Job) -> Optional[str]:
+    """A finished turn of the peer's that ends with this request's id, after the request landed.
+
+    Asked after an answer that did not carry the id. Only the token counts here: the turn that
+    already answered did not echo it, so any later turn that does is the one meant as the answer.
+    """
+    return _transcript_answer(job.target_agent, job.resolved_session_id or job.target_session_id,
+                              job.started_at or job.created_at, job.delivery_id)
+
+
 outbox.OUTBOX.deliver = _deliver
 outbox.OUTBOX.build_reply = _build_reply_job
 outbox.OUTBOX.build_notice = _build_notice_job
 outbox.OUTBOX.recover = _recover_reply
 outbox.OUTBOX.reroute = _reroute
+outbox.OUTBOX.find_late_answer = _find_late_answer
 
 
 def _orphan_note(record: Dict[str, Any], is_never_handed_over: bool) -> str:
@@ -2112,6 +2192,30 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
             'conversation was retired, this starts a turn nobody is watching: check the session '
             'id before relying on an answer.')
 
+    # What this message waits behind, from every server's records: messages from other senders
+    # and a long turn hold it up just the same. One was taken 88 minutes after it was sent, and
+    # the sender, told nothing, had assumed it arrived.
+    ahead = outbox.OUTBOX.deliveries_ahead(job)
+    is_waiting = job.accepted_at is None and job.finished_at is None
+    peer_now = (panel_state(target_agent, resolved_session_id)
+                if is_waiting and (target or {}).get('ui_shim') and resolved_session_id else {})
+    oldest_ahead = (round(time.time() - float(ahead[0].get('created_at') or time.time()))
+                    if ahead else None)
+    if is_waiting and (ahead or peer_now.get('is_turn_active')):
+        holding = []
+        if peer_now.get('is_awaiting_approval'):
+            holding.append('its current turn is paused on an approval only the human can give')
+        elif peer_now.get('is_turn_active'):
+            holding.append('its current turn is still running')
+        if ahead:
+            holding.append(f'{len(ahead)} earlier message(s) are queued ahead of this one, the '
+                           f'oldest for {round(oldest_ahead / 60)} min')
+        warnings.append(
+            f'{target_agent} session {resolved_session_id} is busy: {" and ".join(holding)}. '
+            'This message is handed over when those are done, and says on arrival how long it '
+            'waited. Do not resend it - a second copy waits in the same queue; '
+            f'bridge_status(delivery_id="{delivery_id}") shows when it is taken.')
+
     return {
         'ok': True,
         'accepted': True,
@@ -2145,6 +2249,14 @@ def send_message(target_agent: str, message: str, session_id: Optional[str] = No
         # arrive, and true does not promise one will - a panel can open or close in between.
         'return_panel_available_now': has_return_panel_now,
         'queue_depth': outbox.OUTBOX.depth(job.key()),
+        # what holds this message up, counted across every server, not only this one
+        'peer_queue': {
+            'ahead': len(ahead),
+            'ahead_delivery_ids': [r.get('delivery_id') for r in ahead][:10],
+            'oldest_ahead_waiting_seconds': oldest_ahead,
+            'is_turn_active': peer_now.get('is_turn_active'),
+            'is_awaiting_approval': peer_now.get('is_awaiting_approval'),
+        },
         'sender_agent': sender_agent,
         'reply_lands_in_session': self_session_id,
         'conversation_id': conversation_id,

@@ -1947,6 +1947,163 @@ def test_an_answer_that_hands_over_work_says_how_to_report_back() -> None:
           recovered)
 
 
+def _wait_until(predicate, seconds: float = 5.0) -> bool:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_an_answer_without_its_id_is_marked_and_the_late_one_follows() -> None:
+    """It happened: a peer ended its first turn on "I have handed the research to two subagents
+    and will report", the bridge closed the request on that, and the real answer - written ten
+    minutes later in a turn the subagents' completion opened, ending with the request id -
+    reached nobody. The sender sat for half an hour on an answer already written."""
+    interim = bridge._build_reply_envelope(
+        'claude', 'claude', 'conv_x', 1, 3, '조사를 맡겼습니다', 'sid', request_id='req_1_aaaaaa',
+        is_echoed=False, watch_until=time.time() + 600)
+    check('an answer without its request id is marked as possibly interim',
+          'NO REQUEST ID' in interim and 'possibly interim' in interim, interim)
+    check('and says the later turn will come as a late answer',
+          'keeps reading' in interim and 'LATE ANSWER' in interim, interim)
+    unwatched = bridge._build_reply_envelope(
+        'claude', 'claude', 'conv_x', 1, 3, '조사를 맡겼습니다', 'sid', request_id='req_1_aaaaaa',
+        is_echoed=False)
+    check('with nothing watching, it says where to look instead',
+          'Nothing is watching' in unwatched
+          and 'bridge_status(delivery_id="req_1_aaaaaa")' in unwatched, unwatched)
+    echoed = bridge._build_reply_envelope(
+        'claude', 'claude', 'conv_x', 1, 3, '끝\nreq_1_aaaaaa', 'sid', request_id='req_1_aaaaaa')
+    check('an answer that ends with its id carries no such mark', 'NO REQUEST ID' not in echoed)
+    late = bridge._build_reply_envelope(
+        'claude', 'claude', 'conv_x', 1, 3, '최종\nreq_1_aaaaaa', 'sid', request_id='req_1_aaaaaa',
+        is_late=True)
+    check('a late answer names itself and the request it answers',
+          'LATE ANSWER to request req_1_aaaaaa' in late and '| LATE ANSWER' in late
+          and 'NO REQUEST ID' not in late, late)
+
+    originals = (outbox.LATE_ANSWER_POLL_SECONDS, config.LATE_ANSWER_WATCH_SECONDS)
+    outbox.LATE_ANSWER_POLL_SECONDS = 0.05
+    config.LATE_ANSWER_WATCH_SECONDS = 5
+    built = []
+    polls = []
+
+    def build_reply(job, reply):
+        built.append({'is_late': job.is_late_answer, 'reply': reply,
+                      'watch_until': job.late_answer_watch_until})
+        return outbox.Job(
+            target_agent=config.AGENT_CLAUDE, target_session_id='sender-sid', payload=reply,
+            run_cwd='/tmp', pin_cwd='/tmp', env={}, timeout=5, ui_shim=None, title=None,
+            conversation_id='conv_outbox', hop=1, sender_agent=config.AGENT_CODEX,
+            sender_session_id='peer', wants_reply=False, summary='reply',
+            kind=outbox.KIND_REPLY)
+
+    def find(job):
+        polls.append(job.delivery_id)
+        return f'최종 답\n{job.delivery_id}' if len(polls) >= 3 else None
+
+    box = outbox.Outbox()
+    box.build_reply = build_reply
+    box.find_late_answer = find
+    box.deliver = lambda job: {'session_id': job.target_session_id or '',
+                               'reply': '하위 에이전트에 맡겼고 끝나면 보고하겠습니다'
+                               if job.wants_reply else ''}
+    try:
+        job = _job(box, 'late-' + uuid_hex(), wants_reply=True)
+        box.submit(job)
+        _wait_until(lambda: built)
+        check('the interim answer goes back at once, saying it is watched',
+              len(built) == 1 and not built[0]['is_late'] and built[0]['watch_until'], built)
+        check('and a server watching for the late answer does not read idle', not box.is_idle())
+        _wait_until(lambda: len(built) >= 2)
+        check('the later turn ending with the id goes back as a late answer',
+              len(built) == 2 and built[1]['is_late'] and job.delivery_id in built[1]['reply'],
+              built)
+        record = outbox.read_record(job.delivery_id) or {}
+        check('the request record says the first answer lacked its id and where the late one went',
+              record.get('is_reply_echoed') is False and job.late_reply_delivery_id
+              and record.get('late_reply_delivery_id') == job.late_reply_delivery_id, record)
+        check('and the server is idle again once it is sent', _wait_until(box.is_idle))
+
+        built.clear()
+        polls.clear()
+        box.deliver = lambda job: {'session_id': job.target_session_id or '',
+                                   'reply': f'끝났습니다\n{job.delivery_id}' if job.wants_reply else ''}
+        echoed_job = _job(box, 'late-' + uuid_hex(), wants_reply=True)
+        box.submit(echoed_job)
+        _wait_until(lambda: built and box.is_idle())
+        time.sleep(0.2)
+        check('an answer ending with its id is not watched',
+              echoed_job.late_answer_watch_until is None and not polls and len(built) == 1)
+
+        built.clear()
+        config.LATE_ANSWER_WATCH_SECONDS = 0.3
+        box.find_late_answer = lambda job: None
+        box.deliver = lambda job: {'session_id': job.target_session_id or '',
+                                   'reply': '진행 중' if job.wants_reply else ''}
+        quiet = _job(box, 'late-' + uuid_hex(), wants_reply=True)
+        box.submit(quiet)
+        check('a watch that finds nothing ends on time and lets the server go idle',
+              _wait_until(lambda: built and box.is_idle(), 3) and len(built) == 1)
+
+        box.build_reply = lambda job, reply: None
+        unsent = _job(box, 'late-' + uuid_hex(), wants_reply=True)
+        box.submit(unsent)
+        _wait_until(lambda: unsent.finished_at and box.is_idle())
+        check('no watch when no answer could be sent back to begin with',
+              unsent.late_answer_watch_until is None and box.is_idle())
+    finally:
+        outbox.LATE_ANSWER_POLL_SECONDS, config.LATE_ANSWER_WATCH_SECONDS = originals
+
+
+def test_a_message_that_waited_says_how_long() -> None:
+    """One was taken 88 minutes after it was written, and acted on as if it were current."""
+    job = _job(outbox.Outbox(), 'age-' + uuid_hex(), wants_reply=True)
+    job.payload = '=== CROSS-AGENT BRIDGE MESSAGE ===\nfrom: Claude Code\n\nhello'
+    check('a message handed over at once carries no queue note',
+          bridge._with_queue_age(job) == job.payload)
+    job.created_at = time.time() - 88 * 60
+    aged = bridge._with_queue_age(job)
+    check('one that waited says when it was written and how long ago, under the first line',
+          aged.startswith('=== CROSS-AGENT BRIDGE MESSAGE ===\nqueued: written at ')
+          and '88 min ago' in aged and aged.endswith('hello'), aged)
+    job.payload = 'raw text'
+    check('a raw message is left exactly as sent', bridge._with_queue_age(job) == 'raw text')
+
+
+def test_the_receipt_counts_what_waits_ahead_on_every_server() -> None:
+    box = outbox.Outbox()
+    sid = 'ahead-' + uuid_hex()
+    mine = _job(box, sid, wants_reply=True)
+    written = []
+
+    def record_of(session_id, age, origin_pid):
+        other = _job(box, session_id, wants_reply=True)
+        other.created_at = mine.created_at - age
+        record = other.describe()
+        record['origin_pid'] = origin_pid
+        outbox._write_record(record, is_finished=False)
+        written.append(other.delivery_id)
+        return other.delivery_id
+
+    try:
+        live = record_of(sid, 300, os.getppid())
+        record_of(sid, 600, 999999)            # its server is gone: nothing will deliver it
+        record_of('other-' + uuid_hex(), 300, os.getppid())
+        newer = record_of(sid, -5, os.getppid())
+        ahead = [r['delivery_id'] for r in box.deliveries_ahead(mine)]
+        check('a message queued earlier for the same session by another live server is ahead',
+              ahead == [live], ahead)
+        check('an orphaned one, another session\'s, and a newer one are not',
+              newer not in ahead and len(ahead) == 1)
+    finally:
+        for delivery_id in written:
+            with contextlib.suppress(OSError):
+                os.remove(outbox._record_path(delivery_id, is_finished=False))
+
+
 def test_the_recovered_flag_reaches_the_envelope() -> None:
     originals = (discovery.find_session, bridge._panel_session)
     discovery.find_session = lambda agent, session_id: None
@@ -7749,6 +7906,9 @@ def run_all() -> None:
     test_recovery_refuses_a_message_with_no_timestamp_when_asked_for_one()
     test_a_recovered_answer_says_it_may_not_be_finished()
     test_an_answer_that_hands_over_work_says_how_to_report_back()
+    test_an_answer_without_its_id_is_marked_and_the_late_one_follows()
+    test_a_message_that_waited_says_how_long()
+    test_the_receipt_counts_what_waits_ahead_on_every_server()
     test_the_recovered_flag_reaches_the_envelope()
     test_a_reply_runs_where_the_senders_session_lives()
     test_an_answer_with_no_panel_to_land_in_is_kept_rather_than_resumed()

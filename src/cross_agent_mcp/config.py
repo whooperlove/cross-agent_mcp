@@ -136,6 +136,14 @@ SEND_TIMEOUT_SECONDS: int = get_env_int('CROSS_AGENT_TIMEOUT', 600)
 # hand-over is accepted, the bridge keeps collecting the answer until the turn ends.
 PANEL_PATIENCE_SECONDS: int = get_env_int('CROSS_AGENT_PANEL_PATIENCE', 3600)
 
+# How long a peer's transcript is read, after an answer that did not end with its request id,
+# for a later turn that does - an answer written once the peer's own subagents reported back.
+# Found, it is sent as a late answer. 0 turns the watch off.
+LATE_ANSWER_WATCH_SECONDS: int = get_env_int('CROSS_AGENT_LATE_ANSWER_WATCH', 3 * 3600)
+
+# A message that waited at least this long for its session to be free says so when it arrives
+QUEUE_AGE_NOTICE_SECONDS: int = 120
+
 # 'cwd' = only sessions rooted at the same directory, 'any' = every recorded session
 DEFAULT_SCOPE: str = get_env_str('CROSS_AGENT_SCOPE', 'cwd')
 
@@ -391,7 +399,8 @@ CHILD_ENV_BRIDGE: tuple = (
     'CROSS_AGENT_CLAUDE_BIN', 'CROSS_AGENT_CODEX_BIN', 'CROSS_AGENT_GROK_BIN',
     'CROSS_AGENT_REAL_CLAUDE', 'CROSS_AGENT_REAL_CODEX', 'CROSS_AGENT_REAL_GROK',
     'CROSS_AGENT_ACTIVE_WINDOW_MIN', 'CROSS_AGENT_MAX_HOPS', 'CROSS_AGENT_TIMEOUT',
-    'CROSS_AGENT_PANEL_PATIENCE', 'CROSS_AGENT_SCOPE', 'CROSS_AGENT_UI_HOOK',
+    'CROSS_AGENT_PANEL_PATIENCE', 'CROSS_AGENT_LATE_ANSWER_WATCH', 'CROSS_AGENT_SCOPE',
+    'CROSS_AGENT_UI_HOOK',
     'CROSS_AGENT_REQUIRE_EXPLICIT_TARGET', 'CROSS_AGENT_DISABLE_HEADLESS',
     'CROSS_AGENT_CODEX_SANDBOX', 'CROSS_AGENT_CODEX_MODEL', 'CROSS_AGENT_CODEX_SCAN_LIMIT',
     'CROSS_AGENT_CLAUDE_PERMISSION_MODE', 'CROSS_AGENT_CLAUDE_MODEL',

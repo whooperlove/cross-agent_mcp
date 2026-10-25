@@ -46,6 +46,10 @@ HISTORY_LIMIT = 50
 # headless call, a test harness - has to work with.
 REPLY_PREVIEW_LIMIT = 2000
 
+# After an answer that did not echo its request's token, how often the peer's transcript is read
+# for a later turn that does. For how long is config.LATE_ANSWER_WATCH_SECONDS.
+LATE_ANSWER_POLL_SECONDS = 20
+
 STATE_QUEUED = 'queued'
 STATE_DELIVERING = 'delivering'
 STATE_AWAITING = 'awaiting-peer'
@@ -183,6 +187,16 @@ def persist(job: 'Job') -> None:
         is_finished = job.finished_at is not None
         _write_record(job.describe(), is_finished=is_finished)
         job.is_record_final = is_finished
+
+
+def amend(job: 'Job') -> None:
+    """Add to a finished record what happened after it closed: a late answer, found and sent.
+
+    The delivery stays finished - its first answer was delivered - and the record now also says
+    where the later one went.
+    """
+    with job.record_guard:
+        _write_record(job.describe(), is_finished=job.finished_at is not None)
 
 
 def _is_in_flight(record: Dict[str, Any]) -> bool:
@@ -439,6 +453,15 @@ class Job:
         # its transcript while the shim still reported the turn as running. Delivered, not
         # recovered: the token proves it is the answer, whatever the shim's bookkeeping said.
         self.is_reply_confirmed_by_transcript = False
+        # The answer ends with this request's token, as the peer is asked to make it. One that
+        # does not may be an interim note - "I'll report once the subagents are done" - from a
+        # turn that ended before the work did, while the real answer comes in a later turn.
+        self.is_reply_echoed = False
+        # until when the peer's transcript is read for that later turn
+        self.late_answer_watch_until: Optional[float] = None
+        # set while the later turn is turned into a delivery, and the delivery that carries it
+        self.is_late_answer = False
+        self.late_reply_delivery_id: Optional[str] = None
         # the message never landed - set only when the transport says so, never inferred
         self.is_undelivered = False
         # No answer, and no notice, was sent back into the sender's session: it has no panel
@@ -532,6 +555,12 @@ class Job:
             # true when the peer's echoed, finished answer was read from its transcript while
             # the panel still reported the turn as running - a delivered answer, not a guess
             'is_reply_confirmed_by_transcript': self.is_reply_confirmed_by_transcript or None,
+            # false when the answer did not end with the request id: possibly an interim note,
+            # and the peer's transcript is then watched for the turn that does
+            'is_reply_echoed': self.is_reply_echoed if self.reply else None,
+            'late_answer_watch_until': self.late_answer_watch_until,
+            # the delivery carrying that later turn back, once it was found
+            'late_reply_delivery_id': self.late_reply_delivery_id,
             # true when the peer provably never received the message
             'is_undelivered': self.is_undelivered or None,
             # true when the answer (or the failure notice) could not be delivered into the
@@ -565,6 +594,8 @@ class Outbox:
         self._history: List[Job] = []
         # the job each worker is running right now, by key
         self._running: Dict[str, Job] = {}
+        # answered requests whose peer transcript is read for a late answer, by delivery id
+        self._watches: Dict[str, Job] = {}
 
         # injected by bridge to avoid an import cycle
         self.deliver: Optional[Callable[[Job], Dict[str, Any]]] = None
@@ -572,6 +603,8 @@ class Outbox:
         self.build_notice: Optional[Callable[[Job], Optional['Job']]] = None
         self.recover: Optional[Callable[[Job], Optional[str]]] = None
         self.reroute: Optional[Callable[[Job], None]] = None
+        # the peer's finished turn echoing the request's token, read from its transcript
+        self.find_late_answer: Optional[Callable[[Job], Optional[str]]] = None
 
     # ------------------------------------------------------------- submission
 
@@ -612,10 +645,36 @@ class Outbox:
 
     def is_idle(self) -> bool:
         """Whether this process carries nothing: no delivery queued, running or awaiting its
-        answer. A delivery stays in `pending` until its record is final, and an answer is queued
-        before the request it answers is archived, so this never reads idle in between."""
+        answer, and no late answer being watched for. A delivery stays in `pending` until its
+        record is final, an answer is queued before the request it answers is archived, and a
+        watch is registered before that, so this never reads idle in between."""
         with self._guard:
-            return not self._pending
+            return not self._pending and not self._watches
+
+    def deliveries_ahead(self, job: Job) -> List[Dict[str, Any]]:
+        """Deliveries still in flight to the same session, queued before `job`, by any server.
+
+        Read from the in-flight records, which every server writes, so a session busy with
+        messages from other senders shows up too. Ones whose server is gone are left out:
+        nothing will deliver them.
+        """
+        session_id = job.resolved_session_id or job.target_session_id
+        if not session_id:
+            return []
+        with self._guard:
+            carried = set(self._pending)
+        ahead = []
+        for record in _scan_dir(_in_flight_dir()):
+            delivery_id = record.get('delivery_id')
+            if (delivery_id == job.delivery_id or record.get('target_agent') != job.target_agent
+                    or record.get('target_session_id') != session_id
+                    or float(record.get('created_at') or 0) >= job.created_at):
+                continue
+            described = describe_origin(record, is_carried_here=delivery_id in carried)
+            if not described.get('is_orphaned'):
+                ahead.append(described)
+        ahead.sort(key=lambda r: float(r.get('created_at') or 0))
+        return ahead
 
     def await_outcome(self, job: Job) -> None:
         """Stay with a just-queued job until the peer takes it, it fails, or the window passes.
@@ -730,13 +789,14 @@ class Outbox:
 
         # the outcome is settled here; what follows only tells people about it
         job.finished_at = job.finished_at or time.time()
+        job.is_reply_echoed = bool(job.reply) and job.delivery_id in job.reply
         try:
             if job.is_stopped_with_carrier:
                 # the server is exiting: whoever can hear about it was told as it stopped the
                 # peer, and starting a delivery now would start a process nobody will stop
                 logger.info(f'_run [stopped with its carrier]: {job.delivery_id}')
             elif job.wants_reply and job.reply:
-                self._send_reply(job, job.reply)
+                self._send_reply_and_watch(job)
             elif job.wants_reply:
                 self._send_notice(job)
         finally:
@@ -916,6 +976,75 @@ class Outbox:
             logger.error(f'_recover [exception]: {job.delivery_id} {e}')
             return None
 
+    def _send_reply_and_watch(self, job: Job) -> None:
+        """Send the answer back, and keep reading for the real one if this may not be it.
+
+        A panel turn that ends is taken as the answer. When the peer ended it on an interim note
+        and finished the work in a later turn - one opened by its own subagents reporting back -
+        that later turn, the one ending with the request id, used to reach nobody: the request
+        was closed, and the sender waited on an answer already written. So an answer without
+        the id is sent marked as possibly interim, and the transcript is read until the turn
+        with the id appears, which then goes back as a late answer.
+
+        The watch is registered before the answer is built, so the envelope can say it is on,
+        and before the request is archived, so a draining server never reads idle in between.
+        """
+        session_id = job.resolved_session_id or job.target_session_id
+        is_watched = (job.kind == KIND_REQUEST and not job.is_reply_echoed and bool(session_id)
+                      and self.find_late_answer is not None
+                      and config.LATE_ANSWER_WATCH_SECONDS > 0)
+        if is_watched:
+            job.late_answer_watch_until = time.time() + config.LATE_ANSWER_WATCH_SECONDS
+            with self._guard:
+                self._watches[job.delivery_id] = job
+        self._send_reply(job, job.reply)
+        if not is_watched:
+            return
+        if job.return_delivery_id is None:
+            # no answer went back, so there is no sender to send a later one to either
+            job.late_answer_watch_until = None
+            with self._guard:
+                self._watches.pop(job.delivery_id, None)
+            return
+        threading.Thread(target=self._watch_for_late_answer, args=(job,),
+                         name=f'late-answer:{job.delivery_id}', daemon=True).start()
+        logger.info(f'_send_reply_and_watch [watching]: {job.delivery_id} answered without its '
+                    f'id; reading the {job.target_agent} transcript until '
+                    f'{time.strftime("%H:%M", time.localtime(job.late_answer_watch_until))}')
+
+    def _watch_for_late_answer(self, job: Job) -> None:
+        try:
+            while time.time() < (job.late_answer_watch_until or 0):
+                time.sleep(LATE_ANSWER_POLL_SECONDS)
+                try:
+                    answer = self.find_late_answer(job) if self.find_late_answer else None
+                except Exception as e:
+                    logger.error(f'_watch_for_late_answer [exception]: {job.delivery_id} {e}')
+                    continue
+                if answer:
+                    self._send_late_answer(job, answer)
+                    return
+            logger.info(f'_watch_for_late_answer [END]: {job.delivery_id} no turn echoed the '
+                        'request id in time; the first answer stands')
+        finally:
+            with self._guard:
+                self._watches.pop(job.delivery_id, None)
+
+    def _send_late_answer(self, job: Job, answer: str) -> None:
+        logger.info(f'_send_late_answer: {job.delivery_id} the peer echoed the request id in a '
+                    f'later turn ({len(answer)} chars)')
+        job.is_late_answer = True
+        try:
+            reply_job = self.build_reply(job, answer) if self.build_reply else None
+        except Exception as e:
+            logger.error(f'_send_late_answer [exception]: {job.delivery_id} {e}')
+            return
+        if reply_job is not None:
+            reply_job.parent_delivery_id = job.delivery_id
+            job.late_reply_delivery_id = reply_job.delivery_id
+            self.submit(reply_job)
+        amend(job)
+
     def _send_reply(self, job: Job, reply: str) -> None:
         if self.build_reply is None:
             return
@@ -991,8 +1120,12 @@ class Outbox:
         earlier = [r for r in finished if r.get('delivery_id') not in carried][:limit]
         elsewhere = [describe_origin(r) for r in in_flight
                      if r.get('delivery_id') not in carried][:limit]
+        with self._guard:
+            watching = [{'delivery_id': j.delivery_id, 'target_agent': j.target_agent,
+                         'target_session_id': j.resolved_session_id or j.target_session_id,
+                         'until': j.late_answer_watch_until} for j in self._watches.values()]
         return {'pending': pending, 'recent': recent, 'earlier': earlier,
-                'in_flight_elsewhere': elsewhere}
+                'in_flight_elsewhere': elsewhere, 'watching_for_late_answers': watching}
 
 
 OUTBOX = Outbox()
