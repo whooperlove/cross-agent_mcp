@@ -475,6 +475,8 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
             'selected_session_id': sessions[0]['session_id'] if sessions else None,
             'open_sessions': [_describe_panel_session(s) for s in sessions],
             'other_window_sessions': [_describe_panel_session(s) for s in foreign],
+            'unreachable_shims': (await _run_blocking(uihook.unreachable_shims, name)
+                                  if uihook.is_enabled() else []),
         }
 
     return {
@@ -504,7 +506,9 @@ async def bridge_status(cwd: Optional[str] = None, scope: Optional[str] = None,
                      'with no session_id would land. Use pin_agent_session to force a different '
                      'one. other_window_sessions are panels open in OTHER editor windows: they '
                      'are never chosen automatically, but naming one in session_id delivers to '
-                     'it through its panel. A session in neither list ' +
+                     'it through its panel. unreachable_shims lists live processes whose '
+                     'bridge connection failed, rather than reporting them as closed panels. '
+                     'A session in neither list ' +
                      ('is refused: CROSS_AGENT_DISABLE_HEADLESS is set, so no headless CLI is '
                       'ever started.' if config.DISABLE_HEADLESS else
                       'falls back to a headless CLI resume the panel will not show.')),

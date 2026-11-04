@@ -643,6 +643,19 @@ Observed human input **always takes priority** over transcript timing. Turns the
 
 `bridge_status`'s `ide_panels` shows the list of open tabs and the selection result as-is. If it's not the tab you want, pin one with `pin_agent_session`.
 
+Panel sockets live in the owner-only, node-local `/tmp/cross-agent-<uid>/` directory;
+only their discovery records live under `~/.cross-agent/panels/`. This matters on HPC
+nodes with NFS home directories: an NFS socket pathname can remain visible while
+`connect()` no longer finds the live listener. The shim checks actual connectivity
+every five seconds and rebuilds a failed listener without restarting its agent,
+losing conversation state, or closing already accepted requests. Registry records
+include their hostname so another node sharing the home directory cannot treat
+its own PID or socket lookup as evidence that the remote record is stale.
+
+`ide_panels.<agent>.unreachable_shims` distinguishes a failed bridge connection
+from a closed panel. When a known VS Code Codex thread has an unreachable shim,
+the bridge reports that failure instead of starting a competing CLI writer.
+
 > **A send with no `session_id` is addressed by the human, not by you.**
 >
 > Rules 3 to 5 pick from what the person at the keyboard is doing. That is what you want for
