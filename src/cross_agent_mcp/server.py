@@ -656,14 +656,23 @@ def main() -> None:
 
     logger.info(f'main [BEGIN]: cross-agent MCP server, cwd={os.getcwd()}, '
                 f'front={os.environ.get(config.ENV_FRONT_PID) or "none"}')
+    code = 0
     try:
         server.run('stdio')
         # only after stdin closed: a stop signal raises out of run() and skips this
         _finish_carrying()
     except KeyboardInterrupt:
         logger.info('main [END]: interrupted')
-    finally:
-        logging.shutdown()
+    except SystemExit as e:
+        # a stop signal; the handler has already closed what this server carried
+        code = e.code if isinstance(e.code, int) else int(e.code is not None)
+        logger.info(f'main [END]: stopped, code={code}')
+    except BaseException as e:
+        # an exception group from the transport's task group among them
+        logger.exception(f'main [exception]: {e!r}')
+        code = 1
+    # never the interpreter's own exit, which waits on threads that may never end
+    bridge.exit_process(code)
 
 
 def _finish_carrying() -> None:

@@ -20,6 +20,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -32,6 +33,10 @@ logger = logging.getLogger('cross_agent_mcp.bridge')
 
 # how long a killed process group gets to die before it is SIGKILLed
 KILL_GRACE_SECONDS = 5
+
+# How long the rest of the exit may take once this server's own deliveries are closed. Past
+# it the kernel ends the process (`_arm_exit_deadline`).
+EXIT_GRACE_SECONDS = 10
 
 # how much of the relayed message is used to title a conversation the bridge opened
 PANEL_TITLE_LIMIT = 50
@@ -451,20 +456,29 @@ def _terminate_group(process: subprocess.Popen) -> None:
     The agent CLIs run builds, test suites and shell commands as their own children. Killing
     only the direct child would leave those running unsupervised after a timeout.
     """
+    _terminate_groups([process])
+
+
+def _terminate_groups(processes: List[subprocess.Popen]) -> None:
+    """`_terminate_group` for several CLIs at once, under one grace rather than one each."""
     # Every CLI we start uses start_new_session=True, so its pid is also its group id.
     # Keep using it even after the leader exits: surviving tools may still hold the pipes.
-    group_id = process.pid
-    with contextlib.suppress(OSError):
-        os.killpg(group_id, signal.SIGTERM)
-    try:
-        process.wait(timeout=KILL_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        pass
+    for process in processes:
+        with contextlib.suppress(OSError):
+            os.killpg(process.pid, signal.SIGTERM)
+    _wait_for_all(processes, KILL_GRACE_SECONDS)
     # The leader exiting does not prove the entire tool tree honored SIGTERM.
-    with contextlib.suppress(OSError):
-        os.killpg(group_id, signal.SIGKILL)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=KILL_GRACE_SECONDS)
+    for process in processes:
+        with contextlib.suppress(OSError):
+            os.killpg(process.pid, signal.SIGKILL)
+    _wait_for_all(processes, KILL_GRACE_SECONDS)
+
+
+def _wait_for_all(processes: List[subprocess.Popen], seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    for process in processes:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=max(deadline - time.monotonic(), 0))
 
 
 # Deliveries this process started and has not finished. A CLI runs in its own process group
@@ -475,12 +489,17 @@ _CHILD_JOBS: Dict[int, outbox.Job] = {}
 _CHILDREN_GUARD = threading.Lock()
 
 
-def _track_child(process: subprocess.Popen) -> None:
+def _track_child(process: subprocess.Popen) -> bool:
+    """Returns False once this server has begun to exit: it has already stopped the CLIs it
+    carries, and nothing would stop this one."""
     job = outbox.current_job()
     with _CHILDREN_GUARD:
+        if _is_exiting:
+            return False
         _LIVE_CHILDREN.append(process)
         if job is not None:
             _CHILD_JOBS[process.pid] = job
+    return True
 
 
 def _untrack_child(process: subprocess.Popen) -> None:
@@ -503,6 +522,7 @@ def terminate_live_children() -> None:
         children = [(process, _CHILD_JOBS.get(process.pid)) for process in _LIVE_CHILDREN]
         _LIVE_CHILDREN.clear()
 
+    live = []
     for process, job in children:
         if process.poll() is not None:
             continue
@@ -511,8 +531,13 @@ def terminate_live_children() -> None:
             # marked before the child goes: the worker waiting on it must not record the exit
             # code of a process we are about to kill as the reason the delivery ended
             job.is_stopped_with_carrier = True
-        with contextlib.suppress(Exception):
-            _terminate_group(process)
+        live.append((process, job))
+    # Every turn is stopped before any record is written or any sender told. Those take seconds
+    # each, and a server killed part-way through - its front kills a worker that is slow to go -
+    # must not leave the remaining turns running.
+    with contextlib.suppress(Exception):
+        _terminate_groups([process for process, _ in live])
+    for process, job in live:
         if job is not None:
             _settle_stopped_delivery(job, process)
 
@@ -554,8 +579,23 @@ def _announce_stopped_delivery(job: outbox.Job) -> None:
     uihook.send(text, panel['ui_shim'], job.sender_session_id, timeout=4, accept_timeout=3)
 
 
+# set once this process has started to exit, by a stop signal or by `exit_process`
+_is_exiting = False
+_is_guard_installed = False
+
+
 def install_shutdown_guard() -> None:
-    """Arrange for in-flight deliveries to die with this server, however it exits."""
+    """Arrange for in-flight deliveries to die with this server, however it exits.
+
+    Only the first stop signal acts. A server behind a front usually gets two at once - the
+    editor's, sent to the whole process group, and the one the front passes on - and a second
+    SystemExit raised inside the exit the first one started would cut that exit short.
+    """
+    global _is_guard_installed
+    if _is_guard_installed:
+        # a handler chained to its own copy would find the exit begun and never raise
+        return
+    _is_guard_installed = True
     atexit.register(terminate_live_children)
 
     for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -565,7 +605,12 @@ def install_shutdown_guard() -> None:
             continue
 
         def handler(signum, frame, _previous=previous):
+            global _is_exiting
+            if _is_exiting:
+                return
+            _is_exiting = True
             terminate_live_children()
+            _arm_exit_deadline(EXIT_GRACE_SECONDS)
             if callable(_previous):
                 _previous(signum, frame)
             else:
@@ -573,6 +618,48 @@ def install_shutdown_guard() -> None:
 
         with contextlib.suppress(OSError, ValueError):
             signal.signal(number, handler)
+
+
+def _arm_exit_deadline(seconds: int) -> None:
+    """Have the kernel end this process if it is still here after `seconds`.
+
+    SIGALRM's default action terminates the process, and nothing in Python runs for it - no
+    thread, no lock - so it ends the process whatever the interpreter is stuck on. Arming it
+    again moves the deadline, and 0 takes it away. Main thread only, like every signal call.
+    """
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        signal.alarm(seconds)
+
+
+def exit_process(code: int) -> None:
+    """End this server once what has to happen on the way out has happened.
+
+    Interpreter teardown waits for every non-daemon thread. The AnyIO worker threads the stdio
+    transport reads stdin with are stopped by a callback on the event loop's main task, and a
+    stop signal that lands while that loop is shutting down - the editor closing stdin and
+    signalling at the same moment - skips the callback. The idle thread then waits for work
+    forever, and so did the process: an orphan of init once its front was gone. 1,712 of them
+    were found holding 88 GB. What the way out needs is registered with atexit, so it is run
+    here, under a deadline, and the process ends without the teardown.
+    """
+    global _is_exiting
+    _is_exiting = True
+    logger.info(f'exit_process: code={code}')
+    # Outside the deadline, which a stop signal armed for the event loop's shutdown: stopping a
+    # peer's turn waits for it to die, and a turn left running goes on writing to the peer's
+    # session with nobody watching.
+    _arm_exit_deadline(0)
+    terminate_live_children()
+    _arm_exit_deadline(EXIT_GRACE_SECONDS)
+    try:
+        # the rest of atexit: copilot connections, and logging.shutdown, which flushes the log
+        atexit._run_exitfuncs()
+    finally:
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                stream.flush()
+        os._exit(code)
 
 
 def _run_cli(command: List[str], cwd: str, env: Dict[str, str], timeout: int) -> subprocess.CompletedProcess:
@@ -583,6 +670,10 @@ def _run_cli(command: List[str], cwd: str, env: Dict[str, str], timeout: int) ->
         raise outbox.NotDeliveredError(
             f'{config.ENV_DISABLE_HEADLESS} is set, so the bridge did not start {command[0]}. '
             'Nothing was started and nothing was sent.')
+    if _is_exiting:
+        raise outbox.NotDeliveredError(
+            f'the server carrying this delivery (pid {os.getpid()}) is exiting, so the bridge did '
+            f'not start {command[0]}. Nothing was started and nothing was sent.')
     logger.debug(f'_run_cli [BEGIN]: cwd={cwd} cmd={command[:4]}')
     job = outbox.current_job()
     agent, _, session_id = (env.get(config.ENV_SELF_SESSION) or '').partition(':')
@@ -608,7 +699,11 @@ def _run_cli(command: List[str], cwd: str, env: Dict[str, str], timeout: int) ->
     except FileNotFoundError:
         raise outbox.NotDeliveredError(f'CLI not found: {command[0]}')
 
-    _track_child(process)
+    if not _track_child(process):
+        # the server began to exit while this one was starting, after it stopped the others
+        _terminate_group(process)
+        raise BridgeError(f'the server carrying this delivery (pid {os.getpid()}) began to exit '
+                          f'as {command[0]} started, so the bridge stopped it at once')
     last_activity = time.monotonic()
     output_activity = (0, 0)
     poll_seconds = min(5, max(timeout / 4, 0.01))

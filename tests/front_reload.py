@@ -9,10 +9,12 @@ reloads it. Everything runs against a throwaway CROSS_AGENT_HOME.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -59,6 +61,8 @@ if mode == 'fail':
     sys.exit(3)
 if mode == 'slow-start':
     time.sleep(2)
+if mode in ('ignore-term', 'stay-ignore-term'):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 generation = os.environ.get('CROSS_AGENT_WORKER_GENERATION')
 def log(text):
     with open(os.environ['FAKE_LOG'], 'a') as f:
@@ -130,6 +134,9 @@ for line in sys.stdin:
         send({'jsonrpc': '2.0', 'id': asking, 'result': {'answer': m.get('result')}})
         asking = None
 log(f'drained={bool(drained)}')
+if mode.startswith('stay'):
+    # a server that never gets round to exiting once its stdin closes
+    time.sleep(3600)
 '''
 
 
@@ -165,11 +172,13 @@ def _is_alive(pid: int) -> bool:
 class Editor:
     """Plays the editor: writes JSON-RPC lines to the front and reads what comes back."""
 
-    def __init__(self, fake_path: str) -> None:
+    def __init__(self, fake_path: str, setup: str = '', new_session: bool = False) -> None:
         harness = ('import sys; from cross_agent_mcp import front; '
-                   'front.WORKER_COMMAND[:] = [sys.executable, "-B", sys.argv[1]]; front.main()')
+                   'front.WORKER_COMMAND[:] = [sys.executable, "-B", sys.argv[1]]; '
+                   f'{setup + "; " if setup else ""}front.main()')
         self.process = subprocess.Popen([sys.executable, '-B', '-c', harness, fake_path],
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        start_new_session=new_session)
         self.messages: 'queue.Queue' = queue.Queue()
         self.notifications = []
         self.server_requests = []
@@ -421,9 +430,9 @@ def test_a_2026_editor_keeps_its_subscription_across_a_reload() -> None:
 META_2026 = {'io.modelcontextprotocol/protocolVersion': '2026-07-28'}
 
 
-def _connected(kind: str) -> Editor:
+def _connected(kind: str, setup: str = '', new_session: bool = False) -> Editor:
     """A front with an editor that has connected the way Codex (2025) or Claude Code (2026) does."""
-    editor = Editor(STATE_DIR + '/fake_worker.py')
+    editor = Editor(STATE_DIR + '/fake_worker.py', setup, new_session)
     if kind == '2025':
         editor.call(0, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
                                       'clientInfo': {'name': 'test', 'version': '1'}})
@@ -663,6 +672,187 @@ def test_a_replaced_server_finishes_what_it_carries() -> None:
     check('a replaced server stays until its last delivery is done', 1.0 <= waited < 5, waited)
 
 
+# The real server, with a thread that never ends - what an AnyIO worker thread whose stop
+# callback never ran is - and stdin in place of the MCP transport.
+SERVER_WITH_A_STUCK_THREAD = r'''
+import sys, threading
+from cross_agent_mcp import server
+def run(transport):
+    threading.Thread(target=threading.Event().wait, name='never-stopped').start()
+    sys.stdout.write('ready\n')
+    sys.stdout.flush()
+    sys.stdin.read()
+server.server.run = run
+server.main()
+'''
+
+
+def test_a_server_exits_whatever_threads_it_leaves() -> None:
+    """Interpreter teardown waits for every non-daemon thread, and one the event loop never
+    stopped kept the server forever - an orphan of init once its front was gone."""
+    for how, signals, expected in (('its stdin closes', 0, 0), ('it is signalled', 1, 143),
+                                   ('it is signalled twice', 2, 143)):
+        process = subprocess.Popen([sys.executable, '-B', '-c', SERVER_WITH_A_STUCK_THREAD],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+        try:
+            process.stdout.readline()
+            for _ in range(signals):
+                process.send_signal(signal.SIGTERM)
+            if not signals:
+                process.stdin.close()
+            try:
+                code = process.wait(15)
+            except subprocess.TimeoutExpired:
+                code = 'still running after 15s'
+            check(f'a server left with a thread that never ends exits when {how}',
+                  code == expected, code)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
+def test_a_server_stuck_on_its_way_out_is_ended_by_the_deadline() -> None:
+    """The way out itself can hang - an exit handler that never returns. The kernel ends the
+    process once the deadline passes, whatever Python is stuck on."""
+    grace = 2
+    stuck = SERVER_WITH_A_STUCK_THREAD.replace(
+        'server.main()', f'import atexit, time\nfrom cross_agent_mcp import bridge\n'
+        f'bridge.EXIT_GRACE_SECONDS = {grace}\natexit.register(time.sleep, 3600)\nserver.main()')
+    for how, signals in (('its stdin closes', 0), ('it is signalled', 1)):
+        process = subprocess.Popen([sys.executable, '-B', '-c', stuck], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            process.stdout.readline()
+            started = time.time()
+            if signals:
+                process.send_signal(signal.SIGTERM)
+            else:
+                process.stdin.close()
+            try:
+                code = process.wait(grace + 10)
+            except subprocess.TimeoutExpired:
+                code = f'still running after {grace + 10}s'
+            took = round(time.time() - started, 2)
+            check(f'a server whose exit hangs is ended by the deadline when {how}',
+                  code == -signal.SIGALRM and grace - 0.5 <= took < grace + 4, (code, took))
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
+def test_a_stopped_front_does_not_leave_its_worker_behind() -> None:
+    """A stopped front passed the signal on and exited at once. A worker that was still there
+    then belonged to init, and nothing would ever stop it."""
+    grace = 3
+    for mode, which in ((None, 'that stops'), ('ignore-term', 'that ignores the signal')):
+        _set_control(mode)
+        editor = _connected('2025', f'front.WORKER_STOP_GRACE_SECONDS = {grace}')
+        worker = None
+        try:
+            worker = editor.call(1, 'whoami')['result']['pid']
+            started = time.time()
+            editor.process.send_signal(signal.SIGTERM)
+            editor.process.send_signal(signal.SIGTERM)
+            try:
+                code = editor.process.wait(grace + 10)
+            except subprocess.TimeoutExpired:
+                code = None
+            took = time.time() - started
+            gone = _wait_for(lambda: not _is_alive(worker), 5)
+            check(f'a signalled front exits, after its worker {which} is gone',
+                  code == 143 and gone is not None, (code, took, gone))
+            if mode is None:
+                check('without waiting out the grace', took < grace - 1, took)
+            else:
+                check('the worker is killed once the grace is up',
+                      grace - 0.5 <= took < grace + 5, took)
+        finally:
+            _set_control(None)
+            _kill_if_alive(worker)
+            _stop(editor)
+    killed = [line for line in _log_lines(config.LOG_DIR + 'front.log')
+              if f'still running after {grace}s; killed' in line]
+    check('and the front log says it killed the one that would not stop', len(killed) == 1, killed)
+
+
+def test_a_closed_front_does_not_leave_a_worker_that_stays() -> None:
+    """The editor closing stdin let the current worker exit on its own, and one still there
+    after the grace was left running when the front exited - a child of init from then on."""
+    exit_grace, stop_grace = 1, 2
+    setup = (f'front.WORKER_EXIT_GRACE_SECONDS = {exit_grace}; '
+             f'front.WORKER_STOP_GRACE_SECONDS = {stop_grace}')
+    for mode, which, waited in (('stay', 'that stops when signalled', exit_grace),
+                                ('stay-ignore-term', 'that ignores the signal too',
+                                 exit_grace + stop_grace)):
+        _set_control(mode)
+        editor = _connected('2025', setup)
+        worker = None
+        try:
+            worker = editor.call(1, 'whoami')['result']['pid']
+            started = time.time()
+            editor.process.stdin.close()
+            try:
+                code = editor.process.wait(waited + 10)
+            except subprocess.TimeoutExpired:
+                code = None
+            took = time.time() - started
+            gone = _wait_for(lambda: not _is_alive(worker), 5)
+            check(f'a closed front exits, after its worker {which} is gone',
+                  code == 0 and gone is not None and waited - 0.5 <= took < waited + 4,
+                  (code, round(took, 2), gone))
+        finally:
+            _set_control(None)
+            _kill_if_alive(worker)
+            _stop(editor)
+    stopped = [line for line in _log_lines(config.LOG_DIR + 'front.log')
+               if f'{exit_grace}s after its stdin closed; stopping it' in line]
+    killed = [line for line in _log_lines(config.LOG_DIR + 'front.log')
+              if f'still running after {stop_grace}s; killed' in line]
+    check('and the front log says which it stopped and which it killed',
+          len(stopped) == 2 and len(killed) == 1, (stopped, killed))
+
+
+def _kill_if_alive(pid: Optional[int]) -> None:
+    """A worker a failing check left running is the test's own: never leave it to init."""
+    if pid and _is_alive(pid):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def _clean_exits() -> int:
+    return sum('exit_process: code=' in line for line in _log_lines(config.LOG_DIR + 'bridge.log'))
+
+
+def test_a_real_server_stopped_with_its_process_group_exits() -> None:
+    """Codex stops an MCP server by signalling its process group: the worker is signalled
+    directly and again by the front, while its stdin closes. Often enough that the worker
+    stayed for good - one left behind by every third `codex exec`, 1,712 of them in a day."""
+    real = 'front.WORKER_COMMAND[:] = [sys.executable, "-B", "-m", "cross_agent_mcp"]'
+    took, clean = [], []
+    for _ in range(5):
+        before = _clean_exits()
+        editor = _connected('2025', real, new_session=True)
+        worker = None
+        try:
+            editor.call(1, 'tools/list')
+            worker = _wait_for(lambda: _status(editor.process.pid).get('worker_pid'))
+            started = time.time()
+            os.killpg(editor.process.pid, signal.SIGTERM)
+            gone = _wait_for(lambda: worker and not _is_alive(worker), 20)
+            took.append(round(time.time() - started, 2) if gone else f'pid {worker} still running')
+        finally:
+            _kill_if_alive(worker)
+            _stop(editor)
+        clean.append(_clean_exits() - before)
+    # well inside the worker's own deadline: an exit the deadline forced would pass "it exits"
+    check('a real server signalled with its process group exits, every time',
+          all(isinstance(t, float) and t < 5 for t in took), took)
+    check('each on its own way out, not cut short by the deadline', clean == [1] * 5, clean)
+
+
 def _real_front() -> StdioServerParameters:
     return StdioServerParameters(command=sys.executable,
                                  args=['-B', '-m', 'cross_agent_mcp', '--reload'],
@@ -738,6 +928,11 @@ def main() -> int:
         test_calls_racing_a_reload_are_all_answered()
         test_the_handshake_that_worked_is_the_one_replayed()
         test_odd_frames_do_not_break_the_relay()
+        test_a_server_exits_whatever_threads_it_leaves()
+        test_a_server_stuck_on_its_way_out_is_ended_by_the_deadline()
+        test_a_stopped_front_does_not_leave_its_worker_behind()
+        test_a_closed_front_does_not_leave_a_worker_that_stays()
+        test_a_real_server_stopped_with_its_process_group_exits()
         asyncio.run(test_the_real_server_reloads_behind_the_front())
         test_a_source_that_does_not_import_is_never_sent_to_the_fronts()
     finally:

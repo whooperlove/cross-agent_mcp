@@ -3602,6 +3602,53 @@ def test_a_delivery_does_not_outlive_the_server_that_started_it() -> None:
         worker.join(timeout=5)
 
 
+def test_a_stopping_server_stops_every_delivery_under_one_grace() -> None:
+    """Deliveries used to be stopped one after another, a grace each, and each record written and
+    its sender told before the next was touched. A front now kills a worker that is slow to go,
+    so with a few deliveries running the last ones would have been left behind, still working."""
+    with tempfile.TemporaryDirectory(prefix='orphan-') as work_dir:
+        markers = [f'{work_dir}/child{n}.pid' for n in range(3)]
+        workers = []
+        for marker in markers:
+            # ignores SIGTERM, as a busy CLI may: only the SIGKILL after the grace ends it
+            command = ['/bin/bash', '-c', f'trap "" TERM; sleep 45 & echo $! > {marker}; wait']
+
+            def deliver(command=command):
+                with contextlib_suppress():
+                    bridge._run_cli(command, work_dir, dict(os.environ), timeout=40)
+
+            worker = threading.Thread(target=deliver, daemon=True)
+            worker.start()
+            workers.append(worker)
+
+        def pids():
+            found = []
+            for marker in markers:
+                with contextlib_suppress():
+                    found.append(int(open(marker).read().strip()))
+            return found
+
+        deadline = time.time() + 10
+        while len(pids()) < len(markers) and time.time() < deadline:
+            time.sleep(0.05)
+        grandchildren = pids()
+        check('three deliveries are running before we shut down',
+              len(grandchildren) == 3 and all(registry._is_pid_alive(p) for p in grandchildren),
+              grandchildren)
+
+        started = time.time()
+        bridge.terminate_live_children()
+        took = time.time() - started
+        deadline = time.time() + 5
+        while any(registry._is_pid_alive(p) for p in grandchildren) and time.time() < deadline:
+            time.sleep(0.1)
+        alive = [p for p in grandchildren if registry._is_pid_alive(p)]
+        check('every one is gone, within one grace rather than one each',
+              not alive and took < 2 * bridge.KILL_GRACE_SECONDS, (round(took, 2), alive))
+        for worker in workers:
+            worker.join(timeout=5)
+
+
 # ------------------------------------------- recovery reads finished turns, not fragments
 
 def _claude_line(text: str, stop_reason, request_id: str, at: float, kind: str = 'text') -> str:
@@ -8085,6 +8132,7 @@ def run_all() -> None:
     test_a_named_session_is_never_silently_created()
     test_naming_a_session_and_forcing_a_new_one_is_refused()
     test_a_delivery_does_not_outlive_the_server_that_started_it()
+    test_a_stopping_server_stops_every_delivery_under_one_grace()
     test_recovery_waits_for_a_claude_turn_to_finish()
     test_recovery_reads_the_codex_turn_the_app_server_closed()
     test_a_later_human_turn_does_not_hide_the_echoed_answer()

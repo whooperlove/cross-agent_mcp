@@ -48,6 +48,9 @@ RELOAD_POLL_SECONDS = 1.0
 WORKER_START_TIMEOUT_SECONDS = 60
 # how long the editor closing waits for the current worker to exit on its own
 WORKER_EXIT_GRACE_SECONDS = 10
+# How long a stop signal waits for the workers before it kills them. A worker bounds its own
+# exit, after it has stopped the peer turns it carries - up to about 20 seconds a turn.
+WORKER_STOP_GRACE_SECONDS = 60
 # A worker that keeps dying is not restarted forever: more deaths than this within the window,
 # or this many replacements in a row that never start, and the front exits like a dead server.
 CRASH_LIMIT = 3
@@ -218,6 +221,7 @@ class Front:
         self.next_server_request = 0
         self.crashes: List[float] = []
         self.is_closing = False
+        self.is_stopping = False
         # a request made before this front started is already in the code it is running
         self.seen_request_id = (_read_json(config.RELOAD_REQUEST_PATH) or {}).get('id')
         self.last_reload: Optional[Dict[str, Any]] = None
@@ -262,29 +266,60 @@ class Front:
         """The editor is done: let the current worker exit the way a server always has.
 
         A worker a reload released is left to finish: it was already told to, and it holds
-        the busy locks of what it carries under its own live pid.
+        the busy locks of what it carries under its own live pid. The current one owes nothing
+        once its stdin closes, so one still there after the grace is stopped as a signal stops
+        it: left behind, it would belong to init once the front exits, and nothing would end it.
         """
         with self.lock:
             self.is_closing = True
             current = self.current
+            # a reload that rolled back can leave a worker it had already released current
+            is_released = current is not None and current.is_released
         if current is not None:
             current.close_stdin()
             try:
                 current.process.wait(WORKER_EXIT_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
-                logger.info(f'_close: worker pid={current.pid} is still exiting; left to finish')
+                if is_released:
+                    logger.info(f'_close: worker pid={current.pid} was released by a reload; '
+                                'left to finish what it carries')
+                else:
+                    logger.error(f'_close: worker pid={current.pid} still running '
+                                 f'{WORKER_EXIT_GRACE_SECONDS}s after its stdin closed; stopping it')
+                    self._stop_workers([current])
         self.remove_status()
 
     def on_signal(self, signum: int, frame: Any) -> None:
-        """Stopped by the editor: stop every worker too, as a stopped server stopped itself."""
+        """Stopped by the editor: stop every worker too, as a stopped server stopped itself.
+
+        The front stays until they are gone. A worker still there after the grace is killed:
+        once the front exits it is a child of init, and nothing else would ever stop it.
+        """
         with self.lock:
+            if self.is_stopping:
+                # the same stop, sent to this process and again to its process group
+                return
+            self.is_stopping = True
             self.is_closing = True
             workers = list(self.workers)
         logger.info(f'on_signal: {signum}, stopping {[w.pid for w in workers]}')
+        self._stop_workers(workers)
+        raise SystemExit(128 + signum)
+
+    def _stop_workers(self, workers: List[Worker]) -> None:
+        """SIGTERM each worker, then kill the ones still running when the grace is up."""
         for worker in workers:
             with contextlib.suppress(OSError):
                 worker.process.send_signal(signal.SIGTERM)
-        raise SystemExit(128 + signum)
+        deadline = time.time() + WORKER_STOP_GRACE_SECONDS
+        for worker in workers:
+            try:
+                worker.process.wait(max(deadline - time.time(), 0))
+            except subprocess.TimeoutExpired:
+                logger.error(f'_stop_workers: worker pid={worker.pid} still running after '
+                             f'{WORKER_STOP_GRACE_SECONDS}s; killed')
+                with contextlib.suppress(OSError):
+                    worker.process.kill()
 
     # ------------------------------------------------------------ editor -> worker
 

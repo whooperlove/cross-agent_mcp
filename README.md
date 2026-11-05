@@ -759,10 +759,20 @@ reload 1792633199847-69436: asked 3 running front(s)
 - **A call the editor cancels is not waited for.** MCP servers never answer a cancelled
   request, so the front stops counting it as owed; an interrupted call does not keep a replaced
   worker alive.
-- **Closing the editor:** the current worker exits as a server always has. A worker a reload
-  already released goes on until its last delivery is done (at most 24 hours), still holding
-  the busy locks of what it carries under its own pid; stopping the server with a signal stops
-  it too.
+- **Closing the editor:** the current worker exits as a server always has; one still running
+  10 s after its stdin closed is sent SIGTERM, and killed if it is still there 60 s later. A
+  stop signal is passed to every worker, and the front waits for them the same way before it
+  exits, so no worker is left behind as a child of init. A worker a reload already released goes
+  on until its last delivery is done (at most 24 hours), still holding the busy locks of what it
+  carries under its own pid; stopping the server with a signal stops it too.
+- **A server always exits.** Once a stop signal arrives, or its stdin closes (a worker a reload
+  released first finishes what it carries), the server stops the peer turns it still carries,
+  runs its exit handlers (the log is flushed) and ends with `os._exit`. Interpreter teardown
+  waits for every non-daemon thread, and a second stop signal landing while the event loop shut
+  down skipped the callback that stops AnyIO's stdin-reader threads: 1,712 servers were found
+  waiting on them for good on 2026-11-05, most left by headless `codex exec` runs. Only the
+  first stop signal acts now, and the kernel ends the process (SIGALRM) if the rest of the way
+  out takes more than 10 s once those turns are stopped.
 - **The editor keeps one connection.** On MCP 2026-07-28 (Claude Code) the editor holds one
   `subscriptions/listen` request open for the whole session; the front moves it to the new
   worker under the editor's own request id, so it stays a single stream. After a reload the
