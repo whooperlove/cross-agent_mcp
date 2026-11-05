@@ -1414,6 +1414,17 @@ def _resolve_target(target_agent: str, session_id: Optional[str], scope: str, cw
             raise BridgeError(
                 f'{target_agent} session {label!r} no longer exists. Nothing was sent and no '
                 'session was created; clear the pin with pin_agent_session or name another one.')
+        if (target_agent == config.AGENT_CODEX
+                and found.get('origin') == 'codex_vscode'
+                and uihook.is_enabled()):
+            broken = uihook.unreachable_shims(target_agent)
+            if broken:
+                raise BridgeError(
+                    'Codex is running, but its bridge connection is unavailable '
+                    f'(shim pid={broken[0]["pid"]}: {broken[0]["error"]}). '
+                    'This is not evidence that the panel is closed. No separate CLI resume '
+                    'was started, because it can conflict with the existing thread writer. '
+                    'The listener supervisor will retry; check bridge_status for recovery.')
         found['source'] = 'name' if requested else 'pin'
         return chosen(found, how)
 

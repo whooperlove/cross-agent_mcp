@@ -52,8 +52,16 @@ def list_shims(agent: Optional[str] = None) -> List[Dict[str, Any]]:
         except Exception:
             continue
 
+        # The discovery directory can be shared by NFS. PID existence and socket
+        # paths are meaningful only on the host that published the record.
+        if record.get('hostname') not in (None, socket.gethostname()):
+            continue
+
         pid = int(record.get('pid', -1))
-        if not _is_pid_alive(pid) or not os.path.exists(record.get('socket', '')):
+        # A lost socket pathname is a transport failure, not a dead process.
+        # Keep its record so diagnostics and the second-writer guard can see it
+        # while the listener supervisor rebuilds the binding.
+        if not _is_pid_alive(pid):
             try:
                 os.remove(path)
             except OSError:
@@ -152,6 +160,17 @@ def read_status(shim: Dict[str, Any]) -> Dict[str, Any]:
         return _request(shim['socket'], {'op': 'status'}, CONNECT_TIMEOUT_SECONDS)
     except Exception as e:
         return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+
+
+def unreachable_shims(agent: str) -> List[Dict[str, Any]]:
+    """Live processes whose bridge transport failed, distinct from closed panels."""
+    broken = []
+    for shim in list_shims(agent):
+        status = read_status(shim)
+        if not status.get('ok'):
+            broken.append({'pid': shim.get('pid'), 'socket': shim.get('socket'),
+                           'error': status.get('error', 'status request failed')})
+    return broken
 
 
 def read_presence(shim: Dict[str, Any], session_id: str) -> Dict[str, Any]:

@@ -48,6 +48,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) +
 
 from cross_agent_mcp import bridge, config, discovery, outbox, panel, registry  # noqa: E402
 
+# Listener sockets are intentionally outside CROSS_AGENT_HOME in production.
+# Keep the suite's runtime directory isolated as well as its metadata directory.
+panel.LOCAL_SOCKET_ROOT = STATE_ROOT + '/sockets'
+
 
 FAILURES = []
 

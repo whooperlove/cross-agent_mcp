@@ -9,6 +9,7 @@ that lets the bridge find the shim belonging to its own editor window, and the s
 """
 
 import contextlib
+import errno
 import fcntl
 import json
 import logging
@@ -16,6 +17,7 @@ import logging.handlers
 import os
 import re
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -28,6 +30,27 @@ from . import config
 logger = logging.getLogger('cross_agent_mcp.panel')
 
 REGISTRY_DIR: str = config.HOME_DIR + 'panels/'
+
+# A home directory may be NFS-mounted and shared between HPC nodes. A pathname
+# socket must keep its association with a local kernel inode; a visible NFS
+# directory entry is not proof that it still reaches the listener that bound it.
+# Keep only discovery metadata in the home directory, and sockets on this node.
+LOCAL_SOCKET_ROOT = '/tmp/cross-agent-%d' % os.getuid()
+SOCKET_HEALTH_SECONDS = 5
+SOCKET_RETRY_SECONDS = 1
+
+
+def socket_directory() -> str:
+    try:
+        os.mkdir(LOCAL_SOCKET_ROOT, 0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(LOCAL_SOCKET_ROOT)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise OSError('unsafe bridge socket directory: ' + LOCAL_SOCKET_ROOT)
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        os.chmod(LOCAL_SOCKET_ROOT, 0o700)
+    return LOCAL_SOCKET_ROOT
 
 SOCKET_BACKLOG = 4
 MAX_REQUEST_BYTES = 4_000_000
@@ -290,8 +313,12 @@ class PanelShim:
         self.process: Optional[subprocess.Popen] = None
         self.stdin_lock = threading.Lock()
         self.state_lock = threading.Lock()
-        self.socket_path = REGISTRY_DIR + f'{self.agent}-{os.getpid()}.sock'
-        self.registry_path = REGISTRY_DIR + f'{self.agent}-{os.getpid()}.json'
+        self.socket_path = socket_directory() + f'/{self.agent}-{os.getpid()}.sock'
+        host = re.sub(r'[^a-zA-Z0-9_.-]', '_', socket.gethostname())
+        self.registry_path = REGISTRY_DIR + f'{self.agent}-{host}-{os.getpid()}.json'
+        self._side_channel_stop = threading.Event()
+        self._side_channel_thread: Optional[threading.Thread] = None
+        self._started_at = time.time()
         # turns the bridge has not collected yet, by injection id
         self.turns: Dict[str, Turn] = {}
 
@@ -367,16 +394,29 @@ class PanelShim:
         record = {
             'agent': self.agent,
             'pid': os.getpid(),
+            'hostname': socket.gethostname(),
             'socket': self.socket_path,
             'ancestors': process_ancestry(os.getpid()),
-            'started_at': time.time(),
+            'started_at': getattr(self, '_started_at', time.time()),
             'argv': self.argv,
         }
-        with config.secure_open(self.registry_path) as f:
-            json.dump(record, f)
+        temporary = self.registry_path + '.' + uuid.uuid4().hex + '.tmp'
+        try:
+            with config.secure_open(temporary) as f:
+                json.dump(record, f)
+            os.replace(temporary, self.registry_path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
 
     def unregister(self) -> None:
-        for path in (self.registry_path, self.socket_path):
+        stop = getattr(self, '_side_channel_stop', None)
+        if stop is not None:
+            stop.set()
+        # A live upgrade can retain its old listener for already accepted jobs
+        # that still reconnect to that address. Clean both at normal shutdown.
+        paths = [self.registry_path, self.socket_path] + getattr(self, '_legacy_socket_paths', [])
+        for path in paths:
             with contextlib.suppress(OSError):
                 os.remove(path)
 
@@ -412,14 +452,17 @@ class PanelShim:
         return {'ok': False, 'error': f'unknown op: {operation}'}
 
     def _serve_client(self, connection: socket.socket) -> None:
+        # Always close an empty health-check connection or a malformed request.
         try:
             buffer = b''
             while b'\n' not in buffer:
                 chunk = connection.recv(65536)
                 if not chunk:
+                    connection.close()
                     return
                 buffer += chunk
                 if len(buffer) > MAX_REQUEST_BYTES:
+                    connection.close()
                     return
             response = self._handle_request(json.loads(buffer.split(b'\n', 1)[0].decode('utf-8')))
         except Exception as e:
@@ -431,25 +474,61 @@ class PanelShim:
             connection.close()
 
     def serve_socket(self) -> None:
-        with contextlib.suppress(OSError):
-            os.remove(self.socket_path)
-
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(self.socket_path)
-        os.chmod(self.socket_path, 0o600)
-        server.listen(SOCKET_BACKLOG)
-
-        while True:
+        """Supervise only the listener; never restart the agent or its stdio pipes."""
+        stop = self._side_channel_stop
+        log = getattr(self, 'log', logger)
+        while not stop.is_set():
             try:
-                connection, _ = server.accept()
+                socket_directory()
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(self.socket_path)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                    server.bind(self.socket_path)
+                    os.chmod(self.socket_path, 0o600)
+                    server.listen(SOCKET_BACKLOG)
+                    server.settimeout(min(1, SOCKET_HEALTH_SECONDS))
+                    # Publish after listen, rather than advertising an unbound path.
+                    self.register()
+                    log.info('bridge listener ready: %s', self.socket_path)
+                    next_check = time.monotonic() + SOCKET_HEALTH_SECONDS
+                    while not stop.is_set():
+                        try:
+                            connection, _ = server.accept()
+                        except socket.timeout:
+                            pass
+                        except InterruptedError:
+                            continue
+                        else:
+                            threading.Thread(target=self._serve_client, args=(connection,),
+                                             daemon=True).start()
+                        if time.monotonic() >= next_check:
+                            self._check_socket()
+                            next_check = time.monotonic() + SOCKET_HEALTH_SECONDS
             except Exception:
-                return
-            threading.Thread(target=self._serve_client, args=(connection,), daemon=True).start()
+                if not stop.is_set():
+                    log.exception('bridge listener failed; rebuilding it without restarting agent')
+                    stop.wait(SOCKET_RETRY_SECONDS)
+
+    def _check_socket(self) -> None:
+        """Check connect(), not exists(): the failed NFS socket still existed."""
+        socket_directory()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            try:
+                probe.connect(self.socket_path)
+            except OSError as e:
+                # A full backlog is busy, not a broken binding. Do not throw away
+                # queued deliveries merely because a health probe cannot join it.
+                if isinstance(e, socket.timeout) or e.errno in (errno.EAGAIN, errno.EINTR):
+                    return
+                raise
 
     def start_side_channel(self) -> None:
         """The side channel must never be able to take the passthrough down with it."""
         try:
-            self.register()
-            threading.Thread(target=self.serve_socket, daemon=True).start()
+            if self._side_channel_thread and self._side_channel_thread.is_alive():
+                return
+            self._side_channel_thread = threading.Thread(target=self.serve_socket, daemon=True)
+            self._side_channel_thread.start()
         except Exception as e:
             print(f'cross-agent shim: side channel disabled ({e})', file=__import__('sys').stderr)
